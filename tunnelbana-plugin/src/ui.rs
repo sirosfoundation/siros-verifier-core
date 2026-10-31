@@ -302,6 +302,7 @@ a.choice:hover,a.choice:focus {{ border-color:#3167d5; outline:none; }}
 .presentation-flow select,.presentation-flow textarea {{ box-sizing:border-box; width:100%; margin-top:6px; padding:10px; border:1px solid #aab5c5; border-radius:8px; background:inherit; color:inherit; font:inherit; }}
 .presentation-flow textarea {{ min-height:260px; font-family:ui-monospace,monospace; font-size:.88rem; }}
 .claim-options {{ display:block; margin:16px 0; }}
+.claim-options option::before {{ content:"☐ "; }} .claim-options option:checked::before {{ content:"☑ "; }}
 .flow-actions {{ display:flex; flex-wrap:wrap; gap:12px; margin-top:20px; }}
 .flow-actions button {{ padding:11px 18px; border:1px solid #3167d5; border-radius:8px; background:#3167d5; color:white; cursor:pointer; }}
 .flow-actions button:nth-child(n+2) {{ background:transparent; color:#3167d5; }}
@@ -423,6 +424,8 @@ mod tests {
         assert!(html.contains("/ui/assets/demo.js"));
         assert!(html.contains("presentation-catalog"));
         assert!(html.contains("dc-api"));
+        assert!(html.contains(".claim-options option::before"));
+        assert!(html.contains(".claim-options option:checked::before"));
         assert!(!html.contains("haip-vp"));
         assert!(!html.contains("navigator.credentials"));
     }
