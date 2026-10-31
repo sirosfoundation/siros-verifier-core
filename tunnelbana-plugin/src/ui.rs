@@ -280,8 +280,8 @@ a.choice:hover,a.choice:focus {{ border-color:#3167d5; outline:none; }}
 .siros-spinner {{ display:flex; gap:5px; align-items:center; justify-content:center; margin:20px 0; font-weight:800; letter-spacing:.2em; color:#3167d5; }}
 .siros-spinner span {{ animation:siros-pulse 1.2s infinite ease-in-out; }} .siros-spinner span:nth-child(2) {{ animation-delay:.1s; }} .siros-spinner span:nth-child(3) {{ animation-delay:.2s; }} .siros-spinner span:nth-child(4) {{ animation-delay:.3s; }} .siros-spinner span:nth-child(5) {{ animation-delay:.4s; }}
 @keyframes siros-pulse {{ 0%,100% {{ opacity:.25; transform:translateY(0); }} 50% {{ opacity:1; transform:translateY(-4px); }} }}
-dl {{ display:grid; grid-template-columns:minmax(120px,1fr) 2fr; gap:10px 16px; }}
-dt {{ font-weight:650; }} dd {{ margin:0; overflow-wrap:anywhere; }}
+dl {{ display:grid; grid-template-columns:minmax(0,1fr) minmax(0,2fr); gap:10px 16px; }}
+dt {{ font-weight:650; overflow-wrap:anywhere; }} dd {{ margin:0; overflow-wrap:anywhere; }}
 a.back {{ display:inline-block; margin-top:24px; color:#214faa; }}
 @media (prefers-color-scheme:dark) {{ body {{ background:#111722; color:#e7ebf3; }} main {{ background:#1b2432; }} a.choice {{ border-color:#3a4658; }} .choice strong,a.back {{ color:#8eb2ff; }} }}
 </style></head><body><main>{body}</main></body></html>"#
@@ -406,5 +406,7 @@ mod tests {
         assert!(!html.contains("<script>alert"));
         assert!(html.contains("&lt;script&gt;"));
         assert!(html.contains("https://issuer.example/&lt;unsafe&gt;"));
+        assert!(html.contains("dt { font-weight:650; overflow-wrap:anywhere; }"));
+        assert!(html.contains("grid-template-columns:minmax(0,1fr) minmax(0,2fr)"));
     }
 }
