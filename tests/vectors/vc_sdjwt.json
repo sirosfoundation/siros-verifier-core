@@ -1,0 +1,21 @@
+{
+  "aud": "https://verifier.example",
+  "expect": {
+    "family_name": "Lovelace",
+    "given_name": "Ada",
+    "iss": "https://go-issuer.example",
+    "locality": "London",
+    "street": "St James's Square 1",
+    "vct": "urn:vp-spike:test:1"
+  },
+  "generated_at": 1792271506,
+  "generator": "SUNET/vc pkg/sdjwtvc",
+  "issuer_public_jwk": {
+    "crv": "P-256",
+    "kty": "EC",
+    "x": "swZMA3CsJfSawwWMG5Wpj87n88i_InfkQ-KvYVbGSuY",
+    "y": "pzYziPoD1QBHH-EcXAVzCV-JadpLIK-XtTBTKyVgN_I"
+  },
+  "nonce": "go-nonce-123",
+  "presentation": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImdvLWlzc3Vlci0xIiwidHlwIjoiZGMrc2Qtand0In0.eyJfc2QiOlsiNnRXOHNkTE9EbTliX3plbGEwai1nVnRiZWM0aEpKbVlTV3VQZE1xYjh6ayIsIkljcUNsXzJWOVpjWkxCazJSMDZNU2JHM3RvQW5hdEtucFFPbUJaM1JqNGsiLCJYVWlEOENXSFhyakZ2NHNNTmxCUWU5UElCMWFMcW80ejFZZEUzSjVhLVFzIiwicDJzeEdpNURJVVJmNDJPTEJtNWxQQ09FbE82azhxM0xya0xhNDNlMDd3SSIsInRhVUNmSXAzYU91bzNEWVVXRHlzVHlhY2FxSm5PRUR1OG96OXNLeHZTS2ciXSwiX3NkX2FsZyI6InNoYS0yNTYiLCJhZGRyZXNzIjp7Il9zZCI6WyI3ZGEtVF9WWWplaXlkMGRIalBxZ2hSVFd1N0VWQWVTcGZkUUhHclJBM1ZzIiwiSGRNenRyYmh0b3VXd216Wm9TQVdlbTk5Y05YSDhCUVJabXNmNC13RnIwMCIsIklRQ19iZTZzZlNKOGU2UEMyODRXcHJEZ1haZnR1U0dUSHVLTlRoT0gxM00iLCJlVEFMVnROaGF1UXJadHliWDlSVEp4MkFBNHFoV0tjdjlZV09mZ21MaWpZIl0sImxvY2FsaXR5IjoiTG9uZG9uIn0sImNuZiI6eyJqd2siOnsiY3J2IjoiUC0yNTYiLCJrdHkiOiJFQyIsIngiOiJGdWhjZXd3cDNtVVZENWtPVFV4eExDZFdEdWtWVDdtZThpRUM0aW84VHA0IiwieSI6Ikd0UG9TUTRHSzZfb29qcTJmUVBVMEJDN0MwVGtuVkJyaDl3bnlUbVZNbzgifX0sImV4cCI6MTgyMzgwNzUwNiwiaWF0IjoxNzkyMjcxNTA2LCJpc3MiOiJodHRwczovL2dvLWlzc3Vlci5leGFtcGxlIiwianRpIjoiZWViYmI0MWYtYzFhYy00NzM2LWFiN2YtNWIyMDI1NmEzOTU3IiwibmJmIjoxNzkyMjcxNTA2LCJ2Y3QiOiJ1cm46dnAtc3Bpa2U6dGVzdDoxIn0.nj6gVBBFiiAC-Av2EEIzvFGSY87-QhiqCex0ku-fE853qBe0CCH0fjDkwzEFP_CRAnUI_N3LIEUv4zEsgpU33g~WyJMRlJWN0lkRmFYaEV5d3B4LS0tYzVBIiwic3RyZWV0IiwiU3QgSmFtZXMncyBTcXVhcmUgMSJd~WyJ4UkhUcW1CeW9sYXRXYlkwZHRGLTNnIiwiZ2l2ZW5fbmFtZSIsIkFkYSJd~WyJTb19ZNEVaNm5nWEpteS0wWXZnVDN3IiwiZmFtaWx5X25hbWUiLCJMb3ZlbGFjZSJd~eyJhbGciOiJFUzI1NiIsInR5cCI6ImtiK2p3dCJ9.eyJhdWQiOiJodHRwczovL3ZlcmlmaWVyLmV4YW1wbGUiLCJpYXQiOjE3OTIyNzE1MDYsIm5vbmNlIjoiZ28tbm9uY2UtMTIzIiwic2RfaGFzaCI6ImZRRkNyUzVXVmFPN2tRZzV1ejNfbzJZQ3J0R1QybW5ycm1kTG5LY1h3TDgifQ.q5Grj1V7g8liUUmoKntVV9ZO6MFwMkunjT_9-8yNRYfhaLTYhT59c5jfZteEa43g3qA7GCz1_2n2yEyMADHI2A"
+}

@@ -1,0 +1,49 @@
+# cargo-deny policy. Every exception includes its scope and removal condition.
+
+[graph]
+all-features = false
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "Marvin Attack on RSA private-key operations. This verifier performs no RSA private-key operation. rsa is mandatory in jose-rs/kryptering and in tunnelbana's older JOSE stack. Remove when those stacks make RSA optional or a fixed release exists." },
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.5 remains only through tunnelbana's grindvakt -> p256 0.13 chain; this workspace's own crates use the 0.14 family. Remove when tunnelbana/grindvakt upgrades p256." },
+    { id = "RUSTSEC-2026-0374", reason = "basic-toml is build-time template tooling in uniffi_bindgen, not a shipped verifier library. Remove with a uniffi upgrade." },
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1.x is used by uniffi_macros at compile time only. Remove with a uniffi upgrade." },
+    { id = "RUSTSEC-2024-0436", reason = "paste is a proc-macro used by uniffi at compile time only. Remove with a uniffi upgrade." },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+allow = [
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0", # webpki-root-certs, used by the gateway HTTPS client
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+allow-wildcard-paths = true
+# Do not add an OpenSSL/native-TLS stack to the verifier.
+deny = [
+    { name = "openssl" },
+    { name = "openssl-sys" },
+    { name = "native-tls" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = ["https://github.com/SUNET/tunnelbana"]

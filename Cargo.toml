@@ -1,0 +1,59 @@
+[workspace]
+resolver = "2"
+members = [".", "ffi", "tunnelbana-plugin", "service"]
+
+[workspace.package]
+edition = "2021"
+license = "BSD-2-Clause"
+repository = "https://github.com/sirosfoundation/siros-verifier-core"
+authors = ["SIROS Foundation"]
+
+[package]
+name = "siros-verifier-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Sans-I/O digital credential verification core"
+publish = false
+
+[dependencies]
+# default-features = false drops PKCS#11 (cryptoki) so the crate can target wasm32;
+# kryptering needs an explicit provider feature.
+jose-rs = { version = "0.10", default-features = false }
+kryptering = { version = "0.7", default-features = false, features = ["rustcrypto"] }
+aes-gcm = "0.11"
+ciborium = "0.2"
+hkdf = "0.13"
+hmac = "0.13"
+base64 = "0.22"
+p256 = { version = "0.14", features = ["ecdh", "ecdsa", "pkcs8"] }
+getrandom = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+thiserror = "2"
+url = "2"
+x509-cert = "0.2"
+zeroize = "1"
+rcgen = { version = "0.14", optional = true }
+
+[features]
+# Test simulators are opt-in so production builds do not include rcgen or test-only issuance paths.
+default = []
+testutil = ["dep:rcgen"]
+
+[[example]]
+name = "bench"
+required-features = ["testutil"]
+
+[[example]]
+name = "emit_vectors"
+required-features = ["testutil"]
+
+[[example]]
+name = "live_pdp_fixture"
+required-features = ["testutil"]
+
+# On wasm32-unknown-unknown, getrandom 0.4 uses the wasm_js backend selected in .cargo/config.toml.

@@ -1,0 +1,102 @@
+[
+ {
+  "input": "{\"subject\":{\"type\":\"key\",\"id\":\"x5t#S256:abc\"},\"resource\":{\"type\":\"x5c\",\"id\":\"x5t#S256:abc\",\"key\":[\"MIIB\",\"MIIC\"]},\"action\":{\"name\":\"pid-provider\",\"parameters\":{\"credential_types\":[\"eu.europa.ec.eudi.pid.1\"]}}}",
+  "canonical": "{\"action\":{\"name\":\"pid-provider\",\"parameters\":{\"credential_types\":[\"eu.europa.ec.eudi.pid.1\"]}},\"resource\":{\"id\":\"x5t#S256:abc\",\"key\":[\"MIIB\",\"MIIC\"],\"type\":\"x5c\"},\"subject\":{\"id\":\"x5t#S256:abc\",\"type\":\"key\"}}",
+  "sha256": "Aym8WW8r8wN6OYpHn8Wd6UkmlmH7Gxg0KegmLstPZ6Y"
+ },
+ {
+  "input": "{\"\\u20ac\":\"Euro\",\"\\r\":\"CR\",\"\\ufb33\":\"Dalet\",\"1\":\"One\",\"\\ud83d\\ude00\":\"Emoji\",\"\\u0080\":\"Ctl\",\"\\u00f6\":\"O\"}",
+  "canonical": "{\"\\r\":\"CR\",\"1\":\"One\",\"\":\"Ctl\",\"ö\":\"O\",\"€\":\"Euro\",\"😀\":\"Emoji\",\"דּ\":\"Dalet\"}",
+  "sha256": "7xJjYJqhRjN3rF9VHrro6H-NcXPOGzek_nVq1GVPSig"
+ },
+ {
+  "input": "{\"literals\":[null,true,false],\"string\":\"\\u20ac$\\u000F\\u000aA'\\u0042\\u0022\\u005c\\\\\\\"/\"}",
+  "canonical": "{\"literals\":[null,true,false],\"string\":\"€$\\u000f\\nA'B\\\"\\\\\\\\\\\"/\"}",
+  "sha256": "g0sK4N1olE8Zg2qknWCKpJdfA5mPknRm-LZI1fkn7O4"
+ },
+ {
+  "input": "{\"k\":\"\\u00e9\\ud83d\\ude00 \\u2028 \\u007f\"}",
+  "canonical": "{\"k\":\"é😀 \u2028 \"}",
+  "sha256": "L-VgNL9znCTk3iZ_ZSGXUsPfOF6Roo8O2vun16nrC0w"
+ },
+ {
+  "input": "{\"max\":18446744073709551615,\"min\":-9223372036854775808,\"zero\":0,\"neg\":-1}",
+  "canonical": "{\"max\":18446744073709552000,\"min\":-9223372036854776000,\"neg\":-1,\"zero\":0}",
+  "sha256": "giv0yBNgHox8RwxAxO8X5lbc5WB90kUP7EfSr0pAc88"
+ },
+ {
+  "input": "{\"c\":\"\\u0000\\u0001\\u0008\\u0009\\u000a\\u000b\\u000c\\u000d\\u001f\\u0020\"}",
+  "canonical": "{\"c\":\"\\u0000\\u0001\\b\\t\\n\\u000b\\f\\r\\u001f \"}",
+  "sha256": "aTBU0fgHVeq22IX67GaxxKbfGZJk2z9-omiSls5wbe8"
+ },
+ {
+  "input": " {  \"b\" : [ ] ,\n \"a\" : { } , \"c\":[ [ ] , { } ] } ",
+  "canonical": "{\"a\":{},\"b\":[],\"c\":[[],{}]}",
+  "sha256": "klxnOt8YyiIO59p_XjRN72-MYL5yGy72jJOmfufZyIM"
+ },
+ {
+  "input": "{\"a\\u0062\":1,\"\":2,\"a\":3,\"aa\":4,\"b\":5}",
+  "canonical": "{\"\":2,\"a\":3,\"aa\":4,\"ab\":1,\"b\":5}",
+  "sha256": "w-EHcpoZhj6x2nyu19dXDIZzdPjAG_m7J32DwlKZJnY"
+ },
+ {
+  "input": "{\"nested\":{\"z\":1,\"a\":{\"y\":[3,2,1],\"b\":null}}}",
+  "canonical": "{\"nested\":{\"a\":{\"b\":null,\"y\":[3,2,1]},\"z\":1}}",
+  "sha256": "GRsSZamJzeZLi7JmNe2KaQG3i3e6vUvre6fVQus7D4o"
+ },
+ {
+  "input": "\"just a string \\\"quoted\\\"\"",
+  "canonical": "\"just a string \\\"quoted\\\"\"",
+  "sha256": "Cv044O3jHYtoKIMwHJ99czxBUS01dRsY9pX9qAnODjg"
+ },
+ {
+  "input": "[]",
+  "canonical": "[]",
+  "sha256": "T1PNoYwrqgwDVLtfmj7L5e0Sq02OEbqHPC8RFhICuUU"
+ },
+ {
+  "input": "null",
+  "canonical": "null",
+  "sha256": "dCNOmK_nSY-12vHzasLXiswzlGT5UHA7jAGYkvmCuQs"
+ },
+ {
+  "input": "true",
+  "canonical": "true",
+  "sha256": "tb6kG2xiP3wJ8b8k3K5Y66s8DN2QrZZrxDpFtEhn4Ss"
+ },
+ {
+  "input": "42",
+  "canonical": "42",
+  "sha256": "c0dctApWjo2ooEXO0RATfhWfiQrE2og7axfcZRs6gEk"
+ },
+ {
+  "input": "{\"slash\":\"a/b\",\"tab\":\"\\t\",\"uni\":\"\\u00ff\\u0100\\uffff\"}",
+  "canonical": "{\"slash\":\"a/b\",\"tab\":\"\\t\",\"uni\":\"ÿĀ￿\"}",
+  "sha256": "BEZbEtoU6z7RSy-yIQ6b0cv3v9bVxrGLGSsHrs5fsRA"
+ },
+ {
+  "input": "{\"n\":1.5}",
+  "canonical": "{\"n\":1.5}",
+  "sha256": "yxTVXP5WL9ZZLZGfXfrPqHCGh7dGodEQxt1VKcQQ53I"
+ },
+ {
+  "input": "{\"n\":1e2}",
+  "canonical": "{\"n\":100}",
+  "sha256": "s5AixO2WUlxCzQ585VMIUzliplXxwZ1drC8D6d2ZWyw"
+ },
+ {
+  "input": "{\"n\":100.0}",
+  "canonical": "{\"n\":100}",
+  "sha256": "s5AixO2WUlxCzQ585VMIUzliplXxwZ1drC8D6d2ZWyw"
+ },
+ {
+  "input": "{\"edge\":9007199254740991,\"neg\":-9007199254740991}",
+  "canonical": "{\"edge\":9007199254740991,\"neg\":-9007199254740991}",
+  "sha256": "c11K5XHD2U82tKEXjlNXwbuDnB2RNntrmiDxohoyptk"
+ },
+ {
+  "input": "{\"n\":9007199254740993}",
+  "canonical": "{\"n\":9007199254740992}",
+  "sha256": "Zsh9nLMBTgWhG6qX32IoLYnUJfIu4VgWV3yEU04u8bs"
+ }
+]

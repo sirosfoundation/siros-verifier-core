@@ -1,0 +1,50 @@
+[package]
+name = "siros-verifier-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+siros-verifier-core = { path = ".." }
+libfuzzer-sys = "0.4"
+jose-rs = { version = "0.10", default-features = false }
+p256 = { version = "0.14", features = ["ecdh"] }
+serde_json = "1"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "mdoc_response"
+path = "fuzz_targets/mdoc_response.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "mdoc_session"
+path = "fuzz_targets/mdoc_session.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "sdjwt"
+path = "fuzz_targets/sdjwt.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "oid4vp_jwe"
+path = "fuzz_targets/oid4vp_jwe.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "prepare_seeds"
+path = "src/bin/prepare_seeds.rs"
+test = false
+doc = false
+
+[workspace]

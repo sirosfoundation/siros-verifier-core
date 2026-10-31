@@ -1,0 +1,30 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Fuzz build and crash artifacts (seed corpora are source, not artifacts)
+/fuzz/target/
+/fuzz/artifacts/
+
+# Kotlin/Gradle test artifacts
+/ffi/kotlin-test/build/
+/ffi/kotlin-test/.gradle/
+/ffi/kotlin-test/.kotlin/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Agent and local tooling scratch
+.claude/
+scripts/__pycache__/
+
+# Coverage
+lcov.info

@@ -1,0 +1,23 @@
+{
+  "generator": "go-jose/v4 ECDH-ES",
+  "plaintext": "{\"vp_token\":{\"pid\":[\"x\"]},\"state\":\"s-from-go\"}",
+  "private_jwk": {
+    "crv": "P-256",
+    "d": "elxAzMsxgd4rrpdOtRibYBAW-JICehBiSBkMMLUaj24",
+    "kty": "EC",
+    "x": "ffcChPtmIfQFjVx-BBriUHsZDb2Xcl_Qg83WEhJvPD0",
+    "y": "gqK0YxDYIU5YUtRlCdVVeZX_mSpuXYCDm0Jlseg5LYQ"
+  },
+  "vectors": [
+    {
+      "enc": "A128GCM",
+      "with_party_info": false,
+      "jwe": "eyJhbGciOiJFQ0RILUVTIiwiZW5jIjoiQTEyOEdDTSIsImVwayI6eyJrdHkiOiJFQyIsImNydiI6IlAtMjU2IiwieCI6ImRXS0g4QTgyXzZDRzgxRmhvbHB3N0tPc1NlQXBlRHdSeW5QQVRMSUtWb1UiLCJ5IjoiTk14akg0MHF0SDZ4akJEODNaSHNMWW96YVJPY0Z4SzhNQjgtdWxhSWUxTSJ9LCJraWQiOiJnby1yZWNpcGllbnQifQ..3XnNcdWZRzogZ1N9.I91ICbfMZJ8fteNRLoIHbwgaqaCYZemZz-Ttbeu-pM4G24YzdogJRj5UQ0yxzQ._Pz9iS9Bcx1nVcygIa9z_Q"
+    },
+    {
+      "enc": "A256GCM",
+      "with_party_info": false,
+      "jwe": "eyJhbGciOiJFQ0RILUVTIiwiZW5jIjoiQTI1NkdDTSIsImVwayI6eyJrdHkiOiJFQyIsImNydiI6IlAtMjU2IiwieCI6InQ0OHh4UE5wSVpTS2VTUDh5TGRyX1d0QUdyaVFrLWhmQkpmX01XbUVCLWMiLCJ5IjoiZE1qVnFWZ3RqdXRPX0lVU0x1N3VOTkY5alJjSTluUzY3MnJRVEtyMzg5MCJ9LCJraWQiOiJnby1yZWNpcGllbnQifQ..7bX6QksvpLjATX5P.QaR-7RD2ZiDJCCGnd5Sw7D-rga31L8Zg2FmMxxrHsIZY6H9VHomPmz9XS09h7w.CE-Zuogtn1GJyyjTdQnYuA"
+    }
+  ]
+}

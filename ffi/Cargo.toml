@@ -1,0 +1,34 @@
+[package]
+name = "siros-verifier-core-ffi"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "UniFFI bindings for the SIROS verifier core"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "siros_verifier_core_ffi"
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin.rs"
+
+[dependencies]
+siros-verifier-core = { path = "..", default-features = false }
+uniffi = { version = "0.28", features = ["cli"] }
+ciborium = "0.2"
+serde_json = "1"
+thiserror = "2"
+p256 = { version = "0.14", features = ["ecdh"] }
+
+[features]
+# Exports a constructor that imports a fixed reader key, for running spec vectors from Kotlin/Swift tests. Never enable in a release build.
+vector-tests = ["siros-verifier-core/testutil"]
+
+[dev-dependencies]
+siros-verifier-core = { path = "..", features = ["testutil"] }
+p256 = { version = "0.14", features = ["ecdh"] }
+aes-gcm = "0.11"

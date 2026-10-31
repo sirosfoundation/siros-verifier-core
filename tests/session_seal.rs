@@ -1,0 +1,95 @@
+use siros_verifier_core::oid4vp::{create_request, software_signer, RequestConfig};
+use siros_verifier_core::session_seal::SessionSealer;
+use siros_verifier_core::testutil::*;
+use siros_verifier_core::Error;
+
+const NOW: i64 = 1_800_000_000;
+const MASTER: [u8; 32] = [7u8; 32];
+
+fn session() -> siros_verifier_core::oid4vp::Session {
+    let (cert, key) = self_signed_ec("verifier.example", "ES256");
+    let signer = software_signer(&key).unwrap();
+    let cfg = RequestConfig {
+        response_uri: "https://v.example/r/x".into(),
+        dcql_query: serde_json::json!({"credentials": []}),
+        ttl_secs: 300,
+    };
+    create_request(&cfg, &signer, "ES256", &[cert], NOW)
+        .unwrap()
+        .1
+}
+
+fn sealer(tenant: &str) -> SessionSealer {
+    SessionSealer::from_master(&MASTER, tenant).unwrap()
+}
+
+#[test]
+fn round_trips_and_never_shows_the_private_key() {
+    let s = session();
+    let d = s.enc_key.d.clone().expect("session holds the private key");
+    let sealed = sealer("acme").seal(&s, b"flow-1").unwrap();
+    assert!(sealed.starts_with("v1."));
+    assert!(
+        !sealed.contains(&d),
+        "private key must not appear in the clear"
+    );
+    let back = sealer("acme").unseal(&sealed, b"flow-1").unwrap();
+    assert_eq!(back.nonce, s.nonce);
+    assert_eq!(back.state, s.state);
+    assert_eq!(back.enc_key.d, s.enc_key.d);
+}
+
+#[test]
+fn a_sealed_session_is_bound_to_its_flow_and_tenant() {
+    let sealed = sealer("acme").seal(&session(), b"flow-1").unwrap();
+    assert!(matches!(
+        sealer("acme").unseal(&sealed, b"flow-2"),
+        Err(Error::Integrity(_))
+    ));
+    assert!(matches!(
+        sealer("globex").unseal(&sealed, b"flow-1"),
+        Err(Error::Integrity(_))
+    ));
+    let other_master = SessionSealer::from_master(&[8u8; 32], "acme").unwrap();
+    assert!(matches!(
+        other_master.unseal(&sealed, b"flow-1"),
+        Err(Error::Integrity(_))
+    ));
+}
+
+#[test]
+fn tampering_truncation_and_wrong_versions_are_refused() {
+    let sealed = sealer("acme").seal(&session(), b"f").unwrap();
+    let mut bytes = sealed.clone().into_bytes();
+    let n = bytes.len() - 2;
+    bytes[n] = if bytes[n] == b'A' { b'B' } else { b'A' };
+    assert!(sealer("acme")
+        .unseal(&String::from_utf8(bytes).unwrap(), b"f")
+        .is_err());
+    assert!(matches!(
+        sealer("acme").unseal("v1.AAAA", b"f"),
+        Err(Error::Malformed(_))
+    ));
+    assert!(matches!(
+        sealer("acme").unseal(&sealed.replacen("v1.", "v2.", 1), b"f"),
+        Err(Error::Malformed(_))
+    ));
+    assert!(matches!(
+        sealer("acme").unseal("garbage", b"f"),
+        Err(Error::Malformed(_))
+    ));
+    assert!(matches!(
+        sealer("acme").unseal(&"x".repeat(1024 * 1024 + 1), b"f"),
+        Err(Error::Policy(_))
+    ));
+}
+
+#[test]
+fn every_seal_is_different_and_a_weak_master_is_refused() {
+    let s = session();
+    let a = sealer("acme").seal(&s, b"f").unwrap();
+    let b = sealer("acme").seal(&s, b"f").unwrap();
+    assert_ne!(a, b, "fresh nonce per seal");
+    assert!(SessionSealer::from_master(&[1u8; 31], "acme").is_err());
+    assert!(SessionSealer::from_master(b"", "acme").is_err());
+}

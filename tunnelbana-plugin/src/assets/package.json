@@ -1,0 +1,12 @@
+{
+  "name": "@sirosfoundation/presentation-flow",
+  "version": "0.1.0",
+  "description": "Framework-free OpenID4VP presentation UI driven by DCQL",
+  "type": "module",
+  "main": "presentation-flow.js",
+  "exports": "./presentation-flow.js",
+  "scripts": {
+    "test": "node --test presentation-flow.test.mjs"
+  },
+  "license": "BSD-2-Clause"
+}

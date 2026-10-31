@@ -1,0 +1,796 @@
+//! End-to-end flows through the tunnelbana Backend interface: browser start, wallet fetches the request object,
+//! wallet posts the encrypted response, browser collects the result. The wallet is simulated; go-trust is mocked.
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use serde_json::{json, Value};
+use siros_verifier_core::testutil::*;
+use siros_verifier_core_tunnelbana::*;
+use tunnelbana_core::context::Context;
+use tunnelbana_core::http::HttpRequestData;
+use tunnelbana_core::internal::InternalData;
+use tunnelbana_core::plugin::{Backend, BackendAction};
+use tunnelbana_core::state::State;
+
+const T0: i64 = 1_800_000_000;
+
+/// A permit as a real go-trust (b0ec45c, whitelist registry) returned it on 2026-10-26.
+const REAL_PERMIT: &str = r#"{"decision":true,"context":{"reason":{"matched_list":"pid","registry":"wl","requested_credential_types":["urn:eudi:pid:1"],"resolution_ms":7,"role":"pid-provider","trust_path":"system_ca_pinned_hash","type":"whitelist","user":"trusted via whitelist (pid, pinned certificate hash, no chain validation)"},"trust_metadata":{"matched_list":"pid","registry":"wl","trust_framework":"whitelist","trust_path":"system_ca_pinned_hash"}}}"#;
+const REAL_DENY: &str = r#"{"decision":false,"context":{"reason":{"error":"no registry returned positive match","registries_queried":1,"registry_results":[{"decision":false,"duration_ms":0,"reason":{"admin":"subject not in whitelist for action 'other-role'","error":"subject not in whitelist for action 'other-role'","registry":"wl","type":"whitelist","user":"subject not in whitelist for action 'other-role'"},"registry":"wl"}]}}}"#;
+
+struct MockPdp {
+    permit: AtomicBool,
+    down: AtomicBool,
+    calls: AtomicUsize,
+    next_update_in: i64,
+    /// Answer exactly as go-trust does today: no context.id, no trust_data.
+    go_trust_today: AtomicBool,
+}
+#[async_trait]
+impl PdpClient for MockPdp {
+    async fn evaluate(&self, req: &Value) -> Result<Value, String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.down.load(Ordering::SeqCst) {
+            return Err("connect refused".into());
+        }
+        assert_eq!(
+            req["action"]["name"], "pid-provider",
+            "role comes from config"
+        );
+        if self.go_trust_today.load(Ordering::SeqCst) {
+            return Ok(serde_json::from_str(REAL_PERMIT).unwrap());
+        }
+        assert_eq!(req["resource"]["type"], "x5c");
+        Ok(json!({"decision": self.permit.load(Ordering::SeqCst),
+                  "context": {"id": format!("dec-{}", self.calls.load(Ordering::SeqCst)),
+                              "trust_data": [{"registry": "etsi", "as_of": "2027-01-15T00:00:00Z",
+                                              "next_update": next_update(self.next_update_in)}]}}))
+    }
+}
+fn next_update(secs_after_t0: i64) -> String {
+    // T0 = 2027-01-15T08:00:00Z
+    let t = T0 + secs_after_t0;
+    let days = t.div_euclid(86400);
+    let rem = t.rem_euclid(86400);
+    // civil from days (Hinnant)
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
+struct Fx {
+    b: VpBackend,
+    pdp: Arc<MockPdp>,
+    clock: Arc<AtomicI64>,
+    holder: jose_rs::jwk::Jwk,
+    issued: Issued,
+}
+
+fn fx_with(next_update_in: i64) -> Fx {
+    fx_full(next_update_in, "/family_name")
+}
+fn fx_full(next_update_in: i64, subject_pointer: &str) -> Fx {
+    let (v_cert, v_key) = self_signed_ec("verifier.example", "ES256");
+    let (i_cert, i_key) = self_signed_ec("issuer.example", "ES256");
+    let holder = ec_jwk("ES256", "holder");
+    let mut spec = IssueSpec::new(json!({
+        "iss": "https://issuer.example", "vct": "urn:eudi:pid:1", "iat": T0 - 10, "exp": T0 + 1_000_000,
+        "given_name": "Ada", "family_name": "Lovelace", "address": {"locality": "London"},
+    }));
+    spec.holder_pub = Some(public_of(&holder));
+    spec.x5c_der = vec![i_cert];
+    spec.conceal = vec![vec![Seg::Key("given_name")], vec![Seg::Key("family_name")]];
+    let issued = issue(&i_key, &spec).unwrap();
+
+    let cfg: VpBackendConfig = serde_json::from_value(json!({
+        "dcql": {"credentials": [{"id": "pid", "format": "dc+sd-jwt",
+                 "meta": {"vct_values": ["urn:eudi:pid:1"]},
+                 "claims": [{"path": ["given_name"]}, {"path": ["family_name"]}]}]},
+        "attribute_map": {"givenName": "/given_name", "sn": "/family_name", "l": "/address/locality", "missing": "/nope"},
+        "subject_pointer": subject_pointer,
+        "role": "pid-provider",
+        "auth_class_ref": "urn:eudi:loa:high",
+    })).unwrap();
+    let pdp = Arc::new(MockPdp {
+        permit: AtomicBool::new(true),
+        down: AtomicBool::new(false),
+        calls: AtomicUsize::new(0),
+        next_update_in,
+        go_trust_today: AtomicBool::new(false),
+    });
+    let gate = TrustGate::new(
+        pdp.clone(),
+        p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap(),
+        "k1",
+        "core-1",
+        "tenant-a",
+        "https://pdp.example",
+        3600,
+    );
+    let clock = Arc::new(AtomicI64::new(T0));
+    let c2 = clock.clone();
+    let b = VpBackend::new(
+        "vp",
+        "https://proxy.example/vp",
+        cfg,
+        gate,
+        siros_verifier_core::oid4vp::software_signer(&v_key).unwrap(),
+        vec![v_cert],
+        Arc::new(move || c2.load(Ordering::SeqCst)),
+    )
+    .unwrap();
+    Fx {
+        b,
+        pdp,
+        clock,
+        holder,
+        issued,
+    }
+}
+fn fx() -> Fx {
+    fx_with(100_000)
+}
+
+fn req(path: &str, method: &str) -> HttpRequestData {
+    HttpRequestData {
+        path: path.into(),
+        method: method.into(),
+        ..Default::default()
+    }
+}
+fn respond_body(a: BackendAction) -> (u16, String) {
+    match a {
+        BackendAction::Respond(r) => (r.status, String::from_utf8(r.body).unwrap()),
+        BackendAction::AuthResponse(_) => panic!("unexpected auth response"),
+    }
+}
+
+/// Browser starts a flow; returns (cookie state, flow id).
+async fn start(f: &Fx) -> (State, String) {
+    let mut ctx = Context::new(req("vp/start", "GET"), State::new());
+    let page =
+        f.b.start_auth(&mut ctx, InternalData::request("https://rp.example"))
+            .await
+            .unwrap();
+    let html = String::from_utf8(page.body).unwrap();
+    assert!(
+        html.contains("openid4vp://cb?client_id=x509_hash%3A"),
+        "{html}"
+    );
+    assert!(html.contains("request_uri_method=get"));
+    let id = ctx.state.get_str(NS, FLOW_KEY).unwrap();
+    assert!(html.contains(&format!("vp%2Frequest%2F{id}")), "{html}");
+    (ctx.state, id)
+}
+async fn fetch_jar(f: &Fx, id: &str) -> String {
+    let mut ctx = Context::new(req(&format!("vp/request/{id}"), "GET"), State::new());
+    let (st, body) = respond_body(f.b.handle_endpoint(&mut ctx, "request").await.unwrap());
+    assert_eq!(st, 200);
+    body
+}
+fn wallet(f: &Fx, jar: &str) -> String {
+    wallet_respond(
+        jar,
+        &f.holder,
+        &[WalletCredential {
+            id: "pid",
+            issued: &f.issued,
+            disclose: &[0, 1],
+        }],
+        f.clock.load(Ordering::SeqCst),
+    )
+    .unwrap()
+}
+async fn post(f: &Fx, id: &str, jwe: &str) -> (u16, String) {
+    let mut r = req(&format!("vp/response/{id}"), "POST");
+    r.form = BTreeMap::from([("response".to_string(), jwe.to_string())]);
+    r.form_pairs = vec![("response".into(), jwe.into())];
+    let mut ctx = Context::new(r, State::new());
+    respond_body(f.b.handle_endpoint(&mut ctx, "response").await.unwrap())
+}
+async fn complete(f: &Fx, state: &State) -> Result<BackendAction, String> {
+    let mut ctx = Context::new(req("vp/complete", "GET"), state.clone());
+    f.b.handle_endpoint(&mut ctx, "complete")
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tokio::test]
+async fn happy_path_delivers_mapped_attributes_once() {
+    let f = fx();
+    let (state, id) = start(&f).await;
+    // before the wallet answers, the browser is told to wait
+    assert!(matches!(
+        complete(&f, &state).await.unwrap(),
+        BackendAction::Respond(_)
+    ));
+    let jar = fetch_jar(&f, &id).await;
+    let (st, _) = post(&f, &id, &wallet(&f, &jar)).await;
+    assert_eq!(st, 200);
+    let BackendAction::AuthResponse(d) = complete(&f, &state).await.unwrap() else {
+        panic!("expected auth response")
+    };
+    assert_eq!(d.requester.as_deref(), Some("https://rp.example"));
+    assert_eq!(d.subject_id.as_deref(), Some("Lovelace"));
+    assert_eq!(d.attr_first("givenName"), Some("Ada"));
+    assert_eq!(d.attr_first("l"), Some("London"));
+    assert!(!d.attributes.contains_key("missing"));
+    assert_eq!(
+        d.auth_info.auth_class_ref.as_deref(),
+        Some("urn:eudi:loa:high")
+    );
+    assert_eq!(
+        d.auth_info.issuer.as_deref(),
+        Some("https://issuer.example")
+    );
+    // second collection fails: one-time
+    assert!(complete(&f, &state).await.is_err());
+}
+
+#[tokio::test]
+async fn untrusted_issuer_fails_the_flow_and_no_attributes_leak() {
+    let f = fx();
+    f.pdp.permit.store(false, Ordering::SeqCst);
+    let (state, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    let (st, body) = post(&f, &id, &wallet(&f, &jar)).await;
+    assert_eq!(st, 403);
+    assert!(!body.contains("Lovelace"));
+    assert_eq!(
+        complete(&f, &state).await.err().unwrap(),
+        "authentication error: issuer_not_trusted"
+    );
+}
+
+#[tokio::test]
+async fn pdp_down_with_cold_cache_fails_closed() {
+    let f = fx();
+    f.pdp.down.store(true, Ordering::SeqCst);
+    let (state, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    assert_eq!(post(&f, &id, &wallet(&f, &jar)).await.0, 503);
+    assert_eq!(
+        complete(&f, &state).await.err().unwrap(),
+        "authentication error: trust_unavailable"
+    );
+}
+
+#[tokio::test]
+async fn warm_receipt_survives_a_pdp_outage_until_it_expires() {
+    let f = fx();
+    // first login warms the receipt
+    let (s1, id1) = start(&f).await;
+    let jar = fetch_jar(&f, &id1).await;
+    assert_eq!(post(&f, &id1, &wallet(&f, &jar)).await.0, 200);
+    assert!(matches!(
+        complete(&f, &s1).await.unwrap(),
+        BackendAction::AuthResponse(_)
+    ));
+    assert_eq!(f.pdp.calls.load(Ordering::SeqCst), 1);
+
+    // PDP goes away; the next login within the receipt's life still works without a call
+    f.pdp.down.store(true, Ordering::SeqCst);
+    f.clock.store(T0 + 600, Ordering::SeqCst); // fresh: refresh_after is T0 + 1800
+    let (s2, id2) = start(&f).await;
+    let jar = fetch_jar(&f, &id2).await;
+    assert_eq!(post(&f, &id2, &wallet(&f, &jar)).await.0, 200);
+    assert!(matches!(
+        complete(&f, &s2).await.unwrap(),
+        BackendAction::AuthResponse(_)
+    ));
+    assert_eq!(
+        f.pdp.calls.load(Ordering::SeqCst),
+        1,
+        "fresh receipt: no PDP call"
+    );
+
+    // past refresh_after the gate tries the PDP, fails, and still uses the valid receipt
+    f.clock.store(T0 + 2000, Ordering::SeqCst);
+    let (s3, id3) = start(&f).await;
+    let jar = fetch_jar(&f, &id3).await;
+    assert_eq!(post(&f, &id3, &wallet(&f, &jar)).await.0, 200);
+    assert!(matches!(
+        complete(&f, &s3).await.unwrap(),
+        BackendAction::AuthResponse(_)
+    ));
+    assert_eq!(
+        f.pdp.calls.load(Ordering::SeqCst),
+        2,
+        "stale receipt: one refresh attempt"
+    );
+
+    // after exp the outage is no longer survivable
+    f.clock.store(T0 + 3700, Ordering::SeqCst);
+    let (_s4, id4) = start(&f).await;
+    let jar = fetch_jar(&f, &id4).await;
+    assert_eq!(post(&f, &id4, &wallet(&f, &jar)).await.0, 503);
+}
+
+#[tokio::test]
+async fn receipt_lifetime_follows_trust_data_next_update() {
+    let f = fx_with(900); // the registry's data expires 15 minutes from now
+    let (s, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    assert_eq!(post(&f, &id, &wallet(&f, &jar)).await.0, 200);
+    complete(&f, &s).await.unwrap();
+    f.pdp.down.store(true, Ordering::SeqCst);
+    f.clock.store(T0 + 901, Ordering::SeqCst);
+    let (_s, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    assert_eq!(
+        post(&f, &id, &wallet(&f, &jar)).await.0,
+        503,
+        "receipt must not outlive the trust data"
+    );
+}
+
+#[tokio::test]
+async fn replayed_wallet_response_is_rejected_and_does_not_double_deliver() {
+    let f = fx();
+    let (state, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    let jwe = wallet(&f, &jar);
+    assert_eq!(post(&f, &id, &jwe).await.0, 200);
+    assert_eq!(post(&f, &id, &jwe).await.0, 409);
+    assert!(matches!(
+        complete(&f, &state).await.unwrap(),
+        BackendAction::AuthResponse(_)
+    ));
+}
+
+#[tokio::test]
+async fn response_for_another_flow_does_not_verify() {
+    let f = fx();
+    let (_s1, id1) = start(&f).await;
+    let (s2, id2) = start(&f).await;
+    let jwe_for_1 = wallet(&f, &fetch_jar(&f, &id1).await);
+    // posted to flow 2: wrong nonce/state/key for that session
+    assert_eq!(post(&f, &id2, &jwe_for_1).await.0, 400);
+    assert!(complete(&f, &s2).await.is_err());
+}
+
+#[tokio::test]
+async fn only_the_starting_browser_can_collect() {
+    let f = fx();
+    let (_state, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    assert_eq!(post(&f, &id, &wallet(&f, &jar)).await.0, 200);
+    // an attacker's browser has no cookie, or a cookie for a different flow
+    assert!(complete(&f, &State::new()).await.is_err());
+    let (other, _) = start(&f).await;
+    assert!(
+        matches!(
+            complete(&f, &other).await.unwrap(),
+            BackendAction::Respond(_)
+        ),
+        "other flow still pending"
+    );
+}
+
+#[tokio::test]
+async fn expired_flow_is_not_answerable_or_collectable() {
+    let f = fx();
+    let (state, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    let jwe = wallet(&f, &jar);
+    f.clock.store(T0 + 301, Ordering::SeqCst);
+    assert_eq!(post(&f, &id, &jwe).await.0, 400);
+    assert!(complete(&f, &state).await.is_err());
+}
+
+#[tokio::test]
+async fn flow_ids_are_validated_and_unknown_ids_get_nothing() {
+    let f = fx();
+    for bad in [
+        "short",
+        "../../etc/passwd/xxxxxxxxxxxxxx",
+        &"a".repeat(65),
+        "AAAAAAAAAAAAAAAA!",
+    ] {
+        let mut ctx = Context::new(req(&format!("vp/request/{bad}"), "GET"), State::new());
+        let e =
+            f.b.handle_endpoint(&mut ctx, "request")
+                .await
+                .err()
+                .expect("rejected")
+                .to_string();
+        assert!(
+            e.contains("flow id"),
+            "{bad}: rejected for the wrong reason: {e}"
+        );
+    }
+    let mut ctx = Context::new(
+        req("vp/request/AAAAAAAAAAAAAAAAAAAAAA", "GET"),
+        State::new(),
+    );
+    assert!(f.b.handle_endpoint(&mut ctx, "request").await.is_err());
+    let mut r = req("vp/response/AAAAAAAAAAAAAAAAAAAAAA", "POST");
+    r.form = BTreeMap::from([("response".to_string(), "x".to_string())]);
+    let mut ctx = Context::new(r, State::new());
+    let (st, _) = respond_body(f.b.handle_endpoint(&mut ctx, "response").await.unwrap());
+    assert_eq!(st, 404);
+}
+
+#[tokio::test]
+async fn get_on_the_response_endpoint_is_refused() {
+    let f = fx();
+    let (_s, id) = start(&f).await;
+    let mut ctx = Context::new(req(&format!("vp/response/{id}"), "GET"), State::new());
+    assert_eq!(
+        respond_body(f.b.handle_endpoint(&mut ctx, "response").await.unwrap()).0,
+        405
+    );
+}
+
+#[tokio::test]
+async fn missing_response_parameter_fails_the_flow() {
+    let f = fx();
+    let (state, id) = start(&f).await;
+    let mut ctx = Context::new(req(&format!("vp/response/{id}"), "POST"), State::new());
+    assert_eq!(
+        respond_body(f.b.handle_endpoint(&mut ctx, "response").await.unwrap()).0,
+        400
+    );
+    assert_eq!(
+        complete(&f, &state).await.err().unwrap(),
+        "authentication error: missing_response"
+    );
+}
+
+#[test]
+fn routes_cover_the_flow_endpoints_and_nothing_else() {
+    let f = fx();
+    let routes = f.b.register_endpoints();
+    let m = |p: &str| routes.iter().find(|r| r.matches(p)).map(|r| r.id.clone());
+    assert_eq!(
+        m("vp/request/AAAAAAAAAAAAAAAAAAAAAA").as_deref(),
+        Some("request")
+    );
+    assert_eq!(
+        m("vp/response/AAAAAAAAAAAAAAAAAAAAAA").as_deref(),
+        Some("response")
+    );
+    assert_eq!(m("vp/status").as_deref(), Some("status"));
+    assert_eq!(m("vp/complete").as_deref(), Some("complete"));
+    assert_eq!(m("vp/request/short"), None);
+    assert_eq!(m("other/complete"), None);
+    assert_eq!(m("vp/complete/extra"), None);
+}
+
+#[test]
+fn config_rejects_unknown_fields_and_bad_pointers() {
+    assert!(serde_json::from_value::<VpBackendConfig>(
+        json!({"dcql": {}, "attribute_map": {}, "subject_pointer": "/a", "role": "r", "typo": 1})
+    )
+    .is_err());
+    let (v_cert, v_key) = self_signed_ec("v.example", "ES256");
+    let mk = |sp: &str, ttl: i64| {
+        let cfg: VpBackendConfig = serde_json::from_value(json!({"dcql": {}, "attribute_map": {}, "subject_pointer": sp, "role": "r", "request_ttl_secs": ttl})).unwrap();
+        let gate = TrustGate::new(
+            Arc::new(NoPdp),
+            p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap(),
+            "k",
+            "i",
+            "a",
+            "p",
+            60,
+        );
+        VpBackend::new(
+            "vp",
+            "https://p/vp",
+            cfg,
+            gate,
+            siros_verifier_core::oid4vp::software_signer(&v_key).unwrap(),
+            vec![v_cert.clone()],
+            system_clock(),
+        )
+    };
+    assert!(
+        mk("family_name", 300).is_err(),
+        "pointer without leading slash"
+    );
+    assert!(mk("/family_name", 0).is_err());
+    assert!(mk("/family_name", 901).is_err());
+    assert!(mk("/family_name", 300).is_ok());
+}
+
+#[tokio::test]
+async fn no_pdp_configured_denies_everything() {
+    let g = TrustGate::new(
+        Arc::new(NoPdp),
+        p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap(),
+        "k",
+        "i",
+        "a",
+        "p",
+        60,
+    );
+    assert_eq!(
+        g.permits(&json!({"x": 1}), T0).await.unwrap_err(),
+        "pdp_not_configured"
+    );
+}
+
+#[test]
+fn authzen_response_parsing_is_strict() {
+    let ok = json!({"decision": true, "context": {"id": "d1", "trust_data": [{"registry": "etsi", "as_of": "2027-01-15T00:00:00Z", "next_update": "2027-01-16T00:00:00Z"}]}});
+    let a = parse_authzen_response(&ok).unwrap();
+    assert!(a.decision);
+    assert_eq!(
+        a.trust_data[0].next_update.unwrap() - a.trust_data[0].as_of,
+        86400
+    );
+    assert!(
+        parse_authzen_response(&json!({"decision": "true", "context": {"id": "d"}})).is_err(),
+        "decision must be a boolean"
+    );
+    assert!(
+        parse_authzen_response(&json!({"decision": true, "context": {"id": 5}})).is_err(),
+        "a non-string id is malformed, not absent"
+    );
+    assert!(
+        parse_authzen_response(&json!({"decision": true, "context": {"id": ""}})).is_err(),
+        "an empty id is malformed, not absent"
+    );
+    assert!(parse_authzen_response(&json!({"decision": true, "context": {"id": "d", "trust_data": [{"next_update": "2027-01-16T00:00:00Z"}]}})).is_err());
+    assert!(parse_authzen_response(
+        &json!({"decision": true, "context": {"id": "d", "trust_data": [{"as_of": "garbage"}]}})
+    )
+    .is_err());
+}
+
+#[tokio::test]
+async fn pending_flow_past_its_expiry_is_dropped_not_waited_on() {
+    let f = fx();
+    let (state, _id) = start(&f).await;
+    assert!(matches!(
+        complete(&f, &state).await.unwrap(),
+        BackendAction::Respond(_)
+    ));
+    f.clock.store(T0 + 301, Ordering::SeqCst);
+    assert_eq!(
+        complete(&f, &state).await.err().unwrap(),
+        "authentication error: flow_expired"
+    );
+    // and the flow is gone
+    assert_eq!(
+        complete(&f, &state).await.err().unwrap(),
+        "authentication error: unknown_flow"
+    );
+}
+
+#[tokio::test]
+async fn wallet_gets_a_no_store_request_object() {
+    let f = fx();
+    let (_s, id) = start(&f).await;
+    let mut ctx = Context::new(req(&format!("vp/request/{id}"), "GET"), State::new());
+    let BackendAction::Respond(r) = f.b.handle_endpoint(&mut ctx, "request").await.unwrap() else {
+        panic!()
+    };
+    let h = |n: &str| {
+        r.headers
+            .iter()
+            .find(|(k, _)| k == n)
+            .map(|(_, v)| v.as_str())
+    };
+    assert_eq!(h("content-type"), Some("application/oauth-authz-req+jwt"));
+    assert_eq!(h("cache-control"), Some("no-store"));
+}
+
+#[tokio::test]
+async fn a_credential_without_the_subject_claim_fails_for_that_reason() {
+    let f = fx_full(100_000, "/no_such_claim");
+    let (state, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    assert_eq!(post(&f, &id, &wallet(&f, &jar)).await.0, 422);
+    assert_eq!(
+        complete(&f, &state).await.err().unwrap(),
+        "authentication error: subject_claim_missing"
+    );
+}
+
+#[test]
+fn real_go_trust_answers_parse_without_id_or_freshness() {
+    let p = parse_authzen_response(&serde_json::from_str(REAL_PERMIT).unwrap()).unwrap();
+    assert!(p.decision);
+    assert!(p.id.starts_with("local-") && p.id.len() > 10);
+    assert!(p.trust_data.is_empty());
+    assert!(!p.reasons.is_empty());
+    let d = parse_authzen_response(&serde_json::from_str(REAL_DENY).unwrap()).unwrap();
+    assert!(!d.decision);
+    // a decision with no context at all is still a valid answer
+    assert!(parse_authzen_response(&json!({"decision": true}))
+        .unwrap()
+        .id
+        .starts_with("local-"));
+    // local ids are unique per answer
+    let again = parse_authzen_response(&serde_json::from_str(REAL_PERMIT).unwrap()).unwrap();
+    assert_ne!(p.id, again.id);
+}
+
+#[tokio::test]
+async fn without_freshness_data_the_receipt_is_capped_at_the_default_lifetime() {
+    let f = fx();
+    f.pdp.go_trust_today.store(true, Ordering::SeqCst);
+    let (s, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    assert_eq!(post(&f, &id, &wallet(&f, &jar)).await.0, 200);
+    complete(&f, &s).await.unwrap();
+    assert_eq!(f.pdp.calls.load(Ordering::SeqCst), 1);
+    // PDP down: the receipt (5 minutes, not the tenant's 60) still covers a login inside its life...
+    f.pdp.down.store(true, Ordering::SeqCst);
+    f.clock.store(T0 + 100, Ordering::SeqCst);
+    let (s, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    assert_eq!(post(&f, &id, &wallet(&f, &jar)).await.0, 200);
+    complete(&f, &s).await.unwrap();
+    // ...and no longer once it has lapsed, although the tenant ceiling is an hour.
+    f.clock.store(T0 + 301, Ordering::SeqCst);
+    let (_s, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    assert_eq!(post(&f, &id, &wallet(&f, &jar)).await.0, 503);
+}
+
+/// Against a real go-trust. Skipped unless GT_URL (evaluation endpoint) and GT_REQUEST_DIR are set:
+///   GT_URL=http://127.0.0.1:6411/evaluation GT_REQUEST_DIR=<dir with request.json, request_other.json> \
+///   cargo test --features http -- --ignored live_go_trust
+#[cfg(feature = "http")]
+#[tokio::test]
+#[ignore]
+async fn live_go_trust() {
+    let (Ok(url), Ok(dir)) = (std::env::var("GT_URL"), std::env::var("GT_REQUEST_DIR")) else {
+        return;
+    };
+    let pdp = Arc::new(HttpPdp::new(&url, None, std::time::Duration::from_secs(5)).unwrap());
+    let gate = TrustGate::new(
+        pdp,
+        p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap(),
+        "k",
+        "i",
+        "a",
+        &url,
+        3600,
+    );
+    let read = |n: &str| {
+        serde_json::from_str::<Value>(&std::fs::read_to_string(format!("{dir}/{n}")).unwrap())
+            .unwrap()
+    };
+    assert!(
+        gate.permits(&read("request.json"), T0).await.unwrap(),
+        "pinned issuer is trusted"
+    );
+    assert!(
+        !gate.permits(&read("request_other.json"), T0).await.unwrap(),
+        "other role is denied"
+    );
+}
+
+#[cfg(feature = "http")]
+#[test]
+fn http_pdp_endpoint_validation() {
+    let t = std::time::Duration::from_secs(1);
+    assert!(HttpPdp::new("https://pdp.example/evaluation", None, t).is_ok());
+    assert!(HttpPdp::new("http://127.0.0.1:6001/evaluation", None, t).is_ok());
+    assert!(HttpPdp::new_allow_http("http://go-trust-allow:6001/evaluation", None, t).is_ok());
+    assert!(
+        HttpPdp::new("http://pdp.example/evaluation", None, t).is_err(),
+        "plain http to a remote host"
+    );
+    assert!(
+        HttpPdp::new("http://127.0.0.1.evil.example/evaluation", None, t).is_err(),
+        "lookalike host"
+    );
+    assert!(HttpPdp::new("ftp://pdp.example/", None, t).is_err());
+    assert!(HttpPdp::new("not a url", None, t).is_err());
+}
+
+/// One-shot HTTP server: answers the first request with `raw`, returns (url, captured request text).
+#[cfg(feature = "http")]
+async fn one_shot(raw: &'static str) -> (String, tokio::task::JoinHandle<String>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/evaluation", l.local_addr().unwrap());
+    let h = tokio::spawn(async move {
+        let (mut sock, _) = l.accept().await.unwrap();
+        let mut buf = vec![0u8; 8192];
+        let n = sock.read(&mut buf).await.unwrap();
+        sock.write_all(raw.as_bytes()).await.unwrap();
+        let _ = sock.shutdown().await;
+        String::from_utf8_lossy(&buf[..n]).into_owned()
+    });
+    (url, h)
+}
+
+#[cfg(feature = "http")]
+#[tokio::test]
+async fn http_pdp_status_body_redirect_and_bearer() {
+    let t = std::time::Duration::from_secs(2);
+    let ok = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 17\r\nconnection: close\r\n\r\n{\"decision\":true}";
+    let (url, h) = one_shot(ok).await;
+    let v = HttpPdp::new(&url, Some("tok".into()), t)
+        .unwrap()
+        .evaluate(&json!({"a": 1}))
+        .await
+        .unwrap();
+    assert_eq!(v["decision"], true);
+    let seen = h.await.unwrap().to_lowercase();
+    assert!(seen.starts_with("post /evaluation"), "{seen}");
+    assert!(seen.contains("authorization: bearer tok"), "{seen}");
+    assert!(seen.contains("content-type: application/json"));
+
+    let (url, _h) = one_shot(
+        "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(
+        HttpPdp::new(&url, None, t)
+            .unwrap()
+            .evaluate(&json!({}))
+            .await
+            .unwrap_err(),
+        "pdp status 500"
+    );
+
+    let (url, _h) = one_shot("HTTP/1.1 302 Found\r\nlocation: http://127.0.0.1:1/evil\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
+    assert_eq!(
+        HttpPdp::new(&url, None, t)
+            .unwrap()
+            .evaluate(&json!({}))
+            .await
+            .unwrap_err(),
+        "pdp status 302",
+        "redirects are not followed"
+    );
+
+    let (url, _h) =
+        one_shot("HTTP/1.1 200 OK\r\ncontent-length: 8\r\nconnection: close\r\n\r\nnot json").await;
+    assert!(HttpPdp::new(&url, None, t)
+        .unwrap()
+        .evaluate(&json!({}))
+        .await
+        .unwrap_err()
+        .contains("not json"));
+
+    // nothing listening: an error, never a decision
+    assert!(HttpPdp::new("http://127.0.0.1:1/evaluation", None, t)
+        .unwrap()
+        .evaluate(&json!({}))
+        .await
+        .unwrap_err()
+        .contains("unreachable"));
+}
+
+#[cfg(feature = "http")]
+#[tokio::test]
+async fn http_pdp_refuses_oversized_responses() {
+    let body = format!("{{\"decision\":true}}{}", " ".repeat(1_100_000)); // valid JSON, so only the limit can reject it
+    let raw: &'static str = Box::leak(
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_boxed_str(),
+    );
+    let (url, _h) = one_shot(raw).await;
+    let e = HttpPdp::new(&url, None, std::time::Duration::from_secs(5))
+        .unwrap()
+        .evaluate(&json!({}))
+        .await
+        .unwrap_err();
+    assert_eq!(e, "pdp response too large");
+}

@@ -1,0 +1,10 @@
+target
+fuzz/target
+fuzz/artifacts
+ffi/kotlin-test/build
+ffi/kotlin-test/.gradle
+ffi/kotlin-test/.kotlin
+.git
+.claude
+*.rs.bk
+lcov.info
