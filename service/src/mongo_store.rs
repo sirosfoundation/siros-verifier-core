@@ -4,7 +4,9 @@ use std::future::IntoFuture;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use grindvakt::provider::TokenUseStore;
 use mongodb::bson::{self, doc, DateTime, Document};
+use mongodb::error::{ErrorKind, WriteFailure};
 use mongodb::options::{
     Acknowledgment, ClientOptions, FindOneAndUpdateOptions, IndexOptions, ReturnDocument,
     WriteConcern,
@@ -18,6 +20,7 @@ use siros_verifier_core_tunnelbana::{
 
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 const RETENTION_INDEX: &str = "retain_at_ttl";
+const TOKEN_USE_INDEX: &str = "expires_at_ttl";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct MongoFlow {
@@ -53,46 +56,11 @@ pub struct MongoFlowStore {
 
 impl MongoFlowStore {
     pub async fn connect(uri: &str, database: &str, collection: &str) -> StoreResult<Self> {
-        let mut options =
-            bounded("invalid MongoDB configuration", ClientOptions::parse(uri)).await?;
-        options.app_name = Some("siros-verifier-service".into());
-        options.connect_timeout = Some(OPERATION_TIMEOUT);
-        options.server_selection_timeout = Some(OPERATION_TIMEOUT);
-        options.write_concern = Some(
-            WriteConcern::builder()
-                .w(Acknowledgment::Majority)
-                .w_timeout(OPERATION_TIMEOUT)
-                .build(),
-        );
-        let client = Client::with_options(options)
-            .map_err(|e| store_error("MongoDB client initialization failed", e))?;
-        bounded(
-            "MongoDB ping failed",
-            client
-                .database("admin")
-                .run_command(doc! { "ping": 1, "maxTimeMS": 5000 }),
-        )
-        .await?;
+        let client = mongo_client(uri).await?;
         let flows = client
             .database(database)
             .collection::<MongoFlow>(collection);
-        bounded(
-            "MongoDB retention index creation failed",
-            flows
-                .create_index(
-                    IndexModel::builder()
-                        .keys(doc! { "retain_at": 1 })
-                        .options(
-                            IndexOptions::builder()
-                                .name(Some(RETENTION_INDEX.to_owned()))
-                                .expire_after(Duration::ZERO)
-                                .build(),
-                        )
-                        .build(),
-                )
-                .max_time(OPERATION_TIMEOUT),
-        )
-        .await?;
+        create_ttl_index(&flows, "retain_at", RETENTION_INDEX).await?;
         Ok(Self { flows })
     }
 
@@ -257,6 +225,116 @@ impl FlowStore for MongoFlowStore {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct TokenUseMarker {
+    #[serde(rename = "_id")]
+    token_hash: String,
+    expires_at: DateTime,
+}
+
+/// Shared one-time use markers for authorization codes, refresh tokens, and
+/// private-key client assertions. Only Grindvakt's hashes are stored.
+pub struct MongoTokenUseStore {
+    markers: Collection<TokenUseMarker>,
+}
+
+impl MongoTokenUseStore {
+    pub async fn connect(uri: &str, database: &str, collection: &str) -> StoreResult<Self> {
+        let client = mongo_client(uri).await?;
+        let markers = client
+            .database(database)
+            .collection::<TokenUseMarker>(collection);
+        create_ttl_index(&markers, "expires_at", TOKEN_USE_INDEX).await?;
+        Ok(Self { markers })
+    }
+}
+
+#[async_trait]
+impl TokenUseStore for MongoTokenUseStore {
+    async fn consume(&self, token_hash: &str, ttl_secs: u64) -> Result<bool, String> {
+        let now = DateTime::now();
+        let ttl_millis = ttl_secs.max(1).min(i64::MAX as u64) as i64;
+        let expires_at = DateTime::from_millis(
+            now.timestamp_millis()
+                .saturating_add(ttl_millis.saturating_mul(1000)),
+        );
+        let options = FindOneAndUpdateOptions::builder()
+            .upsert(true)
+            .return_document(ReturnDocument::Before)
+            .max_time(OPERATION_TIMEOUT)
+            .build();
+        let operation = self
+            .markers
+            .find_one_and_update(
+                doc! { "_id": token_hash, "expires_at": { "$lte": now } },
+                doc! { "$set": { "expires_at": expires_at } },
+            )
+            .with_options(options);
+        match tokio::time::timeout(OPERATION_TIMEOUT, operation.into_future()).await {
+            Ok(Ok(_)) => Ok(true),
+            Ok(Err(error)) if is_duplicate_key(&error) => Ok(false),
+            Ok(Err(error)) => Err(store_error("MongoDB token-use consume failed", error).0),
+            Err(_) => Err("MongoDB token-use consume failed: operation timed out".into()),
+        }
+    }
+}
+
+fn is_duplicate_key(error: &mongodb::error::Error) -> bool {
+    match error.kind.as_ref() {
+        ErrorKind::Write(WriteFailure::WriteError(error)) => error.code == 11000,
+        ErrorKind::Command(error) => error.code == 11000,
+        _ => false,
+    }
+}
+
+async fn mongo_client(uri: &str) -> StoreResult<Client> {
+    let mut options = bounded("invalid MongoDB configuration", ClientOptions::parse(uri)).await?;
+    options.app_name = Some("siros-verifier-service".into());
+    options.connect_timeout = Some(OPERATION_TIMEOUT);
+    options.server_selection_timeout = Some(OPERATION_TIMEOUT);
+    options.write_concern = Some(
+        WriteConcern::builder()
+            .w(Acknowledgment::Majority)
+            .w_timeout(OPERATION_TIMEOUT)
+            .build(),
+    );
+    let client = Client::with_options(options)
+        .map_err(|e| store_error("MongoDB client initialization failed", e))?;
+    bounded(
+        "MongoDB ping failed",
+        client
+            .database("admin")
+            .run_command(doc! { "ping": 1, "maxTimeMS": 5000 }),
+    )
+    .await?;
+    Ok(client)
+}
+
+async fn create_ttl_index<T: Send + Sync>(
+    collection: &Collection<T>,
+    field: &str,
+    name: &str,
+) -> StoreResult<()> {
+    bounded(
+        "MongoDB retention index creation failed",
+        collection
+            .create_index(
+                IndexModel::builder()
+                    .keys(doc! { field: 1 })
+                    .options(
+                        IndexOptions::builder()
+                            .name(Some(name.to_owned()))
+                            .expire_after(Duration::ZERO)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .max_time(OPERATION_TIMEOUT),
+    )
+    .await?;
+    Ok(())
+}
+
 async fn bounded<T>(
     context: &str,
     operation: impl IntoFuture<Output = std::result::Result<T, mongodb::error::Error>>,
@@ -285,6 +363,40 @@ mod tests {
     use super::*;
     use futures_util::TryStreamExt;
     use std::collections::BTreeMap;
+
+    fn token_provider(store: std::sync::Arc<MongoTokenUseStore>) -> grindvakt::provider::Provider {
+        use grindvakt::client::{InMemoryClientStore, AUTH_CLIENT_SECRET_POST};
+        use grindvakt::keys::signing_key_from_jwk_json;
+        use grindvakt::metadata::ProviderMetadata;
+        use grindvakt::provider::TokenLifetimes;
+        use grindvakt::tokens::TokenCodec;
+        let client = grindvakt::client::Client {
+            client_id: "rp-conf".into(),
+            client_secret: Some("s3cret".into()),
+            redirect_uris: vec!["https://rp.example.com/cb".into()],
+            response_types: vec!["code".into()],
+            grant_types: vec!["authorization_code".into(), "refresh_token".into()],
+            token_endpoint_auth_method: AUTH_CLIENT_SECRET_POST.into(),
+            jwks: None,
+            scope: Some("openid".into()),
+            subject_type: "public".into(),
+            client_name: None,
+        };
+        let mut jwk = jose_rs::jwk::generate_ec("P-256").unwrap();
+        jwk.alg = Some("ES256".into());
+        let signing_key =
+            signing_key_from_jwk_json(&jwk.to_json().unwrap(), Some("ES256"), Some("op-key"))
+                .unwrap();
+        grindvakt::provider::Provider::new(
+            ProviderMetadata::new("https://op.example.com", "https://op.example.com"),
+            signing_key,
+            std::sync::Arc::new(InMemoryClientStore::with_clients(vec![client])),
+            TokenCodec::new("shared-op-test-secret"),
+            TokenLifetimes::default(),
+            store,
+        )
+        .unwrap()
+    }
 
     fn pending_flow(id: &str, now: i64) -> Flow {
         Flow {
@@ -344,6 +456,164 @@ mod tests {
         .unwrap_err();
         assert!(error.0.contains("operation timed out"), "{error}");
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn real_mongo_token_use_is_atomic_and_bounded_by_ttl() {
+        let Ok(uri) = std::env::var("SIROS_VERIFIER_TEST_MONGODB_URI") else {
+            return;
+        };
+        let database = format!("siros_verifier_token_test_{}", std::process::id());
+        let store_a = MongoTokenUseStore::connect(&uri, &database, "oidc_token_use")
+            .await
+            .unwrap();
+        let store_b = MongoTokenUseStore::connect(&uri, &database, "oidc_token_use")
+            .await
+            .unwrap();
+        assert!(store_a.consume("code:first", 60).await.unwrap());
+        assert!(!store_b.consume("code:first", 60).await.unwrap());
+        assert!(store_a.consume("refresh:independent", 60).await.unwrap());
+        assert!(store_a.consume("code:zero-ttl", 0).await.unwrap());
+        assert!(!store_b.consume("code:zero-ttl", 0).await.unwrap());
+
+        let (a, b) = tokio::join!(
+            store_a.consume("code:race", 60),
+            store_b.consume("code:race", 60)
+        );
+        let results = [a.unwrap(), b.unwrap()];
+        assert_eq!(results.into_iter().filter(|won| *won).count(), 1);
+
+        let client = Client::with_uri_str(&uri).await.unwrap();
+        let markers = client
+            .database(&database)
+            .collection::<Document>("oidc_token_use");
+        markers
+            .update_one(
+                doc! { "_id": "code:expired" },
+                doc! { "$set": { "expires_at": DateTime::from_millis(0) } },
+            )
+            .upsert(true)
+            .await
+            .unwrap();
+        assert!(store_a.consume("code:expired", 60).await.unwrap());
+        assert!(!store_b.consume("code:expired", 60).await.unwrap());
+        markers
+            .update_one(
+                doc! { "_id": "code:expired-race" },
+                doc! { "$set": { "expires_at": DateTime::from_millis(0) } },
+            )
+            .upsert(true)
+            .await
+            .unwrap();
+        let (a, b) = tokio::join!(
+            store_a.consume("code:expired-race", 60),
+            store_b.consume("code:expired-race", 60)
+        );
+        let results = [a.unwrap(), b.unwrap()];
+        assert_eq!(results.into_iter().filter(|won| *won).count(), 1);
+
+        let stored = markers
+            .find_one(doc! { "_id": "code:first" })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.len(), 2);
+        assert!(stored.get_datetime("expires_at").is_ok());
+        let indexes = markers.list_indexes().await.unwrap();
+        let indexes: Vec<_> = indexes.try_collect().await.unwrap();
+        assert!(indexes.iter().any(|index| {
+            index.keys.get_i32("expires_at") == Ok(1)
+                && index
+                    .options
+                    .as_ref()
+                    .and_then(|options| options.expire_after)
+                    == Some(Duration::ZERO)
+        }));
+        client.database(&database).drop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn two_providers_share_code_and_refresh_replay_protection() {
+        let Ok(uri) = std::env::var("SIROS_VERIFIER_TEST_MONGODB_URI") else {
+            return;
+        };
+        let database = format!("siros_verifier_oidc_test_{}", std::process::id());
+        let store_a = std::sync::Arc::new(
+            MongoTokenUseStore::connect(&uri, &database, "oidc_token_use")
+                .await
+                .unwrap(),
+        );
+        let store_b = std::sync::Arc::new(
+            MongoTokenUseStore::connect(&uri, &database, "oidc_token_use")
+                .await
+                .unwrap(),
+        );
+        let op_a = token_provider(store_a);
+        let op_b = token_provider(store_b);
+        let request = grindvakt::request::AuthorizationRequest::from_pairs(&[
+            ("client_id".into(), "rp-conf".into()),
+            ("response_type".into(), "code".into()),
+            ("redirect_uri".into(), "https://rp.example.com/cb".into()),
+            ("scope".into(), "openid".into()),
+            ("nonce".into(), "nonce-abc".into()),
+        ])
+        .unwrap();
+        let redirect = op_a
+            .authorization_redirect(&request, "subject-123", &BTreeMap::new(), None)
+            .await
+            .unwrap();
+        let location = redirect
+            .headers
+            .iter()
+            .find(|(name, _)| name == "location")
+            .map(|(_, value)| value.clone())
+            .unwrap();
+        let query = location.split_once('?').unwrap().1;
+        let code = form_urlencoded::parse(query.as_bytes())
+            .find(|(name, _)| name == "code")
+            .map(|(_, value)| value.into_owned())
+            .unwrap();
+        let token_request = vec![
+            ("grant_type".into(), "authorization_code".into()),
+            ("code".into(), code),
+            ("redirect_uri".into(), "https://rp.example.com/cb".into()),
+            ("client_id".into(), "rp-conf".into()),
+            ("client_secret".into(), "s3cret".into()),
+        ];
+        let (a, b) = tokio::join!(
+            op_a.handle_token_request(&token_request, None, "https://op.example.com/token", None),
+            op_b.handle_token_request(&token_request, None, "https://op.example.com/token", None)
+        );
+        let (tokens, replay) = match (a, b) {
+            (Ok(tokens), Err(replay)) | (Err(replay), Ok(tokens)) => (tokens, replay),
+            _ => panic!("exactly one provider must redeem the authorization code"),
+        };
+        assert_eq!(replay.code, grindvakt::OAuthErrorCode::InvalidGrant);
+        let refresh = tokens.refresh_token.clone().expect("refresh token issued");
+        let refresh_request = vec![
+            ("grant_type".into(), "refresh_token".into()),
+            ("refresh_token".into(), refresh),
+            ("client_id".into(), "rp-conf".into()),
+            ("client_secret".into(), "s3cret".into()),
+        ];
+        let (a, b) = tokio::join!(
+            op_a.handle_token_request(&refresh_request, None, "https://op.example.com/token", None),
+            op_b.handle_token_request(&refresh_request, None, "https://op.example.com/token", None)
+        );
+        let (refreshed, replay) = match (a, b) {
+            (Ok(tokens), Err(replay)) | (Err(replay), Ok(tokens)) => (tokens, replay),
+            _ => panic!("exactly one provider must redeem the refresh token"),
+        };
+        assert_eq!(replay.code, grindvakt::OAuthErrorCode::InvalidGrant);
+        assert!(refreshed.refresh_token.is_some());
+
+        Client::with_uri_str(&uri)
+            .await
+            .unwrap()
+            .database(&database)
+            .drop()
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

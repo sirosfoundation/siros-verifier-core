@@ -11,8 +11,9 @@ use std::sync::Arc;
 use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer};
 use anyhow::{anyhow, bail, Context as _};
 use config::{DeploymentConfig, FlowStorageConfig};
+use grindvakt::provider::TokenUseStore;
 use http::ReqwestClient;
-use mongo_store::MongoFlowStore;
+use mongo_store::{MongoFlowStore, MongoTokenUseStore};
 use siros_verifier_core::oid4vp;
 use siros_verifier_core::session_seal::SessionSealer;
 use siros_verifier_core_tunnelbana::{
@@ -108,10 +109,24 @@ async fn build_proxy(cfg: ProxyConfig, config_path: &str) -> anyhow::Result<Prox
         previous_secrets: cfg.previous_state_encryption_keys.clone(),
     };
 
+    let token_use_store = build_token_use_store(&cfg).await?;
     let mut frontends = Vec::new();
     for p in &cfg.frontends {
         let bx = make_ctx(&p.name, p.config_json());
-        frontends.push(registry.build_frontend(&p.kind, &bx)?);
+        if p.kind == "oidc" {
+            if let Some(store) = &token_use_store {
+                frontends.push(
+                    tunnelbana_plugins::oidc_frontend::OidcFrontend::build_with_token_use_store(
+                        &bx,
+                        store.clone(),
+                    )?,
+                );
+            } else {
+                frontends.push(registry.build_frontend(&p.kind, &bx)?);
+            }
+        } else {
+            frontends.push(registry.build_frontend(&p.kind, &bx)?);
+        }
         tracing::info!(name = %p.name, kind = %p.kind, "loaded frontend");
     }
     if cfg.backends.len() != 1 || cfg.backends[0].kind != "openid4vp" {
@@ -134,6 +149,36 @@ async fn build_proxy(cfg: ProxyConfig, config_path: &str) -> anyhow::Result<Prox
         .with_ttl_seconds(ttl)
         .with_previous_secrets(&cfg.previous_state_encryption_keys);
     Ok(Proxy::new(frontends, backends, microservices, sealer))
+}
+
+async fn build_token_use_store(
+    cfg: &ProxyConfig,
+) -> anyhow::Result<Option<Arc<dyn TokenUseStore>>> {
+    if cfg.backends.len() != 1 || cfg.backends[0].kind != "openid4vp" {
+        bail!("exactly one backend of type openid4vp is required");
+    }
+    let deployment: DeploymentConfig = serde_json::from_value(cfg.backends[0].config_json())?;
+    match deployment.storage.backend.as_str() {
+        "memory" => Ok(None),
+        "mongodb" => {
+            let uri = deployment
+                .storage
+                .uri
+                .as_deref()
+                .ok_or_else(|| anyhow!("MongoDB storage requires uri"))?;
+            let database = deployment
+                .storage
+                .database
+                .as_deref()
+                .ok_or_else(|| anyhow!("MongoDB storage requires database"))?;
+            Ok(Some(Arc::new(
+                MongoTokenUseStore::connect(uri, database, "oidc_token_use")
+                    .await
+                    .map_err(|e| anyhow!(e))?,
+            )))
+        }
+        other => bail!("unsupported flow storage backend {other:?}"),
+    }
 }
 
 async fn build_flow_store(config: &FlowStorageConfig) -> anyhow::Result<Arc<dyn FlowStore>> {
