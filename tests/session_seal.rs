@@ -58,6 +58,40 @@ fn a_sealed_session_is_bound_to_its_flow_and_tenant() {
 }
 
 #[test]
+fn previous_masters_open_inflight_sessions_and_results_during_rotation() {
+    let old_master = [8u8; 32];
+    let new_master = [9u8; 32];
+    let old = SessionSealer::from_master(&old_master, "acme").unwrap();
+    let original = session();
+    let session_token = old.seal(&original, b"flow-1").unwrap();
+    let result_token = old
+        .seal_json(&serde_json::json!({"sub": "Lovelace"}), b"result:flow-1")
+        .unwrap();
+    let rotated = SessionSealer::from_master(&new_master, "acme")
+        .unwrap()
+        .with_previous_masters(&[&old_master], "acme")
+        .unwrap();
+    assert_eq!(
+        rotated.unseal(&session_token, b"flow-1").unwrap().state,
+        original.state
+    );
+    let result: serde_json::Value = rotated
+        .unseal_json(&result_token, b"result:flow-1")
+        .unwrap();
+    assert_eq!(result["sub"], "Lovelace");
+    let fresh = rotated
+        .seal_json(&serde_json::json!({"sub": "new"}), b"result:flow-2")
+        .unwrap();
+    assert!(old
+        .unseal_json::<serde_json::Value>(&fresh, b"result:flow-2")
+        .is_err());
+    assert!(SessionSealer::from_master(&new_master, "acme")
+        .unwrap()
+        .with_previous_masters(&[&[1u8; 31]], "acme")
+        .is_err());
+}
+
+#[test]
 fn tampering_truncation_and_wrong_versions_are_refused() {
     let sealed = sealer("acme").seal(&session(), b"f").unwrap();
     let mut bytes = sealed.clone().into_bytes();

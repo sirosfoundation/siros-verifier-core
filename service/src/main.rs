@@ -280,7 +280,13 @@ async fn build_openid4vp_backend(
         deployment.max_receipt_ttl_secs(),
     )
     .with_no_freshness_ttl(deployment.max_receipt_ttl_secs());
-    let sealer = SessionSealer::from_master(cfg.state_encryption_key.as_bytes(), &plugin.name)?;
+    let previous_masters: Vec<&[u8]> = cfg
+        .previous_state_encryption_keys
+        .iter()
+        .map(|secret| secret.as_bytes())
+        .collect();
+    let sealer = SessionSealer::from_master(cfg.state_encryption_key.as_bytes(), &plugin.name)?
+        .with_previous_masters(&previous_masters, &plugin.name)?;
     let module_base = format!("{}/{}", cfg.base_url.trim_end_matches('/'), plugin.name);
     let store = build_flow_store(&deployment.storage).await?;
     let backend = VpBackend::new(

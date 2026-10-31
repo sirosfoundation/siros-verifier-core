@@ -22,25 +22,27 @@ const MAX_SEALED: usize = 1024 * 1024;
 
 pub struct SessionSealer {
     key: Zeroizing<[u8; 32]>,
+    previous_keys: Vec<Zeroizing<[u8; 32]>>,
 }
 
 impl SessionSealer {
     /// Derive the sealing key for one tenant. The master secret must be at least 32 bytes of high-entropy
     /// material; nothing weaker is accepted, because a guessable master would make the sealing decorative.
     pub fn from_master(master: &[u8], tenant: &str) -> Result<Self> {
-        if master.len() < MIN_MASTER {
-            return Err(Error::Crypto(
-                "session sealing master secret must be at least 32 bytes".into(),
-            ));
-        }
-        let hk = Hkdf::<Sha256>::new(None, master);
-        let mut key = Zeroizing::new([0u8; 32]);
-        hk.expand(
-            format!("siros-verifier session seal v1:{tenant}").as_bytes(),
-            &mut *key,
-        )
-        .map_err(|_| Error::Crypto("hkdf expand".into()))?;
-        Ok(Self { key })
+        Ok(Self {
+            key: derive_key(master, tenant)?,
+            previous_keys: Vec::new(),
+        })
+    }
+
+    /// Allow in-flight sealed sessions and results to be opened during a
+    /// zero-downtime master-key rotation. New values still use the current key.
+    pub fn with_previous_masters(mut self, masters: &[&[u8]], tenant: &str) -> Result<Self> {
+        self.previous_keys = masters
+            .iter()
+            .map(|master| derive_key(master, tenant))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(self)
     }
 
     /// Seal `session` for the flow named by `aad` (the flow id).
@@ -87,15 +89,36 @@ impl SessionSealer {
         let (nonce, ct) = raw.split_at(12);
         let nonce =
             Nonce::try_from(nonce).map_err(|_| Error::Malformed("sealed session nonce".into()))?;
-        let cipher =
-            Aes256Gcm::new_from_slice(&*self.key).map_err(|_| Error::Crypto("key".into()))?;
-        let plain = Zeroizing::new(
-            cipher
-                .decrypt(&nonce, Payload { msg: ct, aad })
-                .map_err(|_| Error::Integrity("sealed session did not authenticate".into()))?,
-        );
-        crate::json_strict::from_slice(&plain).and_then(|v| {
-            serde_json::from_value(v).map_err(|_| Error::Malformed("sealed session content".into()))
-        })
+        for key in std::iter::once(&self.key).chain(self.previous_keys.iter()) {
+            let cipher =
+                Aes256Gcm::new_from_slice(&**key).map_err(|_| Error::Crypto("key".into()))?;
+            let Ok(plain) = cipher.decrypt(&nonce, Payload { msg: ct, aad }) else {
+                continue;
+            };
+            let plain = Zeroizing::new(plain);
+            return crate::json_strict::from_slice(&plain).and_then(|v| {
+                serde_json::from_value(v)
+                    .map_err(|_| Error::Malformed("sealed session content".into()))
+            });
+        }
+        Err(Error::Integrity(
+            "sealed session did not authenticate".into(),
+        ))
     }
+}
+
+fn derive_key(master: &[u8], tenant: &str) -> Result<Zeroizing<[u8; 32]>> {
+    if master.len() < MIN_MASTER {
+        return Err(Error::Crypto(
+            "session sealing master secret must be at least 32 bytes".into(),
+        ));
+    }
+    let hk = Hkdf::<Sha256>::new(None, master);
+    let mut key = Zeroizing::new([0u8; 32]);
+    hk.expand(
+        format!("siros-verifier session seal v1:{tenant}").as_bytes(),
+        &mut *key,
+    )
+    .map_err(|_| Error::Crypto("hkdf expand".into()))?;
+    Ok(key)
 }
