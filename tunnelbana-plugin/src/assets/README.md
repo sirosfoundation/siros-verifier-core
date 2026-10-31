@@ -75,3 +75,7 @@ A preset is `{id, label, dcql}`. The Rust TS11 adapter produces this shape from
 `registry.siros.org/api/v1/schemas.json` and its referenced metadata. Other hosts
 can generate the same shape from another TS11 deployment or static configuration;
 the JS package has no registry-specific logic.
+
+The optional `available_dcql` field supplies the full credential/claim catalog
+for the multi-select attribute dropdown while `dcql` remains the requested
+subset sent to the backend. If omitted, `dcql` supplies the available options.

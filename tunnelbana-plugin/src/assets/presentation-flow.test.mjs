@@ -7,6 +7,7 @@ import {
   normalizeInvocations,
   normalizeSchemes,
   setClaimEnabled,
+  setSelectedClaims,
 } from "./presentation-flow.js";
 
 test("invocations are required, deduplicated, and closed", () => {
@@ -35,6 +36,18 @@ test("claim edits do not mutate the preset", () => {
   const copy = cloneDcql(original);
   assert.notEqual(copy, original);
   assert.deepEqual(copy, original);
+});
+
+test("the full registry catalog is selectable without changing the requested credential identity", () => {
+  const requested = {credentials: [{id: "eudi_pid", format: "dc+sd-jwt", meta: {vct_values: ["urn:pid"]}, claims: [{path: ["given_name"]}]}]};
+  const available = [{id: "registry-uuid", claims: [{path: ["given_name"]}, {path: ["birthdate"]}, {path: ["personal_administrative_number"]}]}];
+  const all = setSelectedClaims(requested, available, ["0:0", "0:1", "0:2"]);
+  assert.equal(all.credentials[0].id, "eudi_pid");
+  assert.deepEqual(all.credentials[0].meta, {vct_values: ["urn:pid"]});
+  assert.equal(all.credentials[0].claims.length, 3);
+  const subset = setSelectedClaims(all, available, ["0:2"]);
+  assert.deepEqual(subset.credentials[0].claims, [{path: ["personal_administrative_number"]}]);
+  assert.equal(requested.credentials[0].claims.length, 1, "selection does not mutate the preset");
 });
 
 test("backend responses cannot cross the configured tenant origin", () => {

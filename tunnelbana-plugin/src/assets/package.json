@@ -1,6 +1,6 @@
 {
   "name": "@sirosfoundation/presentation-flow",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Framework-free OpenID4VP presentation UI driven by DCQL",
   "keywords": [
     "openid4vp",

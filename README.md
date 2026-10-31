@@ -1,5 +1,9 @@
 # siros-verifier-core
 
+[![CI](https://github.com/sirosfoundation/siros-verifier-core/actions/workflows/ci.yml/badge.svg)](https://github.com/sirosfoundation/siros-verifier-core/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/%40sirosfoundation%2Fpresentation-flow)](https://www.npmjs.com/package/@sirosfoundation/presentation-flow)
+[![License: BSD-2-Clause](https://img.shields.io/badge/license-BSD--2--Clause-blue.svg)](LICENSE)
+
 A Rust digital-credential verifier core with native and gateway adapters. The
 core is sans-I/O: parsing, protocol checks, and cryptographic verification are
 kept separate from transport, storage, time, key management, and issuer-trust

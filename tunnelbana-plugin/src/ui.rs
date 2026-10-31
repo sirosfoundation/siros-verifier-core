@@ -27,6 +27,10 @@ pub struct Preset {
     pub id: String,
     pub label: String,
     pub dcql: Value,
+    /// Full registry claim catalog used for selection; `dcql` remains the
+    /// requested subset sent to the wallet. Optional for existing integrations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_dcql: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -61,6 +65,7 @@ fn default_presets() -> Vec<Preset> {
                 {"path": ["personal_administrative_number"]},
             ]
         }]}),
+        available_dcql: None,
     }]
 }
 
@@ -142,9 +147,6 @@ impl UiFrontend {
                     let Some(id) = value.get("id").and_then(Value::as_str) else {
                         continue;
                     };
-                    if ids.contains(id) {
-                        continue;
-                    }
                     let label = value
                         .get("label")
                         .and_then(Value::as_str)
@@ -154,11 +156,16 @@ impl UiFrontend {
                     if oid4vp::validate_dcql_query(&dcql).is_err() {
                         continue;
                     }
+                    merge_available_claims(&mut presets, &dcql);
+                    if ids.contains(id) {
+                        continue;
+                    }
                     ids.insert(id.to_owned());
                     presets.push(Preset {
                         id: id.to_owned(),
                         label,
                         dcql,
+                        available_dcql: None,
                     });
                 }
                 (presets, None)
@@ -171,6 +178,29 @@ impl UiFrontend {
                 )
             }
         }
+    }
+}
+
+fn same_credential_profile(left: &Value, right: &Value) -> bool {
+    let (Some(left), Some(right)) = (
+        left.get("credentials").and_then(Value::as_array),
+        right.get("credentials").and_then(Value::as_array),
+    ) else {
+        return false;
+    };
+    !left.is_empty()
+        && left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.get("format") == right.get("format") && left.get("meta") == right.get("meta")
+        })
+}
+
+fn merge_available_claims(presets: &mut [Preset], registry_dcql: &Value) {
+    for preset in presets
+        .iter_mut()
+        .filter(|preset| same_credential_profile(&preset.dcql, registry_dcql))
+    {
+        preset.available_dcql = Some(registry_dcql.clone());
     }
 }
 
@@ -271,7 +301,7 @@ a.choice:hover,a.choice:focus {{ border-color:#3167d5; outline:none; }}
 .presentation-flow > label {{ display:block; margin:18px 0 8px; font-weight:600; }}
 .presentation-flow select,.presentation-flow textarea {{ box-sizing:border-box; width:100%; margin-top:6px; padding:10px; border:1px solid #aab5c5; border-radius:8px; background:inherit; color:inherit; font:inherit; }}
 .presentation-flow textarea {{ min-height:260px; font-family:ui-monospace,monospace; font-size:.88rem; }}
-.claim-options {{ border:0; padding:0; margin:16px 0; }} .claim-option {{ display:block; font-weight:400; margin:5px 0; }}
+.claim-options {{ display:block; margin:16px 0; }}
 .flow-actions {{ display:flex; flex-wrap:wrap; gap:12px; margin-top:20px; }}
 .flow-actions button {{ padding:11px 18px; border:1px solid #3167d5; border-radius:8px; background:#3167d5; color:white; cursor:pointer; }}
 .flow-actions button:nth-child(n+2) {{ background:transparent; color:#3167d5; }}
@@ -395,6 +425,46 @@ mod tests {
         assert!(html.contains("dc-api"));
         assert!(!html.contains("haip-vp"));
         assert!(!html.contains("navigator.credentials"));
+    }
+
+    #[test]
+    fn registry_claims_expand_selection_without_expanding_the_requested_subset() {
+        let mut presets = default_presets();
+        let registry = serde_json::json!({"credentials": [{
+            "id": "registry-uuid", "format": "dc+sd-jwt",
+            "meta": {"vct_values": ["urn:eudi:pid:arf-1.8:1"]},
+            "claims": [
+                {"path": ["given_name"]},
+                {"path": ["family_name"]},
+                {"path": ["personal_administrative_number"]},
+                {"path": ["age_over_18"]},
+            ]
+        }]});
+        merge_available_claims(&mut presets, &registry);
+        assert_eq!(
+            presets[0].dcql["credentials"][0]["claims"]
+                .as_array()
+                .unwrap()
+                .len(),
+            5
+        );
+        assert_eq!(
+            presets[0].available_dcql.as_ref().unwrap()["credentials"][0]["claims"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+        let html = index_page(
+            "ui",
+            &presets,
+            &default_invocations(),
+            &default_scheme(),
+            None,
+        )
+        .unwrap();
+        assert!(html.contains("available_dcql"));
+        assert!(html.contains("age_over_18"));
     }
 
     #[test]
