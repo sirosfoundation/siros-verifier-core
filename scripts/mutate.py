@@ -6,7 +6,7 @@ being removed. Usage: scripts/mutate.py  (run from the crate root)
 """
 import subprocess, sys, pathlib
 
-F = {"sd": "src/sdjwt.rs", "vp": "src/oid4vp.rs", "md": "src/mdoc.rs", "ms": "src/mdoc_session.rs", "rc": "src/receipt.rs", "tb": "tunnelbana-plugin/src/lib.rs", "js": "src/json_strict.rs", "ss": "src/session_seal.rs"}
+F = {"sd": "src/sdjwt.rs", "vp": "src/oid4vp.rs", "md": "src/mdoc.rs", "ms": "src/mdoc_session.rs", "rc": "src/receipt.rs", "tb": "tunnelbana-plugin/src/lib.rs", "tf": "tunnelbana-plugin/src/flow.rs", "js": "src/json_strict.rs", "ss": "src/session_seal.rs"}
 M = [
  ("sd", 'if kbc.get("sd_hash").and_then(Value::as_str) != Some(expected.as_str()) {', 'if false {', "KB sd_hash"),
  ("sd", 'if w.used.len() != count {', 'if false {', "unreferenced disclosure"),
@@ -100,12 +100,14 @@ M = [
  ("rc", 'self.entries.remove(&k);', '', "receipt cache eviction"),
  ("rc", 'if self.high != i64::MIN && now < self.high - self.skew {', 'if false {', "receipt clock rollback"),
  ("rc", 'self.high = self.high.max(now);', 'self.high = now;', "receipt high-water mark"),
- ("tb", 'if f.responded {', 'if false {', "plugin replay guard"),
- ("tb", '            f.responded = true;\n', '', "plugin mark responded"),
- ("tb", 'return Ok(Response::text(403, "issuer not trusted"));', '', "plugin deny on untrusted issuer"),
- ("tb", 'return Ok(Response::text(503, "trust evaluation unavailable"));', '', "plugin fail closed on pdp error"),
+ ("tf", 'if !matches!(flow.outcome, Outcome::Pending) {', 'if false {', "plugin replay guard"),
+ ("tf", 'flow.outcome = Outcome::Processing(claim_id.to_owned());', 'flow.outcome = Outcome::Pending;', "plugin mark responded"),
+ ("tf", 'if !matches!(&flow.outcome, Outcome::Processing(current) if current == claim_id) {', 'if false {', "plugin finish CAS"),
+ ("tf", 'flow.outcome = Outcome::Collected;', 'flow.outcome = Outcome::Pending;', "plugin collect once"),
+ ("tb", 'Response::text(403, "issuer not trusted"),', 'Response::text(200, "issuer not trusted"),', "plugin deny on untrusted issuer"),
+ ("tb", 'Response::text(503, "trust evaluation unavailable"),', 'Response::text(200, "trust evaluation unavailable"),', "plugin fail closed on pdp error"),
  ("tb", 'Err(_) if fallback.is_some() => Ok(fallback.expect("checked").decision),', 'Err(_) if false => Ok(fallback.expect("checked").decision),', "plugin stale receipt fallback"),
- ("tb", 'matches!(flow.outcome, Outcome::Pending) && now >= flow.expires_at', 'false', "plugin pending expiry"),
+ ("tf", 'matches!(self.outcome, Outcome::Pending) && now >= self.expires_at', 'false', "plugin pending expiry"),
  ("tb", "if id.len() < 16\n            || id.len() > 64\n            || !id\n                .bytes()\n                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')\n        {", 'if false {', "plugin flow id validation"),
  ("tb", 'if ctx.request.method != "POST" {', 'if false {', "plugin POST only"),
  ("tb", 'if cfg.request_ttl_secs <= 0 || cfg.request_ttl_secs > 900 {', 'if false {', "plugin ttl bounds"),

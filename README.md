@@ -30,8 +30,11 @@ production-ready yet.
   result/error API. See the package README and Node tests in that directory.
 
 The initial operational target is an end-to-end gateway flow using the SIROS SDK
-sample wallet, deployed through `sirosid-dev`. High availability is a core
-requirement; the current in-process flow and replay stores are not yet HA.
+sample wallet, deployed through `sirosid-dev`. The gateway supports shared
+MongoDB flow/replay storage with atomic response claims, sealed sessions and
+results, one-time collection, and bounded retention. Single-process memory
+storage remains available only through explicit configuration. Database
+failover itself requires a MongoDB replica set or managed HA service.
 `zkp_req` support is the next major protocol target after the gateway slice and
 will follow the rulebook 0.4/0.5 work landing in SUNET/vc.
 
@@ -45,6 +48,10 @@ cargo build --workspace
 cargo test --workspace --all-features
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+# Also exercise the MongoDB contract against a real server.
+SIROS_VERIFIER_TEST_MONGODB_URI=mongodb://127.0.0.1:27017 \
+  cargo test --workspace --all-features
 ```
 
 Additional checks:

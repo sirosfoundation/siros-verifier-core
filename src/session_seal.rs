@@ -8,6 +8,8 @@
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use hkdf::Hkdf;
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
@@ -43,8 +45,14 @@ impl SessionSealer {
 
     /// Seal `session` for the flow named by `aad` (the flow id).
     pub fn seal(&self, session: &Session, aad: &[u8]) -> Result<String> {
+        self.seal_json(session, aad)
+    }
+
+    /// Seal a serializable stored value. Callers use distinct associated-data
+    /// domains for sessions and verified results.
+    pub fn seal_json<T: Serialize>(&self, value: &T, aad: &[u8]) -> Result<String> {
         let plain = Zeroizing::new(
-            serde_json::to_vec(session).map_err(|_| Error::Crypto("session encode".into()))?,
+            serde_json::to_vec(value).map_err(|_| Error::Crypto("session encode".into()))?,
         );
         let cipher =
             Aes256Gcm::new_from_slice(&*self.key).map_err(|_| Error::Crypto("key".into()))?;
@@ -60,6 +68,11 @@ impl SessionSealer {
 
     /// Open a sealed session. Fails if the token was altered, sealed under another key, or sealed for another flow.
     pub fn unseal(&self, token: &str, aad: &[u8]) -> Result<Session> {
+        self.unseal_json(token, aad)
+    }
+
+    /// Open an authenticated stored value with strict duplicate-member JSON checks.
+    pub fn unseal_json<T: DeserializeOwned>(&self, token: &str, aad: &[u8]) -> Result<T> {
         if token.len() > MAX_SEALED {
             return Err(Error::Policy("sealed session too large".into()));
         }

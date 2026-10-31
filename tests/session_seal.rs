@@ -85,6 +85,24 @@ fn tampering_truncation_and_wrong_versions_are_refused() {
 }
 
 #[test]
+fn generic_stored_values_are_encrypted_and_bound_to_their_purpose() {
+    let value = serde_json::json!({"subject": "Lovelace", "given_name": "Ada"});
+    let sealed = sealer("acme").seal_json(&value, b"result:flow-1").unwrap();
+    assert!(!sealed.contains("Lovelace"));
+    assert!(!sealed.contains("Ada"));
+    let back: serde_json::Value = sealer("acme")
+        .unseal_json(&sealed, b"result:flow-1")
+        .unwrap();
+    assert_eq!(back, value);
+    assert!(sealer("acme")
+        .unseal_json::<serde_json::Value>(&sealed, b"session:flow-1")
+        .is_err());
+    assert!(sealer("acme")
+        .unseal_json::<serde_json::Value>(&sealed, b"result:flow-2")
+        .is_err());
+}
+
+#[test]
 fn every_seal_is_different_and_a_weak_master_is_refused() {
     let s = session();
     let a = sealer("acme").seal(&s, b"f").unwrap();

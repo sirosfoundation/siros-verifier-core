@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use siros_verifier_core::session_seal::SessionSealer;
 use siros_verifier_core::testutil::*;
 use siros_verifier_core_tunnelbana::*;
 use tunnelbana_core::context::Context;
@@ -49,6 +50,41 @@ impl PdpClient for MockPdp {
                                               "next_update": next_update(self.next_update_in)}]}}))
     }
 }
+
+#[derive(Default)]
+struct FinishFailingStore {
+    inner: MemoryFlowStore,
+}
+
+#[async_trait]
+impl FlowStore for FinishFailingStore {
+    async fn insert(&self, flow: Flow, now: i64) -> StoreResult<()> {
+        self.inner.insert(flow, now).await
+    }
+
+    async fn get(&self, id: &str, now: i64) -> StoreResult<Option<Flow>> {
+        self.inner.get(id, now).await
+    }
+
+    async fn claim(&self, id: &str, now: i64, claim_id: &str) -> StoreResult<ClaimResult> {
+        self.inner.claim(id, now, claim_id).await
+    }
+
+    async fn finish(
+        &self,
+        _id: &str,
+        _now: i64,
+        _claim_id: &str,
+        _outcome: TerminalOutcome,
+    ) -> StoreResult<FinishResult> {
+        Err(FlowStoreError("injected finish outage".into()))
+    }
+
+    async fn collect(&self, id: &str, now: i64) -> StoreResult<CollectResult> {
+        self.inner.collect(id, now).await
+    }
+}
+
 fn next_update(secs_after_t0: i64) -> String {
     // T0 = 2027-01-15T08:00:00Z
     let t = T0 + secs_after_t0;
@@ -144,6 +180,21 @@ fn fx_full(next_update_in: i64, subject_pointer: &str) -> Fx {
 }
 fn fx() -> Fx {
     fx_with(100_000)
+}
+
+impl Fx {
+    fn with_storage(self, store: Arc<dyn FlowStore>) -> Self {
+        Self {
+            b: self
+                .b
+                .with_flow_store(store)
+                .with_session_sealer(SessionSealer::from_master(&[41u8; 32], "vp").unwrap()),
+            pdp: self.pdp,
+            clock: self.clock,
+            holder: self.holder,
+            issued: self.issued,
+        }
+    }
 }
 
 fn req(path: &str, method: &str) -> HttpRequestData {
@@ -351,6 +402,57 @@ async fn replayed_wallet_response_is_rejected_and_does_not_double_deliver() {
         complete(&f, &state).await.unwrap(),
         BackendAction::AuthResponse(_)
     ));
+}
+
+#[tokio::test]
+async fn two_replicas_share_the_complete_flow_and_replay_guard() {
+    let store = Arc::new(MemoryFlowStore::default());
+    let a = fx().with_storage(store.clone());
+    let b = fx().with_storage(store);
+    let (state, id) = start(&a).await;
+    let jar = fetch_jar(&b, &id).await;
+    let jwe = wallet(&a, &jar);
+    assert_eq!(post(&b, &id, &jwe).await.0, 200);
+    assert!(matches!(
+        complete(&b, &state).await.unwrap(),
+        BackendAction::AuthResponse(_)
+    ));
+    assert_eq!(post(&a, &id, &jwe).await.0, 409);
+}
+
+#[tokio::test]
+async fn concurrent_replica_responses_and_collections_each_have_one_winner() {
+    let store = Arc::new(MemoryFlowStore::default());
+    let a = fx().with_storage(store.clone());
+    let b = fx().with_storage(store);
+    let (state, id) = start(&a).await;
+    let jar = fetch_jar(&b, &id).await;
+    let jwe = wallet(&a, &jar);
+    let (first, second) = tokio::join!(post(&a, &id, &jwe), post(&b, &id, &jwe));
+    let mut statuses = [first.0, second.0];
+    statuses.sort_unstable();
+    assert_eq!(statuses, [200, 409]);
+
+    let (first, second) = tokio::join!(complete(&a, &state), complete(&b, &state));
+    let delivered = [first, second]
+        .into_iter()
+        .filter(|result| matches!(result, Ok(BackendAction::AuthResponse(_))))
+        .count();
+    assert_eq!(delivered, 1);
+}
+
+#[tokio::test]
+async fn a_failed_final_result_write_never_delivers_authentication() {
+    let f = fx().with_storage(Arc::new(FinishFailingStore::default()));
+    let (state, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    let jwe = wallet(&f, &jar);
+    assert_eq!(post(&f, &id, &jwe).await.0, 503);
+    assert!(matches!(
+        complete(&f, &state).await.unwrap(),
+        BackendAction::Respond(_)
+    ));
+    assert_eq!(post(&f, &id, &jwe).await.0, 409);
 }
 
 #[tokio::test]

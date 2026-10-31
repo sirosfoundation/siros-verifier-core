@@ -24,8 +24,13 @@ use tunnelbana_core::context::Context;
 use tunnelbana_core::internal::{AuthenticationInformation, InternalData};
 use tunnelbana_core::plugin::{Backend, BackendAction, BuildContext, Registry, Route};
 
+pub mod flow;
 pub mod ts11;
 pub mod ui;
+pub use flow::{
+    ClaimResult, CollectResult, FinishResult, Flow, FlowStore, FlowStoreError, MemoryFlowStore,
+    Outcome, StoreResult, TerminalOutcome, FLOW_RETENTION_GRACE_SECS, FLOW_SCHEMA_VERSION,
+};
 use tunnelbana_core::{Error, Response, Result};
 
 pub const NS: &str = "VP_BACKEND";
@@ -172,36 +177,6 @@ pub fn system_clock() -> Clock {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0)
     })
-}
-
-enum Outcome {
-    Pending,
-    Done(InternalData),
-    Failed(String),
-}
-
-struct Flow {
-    jar: String,
-    /// The response-decryption key is stored only inside this sealed session.
-    sealed_session: String,
-    expires_at: i64,
-    requester: Option<String>,
-    attribute_map: BTreeMap<String, String>,
-    subject_pointer: String,
-    outcome: Outcome,
-    /// Set when a wallet response has been accepted for processing; a second response is a replay.
-    responded: bool,
-}
-
-fn is_expired(flow: &Flow, now: i64) -> bool {
-    matches!(flow.outcome, Outcome::Pending) && now >= flow.expires_at
-}
-
-/// Server-side flow state, keyed by an unguessable id. In-process only: a deployment with more than one
-/// instance needs a shared implementation (tunnelbana's own caches are process-local too).
-#[derive(Default)]
-pub struct FlowStore {
-    flows: Mutex<HashMap<String, Flow>>,
 }
 
 // ---- trust gate ----------------------------------------------------------------------------
@@ -372,7 +347,7 @@ pub struct VpBackend {
     name: String,
     module_base: String,
     cfg: VpBackendConfig,
-    store: FlowStore,
+    store: Arc<dyn FlowStore>,
     sealer: SessionSealer,
     gate: TrustGate,
     signer: kryptering::SoftwareSigner,
@@ -483,7 +458,7 @@ impl VpBackend {
             name: name.into(),
             module_base: module_base.into(),
             cfg,
-            store: FlowStore::default(),
+            store: Arc::new(MemoryFlowStore::default()),
             sealer: SessionSealer::from_master(&random_master(), name)
                 .map_err(|e| Error::Internal(format!("session sealer: {}", e.code())))?,
             gate,
@@ -491,6 +466,12 @@ impl VpBackend {
             chain_der,
             clock,
         })
+    }
+
+    /// Inject shared flow/replay storage. Every replica must use the same store.
+    pub fn with_flow_store(mut self, store: Arc<dyn FlowStore>) -> Self {
+        self.store = store;
+        self
     }
 
     /// Override the per-tenant sealing key. Shared-store deployments must construct every
@@ -561,10 +542,38 @@ impl VpBackend {
         Ok(data)
     }
 
-    async fn fail(&self, id: &str, code: &str) {
-        if let Some(f) = self.store.flows.lock().expect("flows").get_mut(id) {
-            f.outcome = Outcome::Failed(code.to_owned());
+    async fn finish_response(
+        &self,
+        id: &str,
+        claim_id: &str,
+        outcome: TerminalOutcome,
+        response: Response,
+    ) -> Result<Response> {
+        match self
+            .store
+            .finish(id, (self.clock)(), claim_id, outcome)
+            .await
+        {
+            Ok(FinishResult::Finished) => Ok(response),
+            Ok(FinishResult::Conflict) => Ok(Response::text(409, "flow completion conflict")),
+            Err(_) => Ok(Response::text(503, "flow store unavailable")),
         }
+    }
+
+    async fn fail(
+        &self,
+        id: &str,
+        claim_id: &str,
+        code: &str,
+        response: Response,
+    ) -> Result<Response> {
+        self.finish_response(
+            id,
+            claim_id,
+            TerminalOutcome::Failed(code.to_owned()),
+            response,
+        )
+        .await
     }
 
     async fn on_wallet_response(&self, ctx: &mut Context) -> Result<Response> {
@@ -573,39 +582,57 @@ impl VpBackend {
             return Ok(Response::text(405, "method not allowed"));
         }
         let now = (self.clock)();
-        // Take what we need and mark the flow answered in one step, so a replay cannot run twice.
-        let (sealed_session, requester, attribute_map, subject_pointer) = {
-            let mut flows = self.store.flows.lock().expect("flows");
-            let Some(f) = flows.get_mut(&id) else {
-                return Ok(Response::text(404, "unknown flow"));
-            };
-            if f.responded {
+        let claim_id = new_flow_id();
+        let flow = match self.store.claim(&id, now, &claim_id).await {
+            Ok(ClaimResult::Claimed(flow)) => flow,
+            Ok(ClaimResult::Unknown) => return Ok(Response::text(404, "unknown flow")),
+            Ok(ClaimResult::Expired) => return Ok(Response::text(400, "expired flow")),
+            Ok(ClaimResult::Replay) => {
                 return Ok(Response::text(409, "response already received"));
             }
-            f.responded = true;
-            (
-                f.sealed_session.clone(),
-                f.requester.clone(),
-                f.attribute_map.clone(),
-                f.subject_pointer.clone(),
-            )
+            Err(_) => return Ok(Response::text(503, "flow store unavailable")),
         };
+        let Flow {
+            sealed_session,
+            requester,
+            attribute_map,
+            subject_pointer,
+            ..
+        } = flow;
         let session = match self.sealer.unseal(&sealed_session, id.as_bytes()) {
             Ok(s) => s,
             Err(e) => {
-                self.fail(&id, e.code()).await;
-                return Ok(Response::text(500, "stored session cannot be opened"));
+                return self
+                    .fail(
+                        &id,
+                        &claim_id,
+                        e.code(),
+                        Response::text(500, "stored session cannot be opened"),
+                    )
+                    .await;
             }
         };
         let Some(jwe) = ctx.request.form.get("response").cloned() else {
-            self.fail(&id, "missing_response").await;
-            return Ok(Response::text(400, "missing response"));
+            return self
+                .fail(
+                    &id,
+                    &claim_id,
+                    "missing_response",
+                    Response::text(400, "missing response"),
+                )
+                .await;
         };
         let verified = match oid4vp::process_response(&session, &jwe, now, &X5cLeaf) {
             Ok(v) => v,
             Err(e) => {
-                self.fail(&id, e.code()).await;
-                return Ok(Response::text(400, "invalid response"));
+                return self
+                    .fail(
+                        &id,
+                        &claim_id,
+                        e.code(),
+                        Response::text(400, "invalid response"),
+                    )
+                    .await;
             }
         };
         // Every presented credential's issuer must be trusted; a single denial fails the flow.
@@ -618,20 +645,41 @@ impl VpBackend {
             match self.gate.permits(&q, now).await {
                 Ok(true) => {}
                 Ok(false) => {
-                    self.fail(&id, "issuer_not_trusted").await;
-                    return Ok(Response::text(403, "issuer not trusted"));
+                    return self
+                        .fail(
+                            &id,
+                            &claim_id,
+                            "issuer_not_trusted",
+                            Response::text(403, "issuer not trusted"),
+                        )
+                        .await;
                 }
                 Err(e) => {
                     tracing_noop(&e);
-                    self.fail(&id, "trust_unavailable").await;
-                    return Ok(Response::text(503, "trust evaluation unavailable"));
+                    return self
+                        .fail(
+                            &id,
+                            &claim_id,
+                            "trust_unavailable",
+                            Response::text(503, "trust evaluation unavailable"),
+                        )
+                        .await;
                 }
             }
             if result.is_none() {
-                let claims = p
-                    .verified
-                    .claims()
-                    .map_err(|e| Error::Internal(format!("claims: {e}")))?;
+                let claims = match p.verified.claims() {
+                    Ok(claims) => claims,
+                    Err(_) => {
+                        return self
+                            .fail(
+                                &id,
+                                &claim_id,
+                                "claims_unavailable",
+                                Response::text(422, "cannot read claims"),
+                            )
+                            .await;
+                    }
+                };
                 match self.map_attributes(
                     &claims,
                     p.verified.issuer_id(),
@@ -643,42 +691,79 @@ impl VpBackend {
                         result = Some(d);
                     }
                     Err(code) => {
-                        self.fail(&id, &code).await;
-                        return Ok(Response::text(422, "cannot map attributes"));
+                        return self
+                            .fail(
+                                &id,
+                                &claim_id,
+                                &code,
+                                Response::text(422, "cannot map attributes"),
+                            )
+                            .await;
                     }
                 }
             }
         }
         let Some(data) = result else {
-            self.fail(&id, "no_presentation").await;
-            return Ok(Response::text(400, "no presentation"));
+            return self
+                .fail(
+                    &id,
+                    &claim_id,
+                    "no_presentation",
+                    Response::text(400, "no presentation"),
+                )
+                .await;
         };
-        if let Some(f) = self.store.flows.lock().expect("flows").get_mut(&id) {
-            f.outcome = Outcome::Done(data);
-        }
-        Response::json(&serde_json::json!({}))
+        let sealed_result = match self
+            .sealer
+            .seal_json(&data, format!("result:{id}").as_bytes())
+        {
+            Ok(result) => result,
+            Err(e) => {
+                return self
+                    .fail(
+                        &id,
+                        &claim_id,
+                        e.code(),
+                        Response::text(500, "result cannot be sealed"),
+                    )
+                    .await;
+            }
+        };
+        self.finish_response(
+            &id,
+            &claim_id,
+            TerminalOutcome::Done(sealed_result),
+            Response::json(&serde_json::json!({}))?,
+        )
+        .await
     }
 
-    fn status(&self, ctx: &Context) -> Result<BackendAction> {
+    async fn status(&self, ctx: &Context) -> Result<BackendAction> {
         let id = ctx
             .state
             .get_str(NS, FLOW_KEY)
             .ok_or_else(|| Error::Authn("no_flow".into()))?;
         let now = (self.clock)();
-        let mut flows = self.store.flows.lock().expect("flows");
-        let Some(f) = flows.get_mut(&id) else {
+        let flow = match self.store.get(&id, now).await {
+            Ok(flow) => flow,
+            Err(_) => {
+                return Ok(BackendAction::Respond(Response::text(
+                    503,
+                    "flow store unavailable",
+                )));
+            }
+        };
+        let Some(flow) = flow else {
             return Ok(BackendAction::Respond(Response::json(
                 &serde_json::json!({"status": "unknown"}),
             )?));
         };
-        let status = match &f.outcome {
-            _ if is_expired(f, now) => {
-                flows.remove(&id);
-                "expired"
-            }
-            Outcome::Pending => "pending",
+        let status = match &flow.outcome {
+            _ if flow.expired(now) => "expired",
+            Outcome::Pending | Outcome::Processing(_) => "pending",
             Outcome::Failed(_) => "failed",
             Outcome::Done(_) => "done",
+            Outcome::Collected => "unknown",
         };
         Ok(BackendAction::Respond(Response::json(
             &serde_json::json!({
@@ -688,39 +773,33 @@ impl VpBackend {
         )?))
     }
 
-    fn complete(&self, ctx: &Context) -> Result<BackendAction> {
+    async fn complete(&self, ctx: &Context) -> Result<BackendAction> {
         // Only the browser that started the flow can collect the result.
         let id = ctx
             .state
             .get_str(NS, FLOW_KEY)
             .ok_or_else(|| Error::Authn("no_flow".into()))?;
         let now = (self.clock)();
-        let mut flows = self.store.flows.lock().expect("flows");
-        let Some(f) = flows.get_mut(&id) else {
-            return Err(Error::Authn("unknown_flow".into()));
-        };
-        match &f.outcome {
-            _ if is_expired(f, now) => {
-                flows.remove(&id);
-                Err(Error::Authn("flow_expired".into()))
+        match self.store.collect(&id, now).await {
+            Ok(CollectResult::Unknown) => Err(Error::Authn("unknown_flow".into())),
+            Ok(CollectResult::Pending) => {
+                Ok(BackendAction::Respond(waiting_page(&self.module_base)))
             }
-            Outcome::Pending => Ok(BackendAction::Respond(waiting_page(&self.module_base))),
-            Outcome::Failed(code) => {
-                let code = code.clone();
-                flows.remove(&id);
-                Err(Error::Authn(code))
-            }
-            Outcome::Done(_) => {
-                // One-time collection.
-                let Some(Flow {
-                    outcome: Outcome::Done(data),
-                    ..
-                }) = flows.remove(&id)
-                else {
-                    unreachable!()
-                };
+            Ok(CollectResult::Expired) => Err(Error::Authn("flow_expired".into())),
+            Ok(CollectResult::Failed(code)) => Err(Error::Authn(code)),
+            Ok(CollectResult::Done(sealed_result)) => {
+                let data: InternalData = self
+                    .sealer
+                    .unseal_json(&sealed_result, format!("result:{id}").as_bytes())
+                    .map_err(|e| {
+                        Error::Internal(format!("stored result cannot be opened: {}", e.code()))
+                    })?;
                 Ok(BackendAction::AuthResponse(data))
             }
+            Err(_) => Ok(BackendAction::Respond(Response::text(
+                503,
+                "flow store unavailable",
+            ))),
         }
     }
 }
@@ -831,6 +910,12 @@ impl Backend for VpBackend {
     async fn start_auth(&self, ctx: &mut Context, request: InternalData) -> Result<Response> {
         let now = (self.clock)();
         let id = new_flow_id();
+        let scheme = request
+            .attr_first(ui::SCHEME_ATTRIBUTE)
+            .unwrap_or("openid4vp");
+        if !matches!(scheme, "openid4vp" | "haip" | "haip-vp" | "mdoc-openid4vp") {
+            return Err(Error::BadRequest("unsupported wallet URI scheme".into()));
+        }
         let (dcql_query, attribute_map, subject_pointer) = request_profile(&request, &self.cfg)?;
         let cfg = RequestConfig {
             response_uri: format!("{}/response/{id}", self.module_base),
@@ -854,27 +939,23 @@ impl Backend for VpBackend {
             .sealer
             .seal(&session, id.as_bytes())
             .map_err(|e| Error::Internal(format!("session seal: {}", e.code())))?;
-        self.store.flows.lock().expect("flows").insert(
-            id.clone(),
-            Flow {
-                jar: jar.clone(),
-                sealed_session,
-                expires_at,
-                requester: request.requester.clone(),
-                attribute_map,
-                subject_pointer,
-                outcome: Outcome::Pending,
-                responded: false,
-            },
-        );
+        let flow = Flow {
+            id: id.clone(),
+            schema_version: FLOW_SCHEMA_VERSION,
+            jar: jar.clone(),
+            sealed_session,
+            expires_at,
+            retain_until: expires_at.saturating_add(FLOW_RETENTION_GRACE_SECS),
+            requester: request.requester.clone(),
+            attribute_map,
+            subject_pointer,
+            outcome: Outcome::Pending,
+        };
+        if self.store.insert(flow, now).await.is_err() {
+            return Ok(Response::text(503, "flow store unavailable"));
+        }
         ctx.state.set_str(NS, FLOW_KEY, id.clone());
         let request_uri = format!("{}/request/{id}", self.module_base);
-        let scheme = request
-            .attr_first(ui::SCHEME_ATTRIBUTE)
-            .unwrap_or("openid4vp");
-        if !matches!(scheme, "openid4vp" | "haip" | "haip-vp" | "mdoc-openid4vp") {
-            return Err(Error::BadRequest("unsupported wallet URI scheme".into()));
-        }
         let link = format!(
             "{scheme}://cb?client_id={}&request_uri={}&request_uri_method=get",
             pct(&client_id),
@@ -893,20 +974,35 @@ impl Backend for VpBackend {
         match route_id {
             "request" => {
                 let id = self.flow_id_from_path(ctx, "request")?;
-                let flows = self.store.flows.lock().expect("flows");
-                let f = flows
-                    .get(&id)
-                    .ok_or_else(|| Error::BadRequest("unknown flow".into()))?;
+                let now = (self.clock)();
+                let flow = match self.store.get(&id, now).await {
+                    Ok(flow) => flow,
+                    Err(_) => {
+                        return Ok(BackendAction::Respond(Response::text(
+                            503,
+                            "flow store unavailable",
+                        )));
+                    }
+                };
+                let Some(flow) = flow else {
+                    return Err(Error::BadRequest("unknown flow".into()));
+                };
+                if !matches!(&flow.outcome, Outcome::Pending) {
+                    return Err(Error::BadRequest("unknown flow".into()));
+                }
+                if flow.expired(now) {
+                    return Err(Error::BadRequest("expired flow".into()));
+                }
                 Ok(BackendAction::Respond(
                     Response::new(200)
                         .with_header("content-type", "application/oauth-authz-req+jwt")
                         .with_header("cache-control", "no-store")
-                        .with_body(f.jar.clone().into_bytes()),
+                        .with_body(flow.jar.into_bytes()),
                 ))
             }
             "response" => Ok(BackendAction::Respond(self.on_wallet_response(ctx).await?)),
-            "status" => self.status(ctx),
-            "complete" => self.complete(ctx),
+            "status" => self.status(ctx).await,
+            "complete" => self.complete(ctx).await,
             other => Err(Error::NoBoundEndpoint(other.into())),
         }
     }

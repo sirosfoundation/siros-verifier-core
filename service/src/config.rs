@@ -1,11 +1,25 @@
 use serde::Deserialize;
 use siros_verifier_core_tunnelbana::VpBackendConfig;
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FlowStorageConfig {
+    /// `memory` for an explicitly single-process deployment, or `mongodb`.
+    pub backend: String,
+    #[serde(default)]
+    pub uri: Option<String>,
+    #[serde(default)]
+    pub database: Option<String>,
+    #[serde(default)]
+    pub collection: Option<String>,
+}
+
 /// Deployment-only settings wrapped around the backend's closed protocol config.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeploymentConfig {
     pub request_signing_key_path: String,
+    pub storage: FlowStorageConfig,
     pub request_certificate_chain_path: String,
     pub pdp_endpoint: String,
     #[serde(default)]

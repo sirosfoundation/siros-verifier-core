@@ -3,18 +3,21 @@
 
 mod config;
 mod http;
+mod mongo_store;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer};
 use anyhow::{anyhow, bail, Context as _};
-use config::DeploymentConfig;
+use config::{DeploymentConfig, FlowStorageConfig};
 use http::ReqwestClient;
+use mongo_store::MongoFlowStore;
 use siros_verifier_core::oid4vp;
 use siros_verifier_core::session_seal::SessionSealer;
 use siros_verifier_core_tunnelbana::{
-    system_clock, ui::UiFrontend, HttpPdp, PdpClient, TrustGate, VpBackend,
+    system_clock, ui::UiFrontend, FlowStore, HttpPdp, MemoryFlowStore, PdpClient, TrustGate,
+    VpBackend,
 };
 use tunnelbana_core::attributes::AttributeMapper;
 use tunnelbana_core::config::ProxyConfig;
@@ -40,10 +43,12 @@ async fn main() -> std::io::Result<()> {
         std::process::exit(1);
     }
 
-    let proxy = build_proxy(cfg.clone(), &config_path).unwrap_or_else(|e| {
-        eprintln!("failed to assemble verifier proxy: {e:#}");
-        std::process::exit(1);
-    });
+    let proxy = build_proxy(cfg.clone(), &config_path)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("failed to assemble verifier proxy: {e:#}");
+            std::process::exit(1);
+        });
     let proxy = web::Data::new(Arc::new(proxy));
     let bind = std::env::var("TUNNELBANA_BIND").unwrap_or_else(|_| "127.0.0.1:9001".to_string());
     tracing::info!(%bind, base_url = %cfg.base_url, "starting siros-verifier-service");
@@ -72,7 +77,7 @@ fn init_tracing(logging: &tunnelbana_core::config::LoggingConfig) {
 /// Assemble the real OIDC frontend and our custom OpenID4VP backend. The
 /// frontend is configured through the ordinary tunnelbana registry; the custom
 /// backend is constructed explicitly because it owns key material and a PDP.
-fn build_proxy(cfg: ProxyConfig, config_path: &str) -> anyhow::Result<Proxy> {
+async fn build_proxy(cfg: ProxyConfig, config_path: &str) -> anyhow::Result<Proxy> {
     let mut registry = Registry::new();
     tunnelbana_plugins::register_all(&mut registry);
     registry.register_frontend("ui", UiFrontend::build);
@@ -113,7 +118,7 @@ fn build_proxy(cfg: ProxyConfig, config_path: &str) -> anyhow::Result<Proxy> {
         bail!("exactly one backend of type openid4vp is required");
     }
     let plugin = &cfg.backends[0];
-    let backend = build_openid4vp_backend(&cfg, plugin, config_path)?;
+    let backend = build_openid4vp_backend(&cfg, plugin, config_path).await?;
     let backends = vec![backend];
     let mut microservices = Vec::new();
     for p in &cfg.microservices {
@@ -131,7 +136,45 @@ fn build_proxy(cfg: ProxyConfig, config_path: &str) -> anyhow::Result<Proxy> {
     Ok(Proxy::new(frontends, backends, microservices, sealer))
 }
 
-fn build_openid4vp_backend(
+async fn build_flow_store(config: &FlowStorageConfig) -> anyhow::Result<Arc<dyn FlowStore>> {
+    match config.backend.as_str() {
+        "memory" => {
+            if config.uri.is_some() || config.database.is_some() || config.collection.is_some() {
+                bail!("memory storage does not accept MongoDB settings");
+            }
+            Ok(Arc::new(MemoryFlowStore::default()))
+        }
+        "mongodb" => {
+            let uri = config
+                .uri
+                .as_deref()
+                .ok_or_else(|| anyhow!("MongoDB storage requires uri"))?;
+            let database = config
+                .database
+                .as_deref()
+                .ok_or_else(|| anyhow!("MongoDB storage requires database"))?;
+            let collection = config.collection.as_deref().unwrap_or("presentation_flows");
+            for (name, value) in [("database", database), ("collection", collection)] {
+                if value.is_empty()
+                    || value.len() > 63
+                    || !value
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+                {
+                    bail!("MongoDB {name} must be 1..=63 ASCII letters, digits, '_' or '-'");
+                }
+            }
+            Ok(Arc::new(
+                MongoFlowStore::connect(uri, database, collection)
+                    .await
+                    .map_err(|e| anyhow!(e))?,
+            ))
+        }
+        other => bail!("unsupported flow storage backend {other:?}"),
+    }
+}
+
+async fn build_openid4vp_backend(
     cfg: &ProxyConfig,
     plugin: &tunnelbana_core::config::PluginConfig,
     config_path: &str,
@@ -194,6 +237,7 @@ fn build_openid4vp_backend(
     .with_no_freshness_ttl(deployment.max_receipt_ttl_secs());
     let sealer = SessionSealer::from_master(cfg.state_encryption_key.as_bytes(), &plugin.name)?;
     let module_base = format!("{}/{}", cfg.base_url.trim_end_matches('/'), plugin.name);
+    let store = build_flow_store(&deployment.storage).await?;
     let backend = VpBackend::new(
         &plugin.name,
         &module_base,
@@ -203,8 +247,9 @@ fn build_openid4vp_backend(
         chain_der,
         system_clock(),
     )?
+    .with_flow_store(store)
     .with_session_sealer(sealer);
-    tracing::info!(name = %plugin.name, pdp = %deployment.pdp_endpoint, "loaded OpenID4VP backend");
+    tracing::info!(name = %plugin.name, pdp = %deployment.pdp_endpoint, storage = %deployment.storage.backend, "loaded OpenID4VP backend");
     Ok(Box::new(backend))
 }
 
@@ -374,12 +419,17 @@ mod tests {
               dcql = {{ credentials = [] }}
               attribute_map = {{}}
               subject_pointer = "/sub"
+
+              [backend.config.storage]
+              backend = "memory"
         "#,
             key = dir.join("key.pem").display(),
             chain = dir.join("chain.pem").display()
         ))
         .unwrap();
-        build_proxy(cfg, dir.join("proxy.toml").to_str().unwrap()).unwrap();
+        build_proxy(cfg, dir.join("proxy.toml").to_str().unwrap())
+            .await
+            .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
