@@ -74,6 +74,16 @@ jobs:
           tool: cargo-audit,cargo-deny
       - run: scripts/audit.sh
 
+  presentation-flow:
+    name: Presentation flow package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - run: npm test
+        working-directory: tunnelbana-plugin/src/assets
+      - run: npm pack --dry-run
+        working-directory: tunnelbana-plugin/src/assets
+
   fuzz:
     name: Parser fuzz smoke
     runs-on: ubuntu-latest

@@ -2,11 +2,37 @@
   "name": "@sirosfoundation/presentation-flow",
   "version": "0.1.0",
   "description": "Framework-free OpenID4VP presentation UI driven by DCQL",
+  "keywords": [
+    "openid4vp",
+    "dcql",
+    "digital-credentials",
+    "wallet",
+    "verifier"
+  ],
   "type": "module",
   "main": "presentation-flow.js",
   "exports": "./presentation-flow.js",
+  "files": [
+    "presentation-flow.js",
+    "demo.js"
+  ],
+  "sideEffects": false,
   "scripts": {
-    "test": "node --test presentation-flow.test.mjs"
+    "test": "node --test presentation-flow.test.mjs",
+    "prepack": "npm test"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sirosfoundation/siros-verifier-core.git",
+    "directory": "tunnelbana-plugin/src/assets"
+  },
+  "homepage": "https://github.com/sirosfoundation/siros-verifier-core/tree/main/tunnelbana-plugin/src/assets#readme",
+  "bugs": "https://github.com/sirosfoundation/siros-verifier-core/issues",
+  "publishConfig": {
+    "access": "public"
   },
   "license": "BSD-2-Clause"
 }

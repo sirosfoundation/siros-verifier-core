@@ -2,8 +2,15 @@
 
 Framework-free ES module for a DCQL-driven OpenID4VP presentation UI. The demo
 page only supplies a catalog and backend binding; request signing, issuer trust,
-and verification remain in the verifier backend. This package is intended to be
-published independently to npm after its API stabilizes.
+and verification remain in the verifier backend.
+
+## Install
+
+```sh
+npm install @sirosfoundation/presentation-flow
+```
+
+The package is an ES module and has no runtime dependencies.
 
 ## Host integration
 
