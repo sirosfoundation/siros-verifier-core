@@ -3,11 +3,11 @@ use jose_rs::jwe::compact as jwe_compact;
 use jose_rs::jwk::Jwk;
 use jose_rs::jws;
 use jose_rs::JoseHeader;
+use p256::elliptic_curve::Generate;
 use serde_json::{json, Value};
 use siros_verifier_core::oid4vp::*;
 use siros_verifier_core::sdjwt::{self, X5cLeaf};
 use siros_verifier_core::testutil::*;
-use siros_verifier_core::trust::TrustQuery;
 use siros_verifier_core::Error;
 
 const NOW: i64 = 1_800_000_000;
@@ -122,14 +122,16 @@ fn happy_path_end_to_end() {
 
     assert_eq!(res.len(), 1);
     let v = &res[0].verified;
-    assert_eq!(v.claims["given_name"], "Ada");
+    let claims = v.claims().unwrap();
+    assert_eq!(claims["given_name"], "Ada");
     assert!(
-        v.claims.get("birthdate").is_none(),
+        claims.get("birthdate").is_none(),
         "undisclosed claim stays hidden"
     );
 
     // what the trust layer would send to go-trust
-    let q = TrustQuery::for_issuer(&v.issuer, "https://example.org/roles/pid-issuer", &v.vct)
+    let q = v
+        .trust_query("https://example.org/roles/pid-issuer", "mdoc-issuer")
         .to_authzen();
     assert_eq!(
         q["subject"],
@@ -179,7 +181,7 @@ fn dc_api_uses_the_browser_origin_for_holder_binding() {
     }];
     let jwe = wallet_respond_dc_api(&jar, &w.holder, &credentials, NOW, origin).unwrap();
     let verified = process_response(&session, &jwe, NOW + 1, &X5cLeaf).unwrap();
-    assert_eq!(verified[0].verified.claims["given_name"], "Ada");
+    assert_eq!(verified[0].verified.claims().unwrap()["given_name"], "Ada");
 
     let wrong_origin = wallet_respond_dc_api(
         &jar,
@@ -285,7 +287,7 @@ fn trailing_array_selector_matches_disclosed_elements() {
     let jwe = answer(&w, &jar, &[disclosure_idx(&w, "nationalities")]);
     let verified = process_response(&s, &jwe, NOW, &X5cLeaf).unwrap();
     assert_eq!(
-        verified[0].verified.claims["nationalities"],
+        verified[0].verified.claims().unwrap()["nationalities"],
         json!(["SE", "DK"])
     );
 
@@ -485,7 +487,7 @@ fn unsupported_query_features_fail_closed() {
 
     // a format other than dc+sd-jwt
     let mut q = dcql(&["given_name"]);
-    q["credentials"][0]["format"] = json!("mso_mdoc");
+    q["credentials"][0]["format"] = json!("jwt_vc_json");
     let (jar, s) = start(&w, q);
     let jwe = answer(&w, &jar, &sel);
     let err = process_response(&s, &jwe, NOW, &X5cLeaf).unwrap_err();
@@ -509,6 +511,18 @@ fn request_time_dcql_validation_is_closed_and_deterministic() {
     let mut array_path = valid.clone();
     array_path["credentials"][0]["claims"][0]["path"] = json!(["nationalities", null]);
     assert!(validate_dcql_query(&array_path).is_ok());
+    let mdoc = json!({"credentials": [{
+        "id": "mdl", "format": "mso_mdoc",
+        "meta": {"doctype_value": "org.iso.18013.5.1.mDL"},
+        "claims": [{"path": ["org.iso.18013.5.1", "family_name"]}],
+    }]});
+    assert!(validate_dcql_query(&mdoc).is_ok());
+    let mut short_mdoc_path = mdoc.clone();
+    short_mdoc_path["credentials"][0]["claims"][0]["path"] = json!(["family_name"]);
+    assert!(validate_dcql_query(&short_mdoc_path).is_err());
+    let mut null_mdoc_path = mdoc;
+    null_mdoc_path["credentials"][0]["claims"][0]["path"] = json!(["org.iso.18013.5.1", null]);
+    assert!(validate_dcql_query(&null_mdoc_path).is_err());
 
     let mut credential_sets = valid.clone();
     credential_sets["credential_sets"] = json!([{ "options": [["pid"]] }]);
@@ -673,4 +687,228 @@ fn a_repeated_jwe_header_member_is_malformed() {
         Err(Error::Malformed(m)) => assert!(m.contains("json_duplicate_member"), "{m}"),
         other => panic!("unexpected result: {:?}", other.err()),
     }
+}
+
+fn mdoc_query() -> Value {
+    json!({"credentials": [{
+        "id": "mdl", "format": "mso_mdoc",
+        "meta": {"doctype_value": "eu.europa.ec.eudi.pid.1"},
+        "claims": [{"path": ["eu.europa.ec.eudi.pid.1", "family_name"]}],
+    }]})
+}
+
+fn start_mdoc(w: &World, dc_api: bool) -> (String, Session) {
+    let signer = software_signer(&w.verifier_key).unwrap();
+    let cfg = RequestConfig {
+        response_uri: "https://verify.example/resp".into(),
+        dcql_query: mdoc_query(),
+        ttl_secs: 300,
+    };
+    if dc_api {
+        create_dc_api_request(
+            &cfg,
+            &signer,
+            "ES256",
+            std::slice::from_ref(&w.verifier_cert),
+            NOW,
+            "https://verify.example",
+        )
+        .unwrap()
+    } else {
+        create_request(
+            &cfg,
+            &signer,
+            "ES256",
+            std::slice::from_ref(&w.verifier_cert),
+            NOW,
+        )
+        .unwrap()
+    }
+}
+
+fn mdoc_token(
+    session: &Session,
+    issuer: &siros_verifier_core::testutil::mdoc_sim::Party,
+    device: &p256::SecretKey,
+    mut spec: siros_verifier_core::testutil::mdoc_sim::Spec,
+) -> String {
+    spec.valid_from = "2026-01-01T00:00:00Z".into();
+    spec.valid_until = "2028-01-01T00:00:00Z".into();
+    let transcript = session.mdoc_session_transcript_bytes().unwrap();
+    let reader = p256::SecretKey::generate();
+    let response = siros_verifier_core::testutil::mdoc_sim::response(
+        &spec,
+        issuer,
+        device,
+        &transcript,
+        Some(&reader.public_key()),
+    );
+    jose_rs::base64url::encode(&response)
+}
+
+fn encrypted_body(session: &Session, body: Value) -> String {
+    raw_response_enc(session, body, None, JweEncryption::A128GCM)
+}
+
+#[test]
+fn mdoc_redirect_and_dc_api_verify_with_their_own_handovers() {
+    let w = world();
+    let issuer = siros_verifier_core::testutil::mdoc_sim::issuer();
+    let device = siros_verifier_core::testutil::mdoc_sim::device();
+    for dc_api in [false, true] {
+        let (_jar, session) = start_mdoc(&w, dc_api);
+        let token = mdoc_token(&session, &issuer, &device, Default::default());
+        let body = json!({"vp_token": {"mdl": [token]}, "state": session.state});
+        let jwe = encrypted_body(&session, body);
+        let verified = process_response(&session, &jwe, NOW + 1, &X5cLeaf).unwrap();
+        assert_eq!(verified.len(), 1);
+        let credential = &verified[0].verified;
+        assert_eq!(credential.vct(), "eu.europa.ec.eudi.pid.1");
+        assert_eq!(
+            credential.claims().unwrap()["eu.europa.ec.eudi.pid.1"]["family_name"],
+            "Svensson"
+        );
+        let trust = credential
+            .trust_query("pid-provider", "mdoc-issuer")
+            .to_authzen();
+        assert_eq!(trust["action"]["name"], "mdoc-issuer");
+        assert_eq!(trust["resource"]["type"], "x5c");
+        assert!(trust["subject"]["id"]
+            .as_str()
+            .unwrap()
+            .starts_with("x509_hash:"));
+    }
+}
+
+#[test]
+fn mixed_sd_jwt_and_mdoc_presentations_stay_distinct() {
+    let w = world();
+    let signer = software_signer(&w.verifier_key).unwrap();
+    let mut query = mdoc_query();
+    query["credentials"]
+        .as_array_mut()
+        .unwrap()
+        .insert(0, dcql(&["given_name"])["credentials"][0].clone());
+    let cfg = RequestConfig {
+        response_uri: "https://verify.example/resp".into(),
+        dcql_query: query,
+        ttl_secs: 300,
+    };
+    let (jar, session) = create_request(
+        &cfg,
+        &signer,
+        "ES256",
+        std::slice::from_ref(&w.verifier_cert),
+        NOW,
+    )
+    .unwrap();
+    let payload: Value = serde_json::from_slice(
+        &jws::compact::verify_with_jwk(&public_of(&w.verifier_key), &jar).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        payload["client_metadata"]["vp_formats_supported"]["mso_mdoc"]["issuerauth_alg_values"],
+        json!([-7])
+    );
+    assert_eq!(
+        payload["client_metadata"]["vp_formats_supported"]["mso_mdoc"]["deviceauth_alg_values"],
+        json!([-7])
+    );
+    let sd = present(
+        &w.issued,
+        &[disclosure_idx(&w, "given_name")],
+        Some(KbSpec {
+            holder: &w.holder,
+            aud: &session.client_id,
+            nonce: &session.nonce,
+            iat: NOW,
+        }),
+        sdjwt::HashAlg::Sha256,
+    )
+    .unwrap();
+    let issuer = siros_verifier_core::testutil::mdoc_sim::issuer();
+    let device = siros_verifier_core::testutil::mdoc_sim::device();
+    let mdoc = mdoc_token(&session, &issuer, &device, Default::default());
+    let body = json!({"vp_token": {"pid": [sd], "mdl": [mdoc]}, "state": session.state});
+    let jwe = encrypted_body(&session, body);
+    let verified = process_response(&session, &jwe, NOW + 1, &X5cLeaf).unwrap();
+    assert_eq!(verified.len(), 2);
+    assert!(matches!(verified[0].verified, VerifiedCredential::SdJwt(_)));
+    assert!(matches!(verified[1].verified, VerifiedCredential::Mdoc(_)));
+}
+
+#[test]
+fn mdoc_rejects_wrong_doctype_missing_claims_and_wrong_handover() {
+    let w = world();
+    let issuer = siros_verifier_core::testutil::mdoc_sim::issuer();
+    let device = siros_verifier_core::testutil::mdoc_sim::device();
+
+    let (_jar, session) = start_mdoc(&w, false);
+    let mut wrong_doctype = mdoc_query();
+    wrong_doctype["credentials"][0]["meta"]["doctype_value"] = json!("org.example.other");
+    let signer = software_signer(&w.verifier_key).unwrap();
+    let cfg = RequestConfig {
+        response_uri: session.response_uri.clone(),
+        dcql_query: wrong_doctype,
+        ttl_secs: 300,
+    };
+    let (_jar, wrong_session) = create_request(
+        &cfg,
+        &signer,
+        "ES256",
+        std::slice::from_ref(&w.verifier_cert),
+        NOW,
+    )
+    .unwrap();
+    let token = mdoc_token(&wrong_session, &issuer, &device, Default::default());
+    let body = json!({"vp_token": {"mdl": [token]}, "state": wrong_session.state});
+    let jwe = encrypted_body(&wrong_session, body);
+    assert!(process_response(&wrong_session, &jwe, NOW + 1, &X5cLeaf).is_err());
+
+    let (_jar, dc_session) = start_mdoc(&w, true);
+    let (_jar, qr_session) = start_mdoc(&w, false);
+    let token = mdoc_token(&dc_session, &issuer, &device, Default::default());
+    let body = json!({"vp_token": {"mdl": [token]}, "state": qr_session.state});
+    let jwe = encrypted_body(&qr_session, body);
+    assert!(process_response(&qr_session, &jwe, NOW + 1, &X5cLeaf).is_err());
+}
+
+#[test]
+fn mdoc_rejects_missing_claim_and_remote_device_mac() {
+    let w = world();
+    let issuer = siros_verifier_core::testutil::mdoc_sim::issuer();
+    let device = siros_verifier_core::testutil::mdoc_sim::device();
+    let signer = software_signer(&w.verifier_key).unwrap();
+    let mut query = mdoc_query();
+    query["credentials"][0]["claims"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"path": ["eu.europa.ec.eudi.pid.1", "not_released"]}));
+    let cfg = RequestConfig {
+        response_uri: "https://verify.example/resp".into(),
+        dcql_query: query,
+        ttl_secs: 300,
+    };
+    let (_jar, session) = create_request(
+        &cfg,
+        &signer,
+        "ES256",
+        std::slice::from_ref(&w.verifier_cert),
+        NOW,
+    )
+    .unwrap();
+    let token = mdoc_token(&session, &issuer, &device, Default::default());
+    let body = json!({"vp_token": {"mdl": [token]}, "state": session.state});
+    let jwe = encrypted_body(&session, body);
+    assert!(process_response(&session, &jwe, NOW + 1, &X5cLeaf).is_err());
+
+    let (_jar, session) = start_mdoc(&w, false);
+    let spec = siros_verifier_core::testutil::mdoc_sim::Spec {
+        use_mac: true,
+        ..Default::default()
+    };
+    let token = mdoc_token(&session, &issuer, &device, spec);
+    let body = json!({"vp_token": {"mdl": [token]}, "state": session.state});
+    let jwe = encrypted_body(&session, body);
+    assert!(process_response(&session, &jwe, NOW + 1, &X5cLeaf).is_err());
 }

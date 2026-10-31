@@ -103,6 +103,7 @@ pub fn go() -> &'static GoFixture {
                 dcql_query: json!({"credentials":[{"id":"pid","format":"dc+sd-jwt"}]}),
                 expires_at: i64::MAX,
                 enc_key,
+                response_mode: "direct_post.jwt".into(),
                 dc_api_origin: None,
             },
             resolver: StaticKey(

@@ -20,7 +20,6 @@ use siros_verifier_core::receipt::{
 };
 use siros_verifier_core::sdjwt::X5cLeaf;
 use siros_verifier_core::session_seal::SessionSealer;
-use siros_verifier_core::trust::TrustQuery;
 use tunnelbana_core::context::Context;
 use tunnelbana_core::internal::{AuthenticationInformation, InternalData};
 use tunnelbana_core::plugin::{Backend, BackendAction, BuildContext, Registry, Route};
@@ -45,11 +44,18 @@ pub struct VpBackendConfig {
     pub subject_pointer: String,
     /// go-trust `action.name` for issuers of this backend.
     pub role: String,
+    /// go-trust action for mdoc IACA evaluation (defaults to `mdoc-issuer`).
+    #[serde(default = "default_mdoc_role")]
+    pub mdoc_role: String,
     #[serde(default = "default_ttl")]
     pub request_ttl_secs: i64,
     /// Reported as `auth_class_ref`.
     #[serde(default)]
     pub auth_class_ref: Option<String>,
+}
+
+fn default_mdoc_role() -> String {
+    "mdoc-issuer".into()
 }
 
 fn default_ttl() -> i64 {
@@ -605,7 +611,9 @@ impl VpBackend {
         // Every presented credential's issuer must be trusted; a single denial fails the flow.
         let mut result: Option<InternalData> = None;
         for p in &verified {
-            let q = TrustQuery::for_issuer(&p.verified.issuer, &self.cfg.role, &p.verified.vct)
+            let q = p
+                .verified
+                .trust_query(&self.cfg.role, &self.cfg.mdoc_role)
                 .to_authzen();
             match self.gate.permits(&q, now).await {
                 Ok(true) => {}
@@ -620,9 +628,13 @@ impl VpBackend {
                 }
             }
             if result.is_none() {
+                let claims = p
+                    .verified
+                    .claims()
+                    .map_err(|e| Error::Internal(format!("claims: {e}")))?;
                 match self.map_attributes(
-                    &p.verified.claims,
-                    p.verified.issuer.iss.clone(),
+                    &claims,
+                    p.verified.issuer_id(),
                     &attribute_map,
                     &subject_pointer,
                 ) {

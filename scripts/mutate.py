@@ -37,7 +37,7 @@ M = [
  ("vp", 'if list.is_empty() || (!multiple && list.len() != 1) {', 'if false {', "presentation count"),
  ("vp", 'if !vals.iter().any(|x| x.as_str() == Some(v.vct.as_str())) {', 'if false {', "vct_values"),
  ("vp", 'if !current.iter().any(|value| vals.contains(value)) {', 'if false {', "claim values"),
- ("vp", 'if query.get("format").and_then(Value::as_str) != Some("dc+sd-jwt") {', 'if false {', "format"),
+ ("vp", '_ => return Err(policy("only dc+sd-jwt and mso_mdoc are supported")),', '_ => {}', "format"),
  ("vp", 'if session.dcql_query.get("credential_sets").is_some() {', 'if false {', "credential_sets fail-closed"),
  ("vp", 'if let Some(err) = body.get("error") {', 'if let Some(err) = None::<&Value> {', "wallet error"),
  ("vp", 'if jwe.len() > MAX_RESPONSE_JWE {', 'if false {', "response JWE size limit"),

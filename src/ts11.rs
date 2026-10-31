@@ -195,8 +195,7 @@ pub struct CredentialType {
     pub label: String,
     pub claims: Vec<ClaimMetadata>,
     pub dcql: Value,
-    /// The launch surface currently supports SD-JWT only. mdoc metadata remains
-    /// available to callers without being offered as a working presentation.
+    /// Whether this format has a complete OpenID4VP verification path.
     pub supported: bool,
     pub raw: Value,
 }
@@ -399,7 +398,7 @@ fn mdoc_credential(document: &RegistryDocument, raw: Value) -> Result<Credential
         label,
         claims,
         dcql,
-        supported: false,
+        supported: true,
         raw,
     })
 }
@@ -516,7 +515,7 @@ mod tests {
             [Some("org.iso.18013.5.1".into()), Some("family_name".into())]
         );
         let presets = catalog.presets();
-        assert_eq!(presets.len(), 1, "only the supported SD-JWT is offered");
+        assert_eq!(presets.len(), 2, "both supported formats are offered");
         assert_eq!(
             presets[0]["dcql"]["credentials"][0]["meta"]["vct_values"][0],
             "urn:eudi:pid:1"

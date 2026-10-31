@@ -11,8 +11,9 @@ production-ready yet.
 
 ## Components
 
-- Root crate (`siros-verifier-core`): SD-JWT VC, OpenID4VP, ISO 18013-5 reader
-  sessions, mdoc DeviceResponse verification, and signed decision receipts.
+- Root crate (`siros-verifier-core`): SD-JWT VC and mdoc OpenID4VP with the
+  distinct redirect/DC API handovers, ISO 18013-5 reader sessions, mdoc
+  DeviceResponse verification, and signed decision receipts.
 - `ffi/` (`siros-verifier-core-ffi`): UniFFI facade for proximity-reader
   applications. BLE and NFC transport remain application responsibilities.
 - `tunnelbana-plugin/` (`siros-verifier-core-tunnelbana`): OpenID4VP verifier
