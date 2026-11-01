@@ -4,6 +4,7 @@ use crate::sdjwt::HashAlg;
 use crate::{b64u, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
+use jose_rs::algorithm::JweEncryption;
 use jose_rs::jwk::Jwk;
 use jose_rs::jws::compact::{sign_with_jwk_options, SignOptions};
 use jose_rs::JoseHeader;
@@ -246,6 +247,82 @@ pub fn wallet_respond_dc_api(
     wallet_respond_inner(jar, holder, creds, now, Some(origin))
 }
 
+/// Encrypt a response using the same public agreement and AES-GCM primitives
+/// as the verifier, without jose-rs's compact-token emission ceiling. This
+/// lets tests cover genuine large Longfellow envelopes.
+pub fn encrypt_response(
+    recipient: &Jwk,
+    mut header: JoseHeader,
+    plaintext: &[u8],
+    enc: JweEncryption,
+) -> Result<String> {
+    use crate::Error;
+    use aes_gcm::aead::{Aead, Payload};
+    use aes_gcm::{Aes128Gcm, Aes256Gcm, KeyInit, Nonce};
+
+    let ephemeral = jose_rs::jwk::generate_ec("P-256")?;
+    header.extra.insert(
+        "epk".into(),
+        serde_json::to_value(ephemeral.to_public_jwk())
+            .map_err(|e| Error::Malformed(e.to_string()))?,
+    );
+    let protected =
+        crate::b64u(&serde_json::to_vec(&header).map_err(|e| Error::Malformed(e.to_string()))?);
+    let own = jose_rs::jwk::agreement::agreement_key(&ephemeral)?;
+    let recipient = jose_rs::jwk::agreement::peer_key(recipient)?;
+    let cek = own
+        .derive_key(
+            &recipient,
+            enc.as_str(),
+            header.extra.get("apu").and_then(Value::as_str),
+            header.extra.get("apv").and_then(Value::as_str),
+            match enc {
+                JweEncryption::A128GCM => 16,
+                JweEncryption::A256GCM => 32,
+                _ => return Err(Error::Policy("unsupported test response enc".into())),
+            },
+        )
+        .map_err(Error::Jose)?;
+    let mut iv = [0u8; 12];
+    getrandom::fill(&mut iv).expect("OS randomness");
+    let nonce = Nonce::from(iv);
+    let authenticated = match enc {
+        JweEncryption::A128GCM => Aes128Gcm::new_from_slice(&cek)
+            .map_err(|_| Error::Malformed("invalid AES-128 key".into()))?
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: plaintext,
+                    aad: protected.as_bytes(),
+                },
+            ),
+        JweEncryption::A256GCM => Aes256Gcm::new_from_slice(&cek)
+            .map_err(|_| Error::Malformed("invalid AES-256 key".into()))?
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: plaintext,
+                    aad: protected.as_bytes(),
+                },
+            ),
+        _ => return Err(Error::Policy("unsupported test response enc".into())),
+    }
+    .map_err(|_| Error::Malformed("response encryption failed".into()))?;
+    let split = authenticated
+        .len()
+        .checked_sub(16)
+        .ok_or_else(|| Error::Malformed("response authentication tag missing".into()))?;
+    let (ciphertext, tag) = authenticated.split_at(split);
+    Ok(format!(
+        "{}.{}.{}.{}.{}",
+        protected,
+        "",
+        crate::b64u(&iv),
+        crate::b64u(ciphertext),
+        crate::b64u(tag)
+    ))
+}
+
 fn wallet_respond_inner(
     jar: &str,
     holder: &Jwk,
@@ -255,7 +332,6 @@ fn wallet_respond_inner(
 ) -> Result<String> {
     use crate::{oid4vp, sdjwt};
     use jose_rs::algorithm::{JweAlgorithm, JweEncryption};
-    use jose_rs::jwe::compact as jwe_compact;
     use jose_rs::jws;
 
     let header = jws::decode_header(jar)?;
@@ -300,12 +376,12 @@ fn wallet_respond_inner(
             .expect("enc jwk");
     let mut header = JoseHeader::for_jwe(JweAlgorithm::EcdhEs, JweEncryption::A128GCM);
     header.kid = enc_jwk.kid.clone();
-    Ok(jwe_compact::encrypt_with_jwk_header(
+    encrypt_response(
         &enc_jwk,
         header,
         body.to_string().as_bytes(),
         JweEncryption::A128GCM,
-    )?)
+    )
 }
 
 /// Sign an arbitrary payload as an issuer JWT. For crafting hostile inputs.

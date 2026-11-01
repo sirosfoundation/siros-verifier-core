@@ -12,9 +12,11 @@ use crate::error::{integrity, malformed, policy};
 use crate::sdjwt::{self, CryptoVerified, HolderBinding, IssuerKeyResolver, VerifyParams};
 use crate::trust::TrustQuery;
 use crate::{b64u, b64u_decode, Error, Result};
+use aes_gcm::aead::{Aead, Payload};
+use aes_gcm::{Aes128Gcm, Aes256Gcm, KeyInit, Nonce};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use jose_rs::jwe::compact as jwe_compact;
+use jose_rs::jwk::agreement::{agreement_key, peer_key};
 use jose_rs::jwk::Jwk;
 use jose_rs::jws::compact::{sign_with_options, SignOptions};
 use jose_rs::JoseHeader;
@@ -23,8 +25,10 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 const REQUEST_AUD: &str = "https://self-issued.me/v2";
-const MAX_RESPONSE_JWE: usize = 1024 * 1024;
-const MAX_RESPONSE_PLAINTEXT: usize = 512 * 1024;
+// Genuine Pixel Longfellow presentations exceed 1 MiB after CBOR and JWE
+// base64 expansion. Keep independent token and plaintext ceilings.
+const MAX_RESPONSE_JWE: usize = 2 * 1024 * 1024;
+const MAX_RESPONSE_PLAINTEXT: usize = 1024 * 1024;
 
 pub struct RequestConfig {
     pub response_uri: String,
@@ -649,7 +653,7 @@ fn mdoc_match(query: &Value, verified: &crate::mdoc::MdocVerified) -> Result<()>
 /// Apply the OpenID4VP response policy before handing the authenticated
 /// decryption to jose-rs. In particular, reject excessive ciphertext before
 /// key operations; jose-rs's one-shot JWK API does not take a plaintext limit.
-fn decrypt_response(session: &Session, jwe: &str) -> Result<jose_rs::Authenticated<Vec<u8>>> {
+fn decrypt_response(session: &Session, jwe: &str) -> Result<(Vec<u8>, JoseHeader)> {
     if jwe.len() > MAX_RESPONSE_JWE {
         return Err(policy("response token too large"));
     }
@@ -663,14 +667,19 @@ fn decrypt_response(session: &Session, jwe: &str) -> Result<jose_rs::Authenticat
         ));
     }
 
-    // Check the exact protected bytes before jose-rs performs typed decoding;
-    // repeated member names are never accepted, even when values are equal.
-    crate::json_strict::from_slice(&b64u_decode(parts[0])?)?;
-    let header = jwe_compact::decode_header(jwe)?;
+    // Check the exact protected bytes before typed decoding; repeated member
+    // names are never accepted, even when values are equal. Parsing the small
+    // header directly also keeps jose-rs's global compact-token default out of
+    // this explicitly bounded application path.
+    let protected_bytes = b64u_decode(parts[0])?;
+    crate::json_strict::from_slice(&protected_bytes)?;
+    let header: JoseHeader = serde_json::from_slice(&protected_bytes)
+        .map_err(|e| malformed(format!("bad JWE header: {e}")))?;
     if header.alg != "ECDH-ES" {
         return Err(policy("response alg must be ECDH-ES"));
     }
-    if !matches!(header.enc.as_deref(), Some("A128GCM" | "A256GCM")) {
+    let enc = header.enc.as_deref().unwrap_or_default();
+    if !matches!(enc, "A128GCM" | "A256GCM") {
         return Err(policy("unsupported response enc"));
     }
     if header.crit.is_some() || header.extra.contains_key("zip") {
@@ -684,21 +693,80 @@ fn decrypt_response(session: &Session, jwe: &str) -> Result<jose_rs::Authenticat
     {
         return Err(policy("epk must not contain private key material"));
     }
-    if b64u_decode(parts[3])?.len() > MAX_RESPONSE_PLAINTEXT {
+    let iv = b64u_decode(parts[2])?;
+    let ciphertext = b64u_decode(parts[3])?;
+    let tag = b64u_decode(parts[4])?;
+    if iv.len() != 12 || tag.len() != 16 {
+        return Err(malformed("invalid AES-GCM IV or tag length"));
+    }
+    let iv: [u8; 12] = iv
+        .try_into()
+        .map_err(|_| malformed("invalid AES-GCM IV length"))?;
+    if ciphertext.len() > MAX_RESPONSE_PLAINTEXT {
         return Err(policy("response ciphertext exceeds policy limit"));
     }
 
-    let dec = jwe_compact::decrypt_with_jwk_authenticated(&session.enc_key, jwe).map_err(|e| {
-        if e.is_authentication_failure() {
-            integrity("response JWE authentication failed")
-        } else {
-            Error::Jose(e)
-        }
-    })?;
-    if dec.value.len() > MAX_RESPONSE_PLAINTEXT {
+    let cek = response_cek(&session.enc_key, &header, enc)?;
+    let mut authenticated = ciphertext;
+    authenticated.extend_from_slice(&tag);
+    let aad = parts[0].as_bytes();
+    let nonce = Nonce::from(iv);
+    let plaintext = match enc {
+        "A128GCM" => Aes128Gcm::new_from_slice(&cek)
+            .map_err(|_| integrity("invalid AES-128 key"))?
+            .decrypt(
+                &nonce,
+                Payload {
+                    msg: &authenticated,
+                    aad,
+                },
+            ),
+        "A256GCM" => Aes256Gcm::new_from_slice(&cek)
+            .map_err(|_| integrity("invalid AES-256 key"))?
+            .decrypt(
+                &nonce,
+                Payload {
+                    msg: &authenticated,
+                    aad,
+                },
+            ),
+        _ => unreachable!("enc was checked above"),
+    }
+    .map_err(|_| integrity("response JWE authentication failed"))?;
+    if plaintext.len() > MAX_RESPONSE_PLAINTEXT {
         return Err(policy("response plaintext exceeds policy limit"));
     }
-    Ok(dec)
+    Ok((plaintext, header))
+}
+
+/// Derive the content-encryption key with jose-rs's validated JWK agreement
+/// and Concat KDF. Compact-token parsing stays above this primitive boundary.
+pub(crate) fn response_cek(
+    recipient: &Jwk,
+    header: &JoseHeader,
+    enc: &str,
+) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+    let epk = header
+        .extra
+        .get("epk")
+        .cloned()
+        .ok_or_else(|| malformed("missing epk"))?;
+    let epk: Jwk = serde_json::from_value(epk).map_err(|e| malformed(format!("bad epk: {e}")))?;
+    if epk.d.is_some() {
+        return Err(policy("epk must not contain private key material"));
+    }
+    let recipient = agreement_key(recipient)?;
+    let ephemeral = peer_key(&epk)?;
+    let key_len = match enc {
+        "A128GCM" => 16,
+        "A256GCM" => 32,
+        _ => return Err(policy("unsupported response enc")),
+    };
+    let apu = header.extra.get("apu").and_then(Value::as_str);
+    let apv = header.extra.get("apv").and_then(Value::as_str);
+    recipient
+        .derive_key(&ephemeral, enc, apu, apv, key_len)
+        .map_err(Error::Jose)
 }
 
 /// A wallet response that decrypted, is addressed to this session, and carries its state.
@@ -721,11 +789,11 @@ pub fn open_response(session: &Session, jwe: &str, now: i64) -> Result<OpenedRes
     if now >= session.expires_at {
         return Err(policy("request has expired"));
     }
-    let dec = decrypt_response(session, jwe)?;
-    if dec.protected.kid.as_deref() != session.enc_key.kid.as_deref() {
+    let (plaintext, protected) = decrypt_response(session, jwe)?;
+    if protected.kid.as_deref() != session.enc_key.kid.as_deref() {
         return Err(integrity("response was encrypted to a different key"));
     }
-    let body = crate::json_strict::from_slice(&dec.value)
+    let body = crate::json_strict::from_slice(&plaintext)
         .map_err(|e| malformed(format!("response is not JSON: {e}")))?;
     if let Some(err) = body.get("error") {
         return Err(policy(format!("wallet returned an error: {err}")));

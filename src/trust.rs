@@ -9,6 +9,7 @@ use crate::sdjwt::IssuerEvidence;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use serde_json::{json, Value};
+use x509_cert::der::Decode;
 
 #[derive(Clone, Debug)]
 pub struct TrustQuery {
@@ -34,8 +35,9 @@ impl TrustQuery {
         }
     }
 
-    /// Query for an mdoc issuer: the subject id is `x509_hash:<base64url SHA-256 of the leaf>` (the OpenID4VP scheme go-trust already recognises),
-    /// since an MSO carries no issuer identifier of its own.
+    /// Query for an mdoc issuer using vc's identity rules: URI SAN, then DNS
+    /// SAN as an HTTPS origin, with the leaf hash only when no SAN identifies
+    /// the issuer. go-trust still makes the actual trust decision.
     pub fn for_mdoc_issuer(chain: &crate::mdoc::MdocIssuer, role: &str, doc_type: &str) -> Self {
         use sha2::{Digest, Sha256};
         let leaf = chain
@@ -43,8 +45,10 @@ impl TrustQuery {
             .first()
             .map(Sha256::digest)
             .unwrap_or_default();
+        let subject_id =
+            mdoc_issuer_id(chain).unwrap_or_else(|| format!("x509_hash:{}", crate::b64u(&leaf)));
         Self {
-            subject_id: format!("x509_hash:{}", crate::b64u(&leaf)),
+            subject_id,
             x5c: chain.x5c_der.iter().map(|d| B64.encode(d)).collect(),
             jwk: Value::Null,
             role: role.to_owned(),
@@ -74,5 +78,93 @@ impl TrustQuery {
             }
         }
         query
+    }
+}
+
+fn mdoc_issuer_id(chain: &crate::mdoc::MdocIssuer) -> Option<String> {
+    use x509_cert::der::oid::ObjectIdentifier;
+    use x509_cert::ext::pkix::name::GeneralName;
+    use x509_cert::ext::pkix::SubjectAltName;
+
+    let cert = x509_cert::Certificate::from_der(chain.x5c_der.first()?).ok()?;
+    let san_oid = ObjectIdentifier::new_unwrap("2.5.29.17");
+    for extension in cert.tbs_certificate.extensions.iter().flatten() {
+        if extension.extn_id != san_oid {
+            continue;
+        }
+        let san = SubjectAltName::from_der(extension.extn_value.as_bytes()).ok()?;
+        let mut dns = None;
+        for name in san.0 {
+            match name {
+                GeneralName::UniformResourceIdentifier(uri) => {
+                    let value = uri.to_string();
+                    if let Some(host) = value.strip_prefix("http://") {
+                        return Some(format!("https://{host}"));
+                    }
+                    if value.starts_with("https://") {
+                        return Some(value);
+                    }
+                }
+                GeneralName::DnsName(host) => {
+                    let host = host.to_string();
+                    if !host.starts_with("*.") && dns.is_none() {
+                        dns = Some(host);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(host) = dns {
+            return Some(format!("https://{host}"));
+        }
+    }
+    None
+}
+
+#[cfg(all(test, feature = "testutil"))]
+mod tests {
+    use super::*;
+    use crate::mdoc::MdocIssuer;
+
+    fn certificate(sans: Vec<rcgen::SanType>) -> Vec<u8> {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.subject_alt_names = sans;
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        params.self_signed(&key).unwrap().der().to_vec()
+    }
+
+    #[test]
+    fn mdoc_issuer_uses_vc_san_identity_rules() {
+        let chain = MdocIssuer {
+            x5c_der: vec![certificate(vec![
+                rcgen::SanType::URI(
+                    rcgen::string::Ia5String::try_from("https://issuer.example").unwrap(),
+                ),
+                rcgen::SanType::DnsName(
+                    rcgen::string::Ia5String::try_from("other.example").unwrap(),
+                ),
+            ])],
+        };
+        let query = TrustQuery::for_mdoc_issuer(&chain, "mdoc-issuer", "doc");
+        assert_eq!(query.subject_id, "https://issuer.example");
+        assert_eq!(query.role, "mdoc-issuer");
+        assert_eq!(query.credential_types, vec!["doc"]);
+
+        let chain = MdocIssuer {
+            x5c_der: vec![certificate(vec![rcgen::SanType::DnsName(
+                rcgen::string::Ia5String::try_from("verifier.example").unwrap(),
+            )])],
+        };
+        assert_eq!(
+            TrustQuery::for_mdoc_issuer(&chain, "mdoc-issuer", "doc").subject_id,
+            "https://verifier.example"
+        );
+
+        let chain = MdocIssuer {
+            x5c_der: vec![certificate(vec![])],
+        };
+        assert!(TrustQuery::for_mdoc_issuer(&chain, "mdoc-issuer", "doc")
+            .subject_id
+            .starts_with("x509_hash:"));
     }
 }

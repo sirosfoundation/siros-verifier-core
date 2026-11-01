@@ -10,7 +10,7 @@ description = "zkp_req (nym_auth) verification: handover and challenge derivatio
 
 [dependencies]
 siros-verifier-core = { path = "..", version = "0.1.0" }
-siros-dc-matcher-core = { git = "https://github.com/sirosfoundation/siros-dc-matcher.git", rev = "93047bc7b8a22117fbc9b4c8cd59ce7cd742e8d3" }
+siros-dc-matcher-core = { git = "https://github.com/sirosfoundation/siros-dc-matcher.git", rev = "d3127f1c12cbbdf9857802729c2f19bb648ae69d" }
 zk-cred-longfellow = { git = "https://github.com/sirosfoundation/zk-cred-longfellow.git", rev = "115bfec9bb58a7e3210062ece7c5c7ab0e936ae7" }
 base64 = "0.22"
 ciborium = "0.2"

@@ -4687,8 +4687,8 @@ checksum = "33f4fe9184a62d842c9ef383018f3306d8ba224fd9d836f56d7288308847c256"
 
 [[package]]
 name = "siros-dc-matcher-core"
-version = "0.10.0"
-source = "git+https://github.com/sirosfoundation/siros-dc-matcher.git?rev=93047bc7b8a22117fbc9b4c8cd59ce7cd742e8d3#93047bc7b8a22117fbc9b4c8cd59ce7cd742e8d3"
+version = "0.11.0"
+source = "git+https://github.com/sirosfoundation/siros-dc-matcher.git?rev=d3127f1c12cbbdf9857802729c2f19bb648ae69d#d3127f1c12cbbdf9857802729c2f19bb648ae69d"
 dependencies = [
  "ciborium",
  "serde",
@@ -4699,8 +4699,8 @@ dependencies = [
 
 [[package]]
 name = "siros-dcql"
-version = "0.10.0"
-source = "git+https://github.com/sirosfoundation/siros-dc-matcher.git?rev=93047bc7b8a22117fbc9b4c8cd59ce7cd742e8d3#93047bc7b8a22117fbc9b4c8cd59ce7cd742e8d3"
+version = "0.11.0"
+source = "git+https://github.com/sirosfoundation/siros-dc-matcher.git?rev=d3127f1c12cbbdf9857802729c2f19bb648ae69d#d3127f1c12cbbdf9857802729c2f19bb648ae69d"
 dependencies = [
  "serde",
  "serde_json",

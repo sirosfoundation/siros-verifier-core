@@ -467,10 +467,10 @@ mod tests {
                 })),
         )
         .await;
-        // 343,748 proof bytes, plus CBOR/JWE overhead and base64 expansion.
+        // Measured from a genuine Pixel Longfellow direct_post.jwt response.
         let req = test::TestRequest::post()
             .uri("/vp/response/id")
-            .set_payload(vec![0u8; 462_330])
+            .set_payload(vec![0u8; 1_102_937])
             .to_request();
         let response = test::call_service(&app, req).await;
         assert_eq!(response.status(), StatusCode::OK);

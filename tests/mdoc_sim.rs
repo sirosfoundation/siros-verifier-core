@@ -379,10 +379,7 @@ fn mdoc_trust_query_has_gotrusts_shape() {
     .to_authzen();
     assert_eq!(q["resource"]["type"], "x5c");
     assert_eq!(q["resource"]["id"], q["subject"]["id"]);
-    assert!(q["subject"]["id"]
-        .as_str()
-        .unwrap()
-        .starts_with("x509_hash:"));
+    assert_eq!(q["subject"]["id"], "https://issuer.example");
     assert_eq!(q["resource"]["key"].as_array().unwrap().len(), 1);
     assert_eq!(
         q["action"]["parameters"]["credential_types"][0],

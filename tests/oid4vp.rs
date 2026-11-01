@@ -1,5 +1,4 @@
 use jose_rs::algorithm::{JweAlgorithm, JweEncryption};
-use jose_rs::jwe::compact as jwe_compact;
 use jose_rs::jwk::Jwk;
 use jose_rs::jws;
 use jose_rs::JoseHeader;
@@ -334,7 +333,7 @@ fn raw_response_enc(
             .unwrap_or(s.enc_key.kid.as_deref().unwrap())
             .to_owned(),
     );
-    jwe_compact::encrypt_with_jwk_header(&pubkey, header, body.to_string().as_bytes(), enc).unwrap()
+    encrypt_response(&pubkey, header, body.to_string().as_bytes(), enc).unwrap()
 }
 
 fn raw_response(s: &Session, body: Value, kid_override: Option<&str>) -> String {
@@ -637,16 +636,36 @@ fn response_jwe_policy_and_structure_checks_survive_the_library_migration() {
     ));
 
     let oversized = mutate_jwe_part(&token, 3, |_| {
-        jose_rs::base64url::encode(&vec![0u8; 512 * 1024 + 1])
+        jose_rs::base64url::encode(&vec![0u8; 1024 * 1024 + 1])
     });
+    let oversized_result = process_response(&s, &oversized, NOW, &X5cLeaf);
+    assert!(
+        matches!(oversized_result, Err(Error::Policy(_))),
+        "{oversized_result:?}"
+    );
     assert!(matches!(
-        process_response(&s, &oversized, NOW, &X5cLeaf),
+        process_response(&s, &"x".repeat(2 * 1024 * 1024 + 1), NOW, &X5cLeaf),
         Err(Error::Policy(_))
     ));
-    assert!(matches!(
-        process_response(&s, &"x".repeat(1024 * 1024 + 1), NOW, &X5cLeaf),
-        Err(Error::Policy(_))
-    ));
+}
+
+#[test]
+fn a_genuine_sized_response_is_not_rejected_by_the_jose_compact_default() {
+    let w = world();
+    let (_jar, s) = start(&w, dcql(&["given_name"]));
+    let pres = real_presentation(&w, &s, &[disclosure_idx(&w, "given_name")]);
+    let token = raw_response(
+        &s,
+        json!({
+            "vp_token": { "pid": [pres] },
+            "state": s.state,
+            "padding": "x".repeat(800 * 1024),
+        }),
+        None,
+    );
+    assert!(token.len() > 1024 * 1024);
+    assert!(token.len() <= 2 * 1024 * 1024);
+    process_response(&s, &token, NOW, &X5cLeaf).unwrap();
 }
 
 #[test]
@@ -781,10 +800,7 @@ fn mdoc_redirect_and_dc_api_verify_with_their_own_handovers() {
             .to_authzen();
         assert_eq!(trust["action"]["name"], "mdoc-issuer");
         assert_eq!(trust["resource"]["type"], "x5c");
-        assert!(trust["subject"]["id"]
-            .as_str()
-            .unwrap()
-            .starts_with("x509_hash:"));
+        assert_eq!(trust["subject"]["id"], "https://issuer.example");
     }
 }
 
