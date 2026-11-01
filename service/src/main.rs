@@ -34,6 +34,10 @@ use tunnelbana_core::plugin::{BuildContext, Registry};
 use tunnelbana_core::proxy::Proxy;
 use tunnelbana_core::state::StateSealer;
 
+// A real Longfellow nym_auth proof is about 344 KiB before CBOR and JWE
+// base64 expansion. Keep a hard limit, but allow those genuine presentations.
+const MAX_HTTP_BODY_BYTES: usize = 2 * 1024 * 1024;
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let config_path = std::env::args()
@@ -63,6 +67,7 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new()
             .app_data(proxy.clone())
+            .app_data(web::PayloadConfig::new(MAX_HTTP_BODY_BYTES))
             .route("/health", web::get().to(health))
             .default_service(web::to(handle))
     })
@@ -450,6 +455,25 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body: serde_json::Value = test::read_body_json(resp).await;
         assert_eq!(body, serde_json::json!({ "status": "ok" }));
+    }
+
+    #[actix_web::test]
+    async fn genuine_longfellow_response_size_fits_the_http_body_limit() {
+        let app = test::init_service(
+            App::new()
+                .app_data(web::PayloadConfig::new(MAX_HTTP_BODY_BYTES))
+                .default_service(web::to(|_body: web::Bytes| async {
+                    HttpResponse::Ok().finish()
+                })),
+        )
+        .await;
+        // 343,748 proof bytes, plus CBOR/JWE overhead and base64 expansion.
+        let req = test::TestRequest::post()
+            .uri("/vp/response/id")
+            .set_payload(vec![0u8; 462_330])
+            .to_request();
+        let response = test::call_service(&app, req).await;
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[actix_web::test]
