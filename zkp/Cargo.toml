@@ -20,6 +20,9 @@ sha2 = "0.11"
 p256 = { version = "0.14", features = ["ecdsa"] }
 subtle = "2"
 zeroize = "1"
+ureq = { version = "3.5", default-features = false, features = ["rustls"] }
+url = "2"
+zstd = "0.14.3"
 rcgen = { version = "0.14", optional = true }
 
 [features]
@@ -29,4 +32,3 @@ testutil = ["dep:rcgen", "siros-verifier-core/testutil"]
 [dev-dependencies]
 siros-verifier-core = { path = "..", version = "0.1.0", features = ["testutil"] }
 siros-verifier-zkp = { path = ".", features = ["testutil"] }
-zstd = "0.14.3"

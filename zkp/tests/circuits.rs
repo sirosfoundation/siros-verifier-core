@@ -180,8 +180,7 @@ fn the_artifact_statement_must_be_complete_and_consistent() {
         sources: vec!["https://catalog.example/".into()],
         allow: vec![c],
     };
-    Allowlist::new(&with_source)
-        .expect("an id with a source is accepted (it is refused at load until a resolver exists)");
+    Allowlist::new(&with_source).expect("an id with a source is accepted");
 }
 
 #[test]

@@ -21,7 +21,8 @@ use siros_verifier_core_tunnelbana::{
     VpBackend,
 };
 use siros_verifier_zkp::backend::{BackendRegistry, ProofBackend, SystemProfile};
-use siros_verifier_zkp::circuits::{Allowlist, FsArtifactSource};
+use siros_verifier_zkp::catalog::CatalogArtifactSource;
+use siros_verifier_zkp::circuits::Allowlist;
 use siros_verifier_zkp::functions::FunctionRegistry;
 use siros_verifier_zkp::longfellow::LongfellowBackend;
 use siros_verifier_zkp::nym_auth::SYSTEM_LONGFELLOW;
@@ -244,9 +245,10 @@ fn build_zkp_verifier(config: &ZkpDeploymentConfig) -> anyhow::Result<ZkpVerifie
             )
             .map_err(|e| anyhow!(e))?;
     }
+    let artifacts = CatalogArtifactSource::new(&config.circuits.sources)?.prefetch(&allowlist)?;
     Ok(ZkpVerifier::new(
         allowlist,
-        Box::new(FsArtifactSource),
+        Box::new(artifacts),
         FunctionRegistry::with_builtins(),
         backends,
         VerifierPolicy {

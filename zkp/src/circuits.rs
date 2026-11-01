@@ -190,6 +190,11 @@ impl Allowlist {
             })
     }
 
+    /// Every allowed entry, sorted by system and configuration.
+    pub fn entries(&self) -> impl Iterator<Item = &Entry> {
+        self.by_key.values()
+    }
+
     /// Every allowed build as `<system_id> <config>`, sorted so a startup log reads the same way twice.
     pub fn allowed(&self) -> Vec<String> {
         self.by_key
@@ -283,15 +288,16 @@ pub fn check_artifact(entry: &Entry, bytes: &[u8]) -> ZkpResult<()> {
     Ok(())
 }
 
-/// Where artifact bytes come from. The one place this crate would do input or output, so it is a seam.
+/// Where artifact bytes come from. Filesystem and catalog implementations sit
+/// behind this seam; the verifier applies the same allowlist check to both.
 pub trait ArtifactSource: Send + Sync {
     /// The artifact's bytes, unchecked. At most `entry.bytes + 1` bytes may be returned, so an artifact that is too
     /// LONG is detected rather than silently truncated to the expected size and then hashed.
     fn read(&self, entry: &Entry) -> ZkpResult<Vec<u8>>;
 }
 
-/// Local files (`artifact_path`). A catalog id is not resolved: the published catalog carries no nym_auth
-/// descriptors, and saying so beats returning bytes from somewhere unintended.
+/// Local files (`artifact_path`) only. Use
+/// [`crate::catalog::CatalogArtifactSource`] to resolve catalog IDs as well.
 pub struct FsArtifactSource;
 
 impl ArtifactSource for FsArtifactSource {

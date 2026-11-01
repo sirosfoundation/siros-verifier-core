@@ -27,7 +27,8 @@ production-ready yet.
   plus a verified-claims result page.
 - `zkp/` (`siros-verifier-zkp`): `zkp_req` response validation, nym_auth
   transcripts and predicates, issuer-set trust policy, and a real Longfellow
-  proof backend. Vega and BBS are not enabled.
+  proof backend. Circuits can be pinned local files or resolved through the
+  SIROS circuit catalog API. Vega and BBS are not enabled.
 - `src/ts11.rs`: sans-I/O TS 119 602 schema parsing, VCTM/MDDL metadata
   extraction, SRI validation, and registry-backed DCQL preset generation. The
   tunnelbana adapter adds bounded HTTPS fetching and last-known-good caching.
@@ -45,6 +46,19 @@ failover itself requires a MongoDB replica set or managed HA service.
 `zkp_req` currently supports `mso_mdoc` nym_auth with the Longfellow proof
 system, pseudonym and `age_check`. Vega, BBS, and predicate-only requests remain
 outside the supported profile and fail closed.
+
+### Circuit catalog
+
+Set `zkp.circuits.sources` to ordered mirrors of the SIROS API, normally
+`["https://api.circuits.siros.org"]`, and use `artifact_id` instead of
+`artifact_path` in an allowlist entry. The service fetches
+`/v1/circuits/{id}.json` and the content-addressed artifact at startup. It
+checks descriptor system/configuration/parameters, served hash and size, any
+uncompressed hash and size, and finally the operator's `artifact_sha256` and
+`artifact_bytes`. Verified artifacts are kept in memory; request processing
+performs no catalog network access. Startup fails if no mirror yields the exact
+allowed artifact. `circuits.siros.org` is the human-facing site, not the API
+origin.
 
 ## Build and test
 

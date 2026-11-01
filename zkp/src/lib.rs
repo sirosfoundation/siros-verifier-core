@@ -1,6 +1,7 @@
 //! zkp_req (nym_auth) verification, ported from SUNET/vc's wiring and checked against the same shared vectors.
 
 pub mod backend;
+pub mod catalog;
 pub mod circuits;
 pub mod dates;
 pub mod functions;
