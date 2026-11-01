@@ -897,6 +897,7 @@ impl VpBackend {
         let opened = match oid4vp::open_response(session, jwe, now) {
             Ok(o) => o,
             Err(e) => {
+                tracing::warn!(code = e.code(), error = %e, token_bytes = jwe.len(), "zkp response envelope rejected");
                 return self
                     .fail(
                         id,
