@@ -316,9 +316,8 @@ a.choice:hover,a.choice:focus {{ border-color:#1C4587; outline:none; }}
 .wallet-launch-dialog {{ max-width:min(92vw,560px); border:0; border-radius:16px; }}
 .wallet-launch-dialog::backdrop {{ background:#17203380; }}
 .qr-code {{ display:grid; place-items:center; background:white; padding:16px; border-radius:12px; margin:16px 0; }}
-.siros-spinner {{ display:flex; gap:5px; align-items:center; justify-content:center; margin:20px 0; font-weight:800; letter-spacing:.2em; color:#1C4587; }}
-.siros-spinner span {{ animation:siros-pulse 1.2s infinite ease-in-out; }} .siros-spinner span:nth-child(2) {{ animation-delay:.1s; }} .siros-spinner span:nth-child(3) {{ animation-delay:.2s; }} .siros-spinner span:nth-child(4) {{ animation-delay:.3s; }} .siros-spinner span:nth-child(5) {{ animation-delay:.4s; }}
-@keyframes siros-pulse {{ 0%,100% {{ opacity:.25; transform:translateY(0); }} 50% {{ opacity:1; transform:translateY(-4px); }} }}
+.siros-spinner {{ box-sizing:border-box; width:28px; height:28px; margin:20px auto; border:3px solid #1C458733; border-top-color:#1C4587; border-radius:50%; animation:siros-spin .8s linear infinite; }}
+@keyframes siros-spin {{ to {{ transform:rotate(360deg); }} }}
 dl {{ display:grid; grid-template-columns:minmax(0,1fr) minmax(0,2fr); gap:10px 16px; }}
 dt {{ font-weight:650; overflow-wrap:anywhere; }} dd {{ margin:0; overflow-wrap:anywhere; }}
 a.back {{ display:inline-block; margin-top:24px; color:#1C4587; }}

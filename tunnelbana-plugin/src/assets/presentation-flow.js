@@ -80,11 +80,6 @@ function createSirosSpinner() {
   spinner.className = "siros-spinner";
   spinner.setAttribute("role", "status");
   spinner.setAttribute("aria-label", "Verification in progress");
-  for (const letter of "SIROS") {
-    const span = document.createElement("span");
-    span.textContent = letter;
-    spinner.append(span);
-  }
   return spinner;
 }
 
@@ -179,8 +174,8 @@ export class PresentationFlow {
       button.addEventListener("click", async () => {
         try {
           const result = await this.start(mechanism);
-          this.renderResult(result);
           if (this.onResult) this.onResult(result);
+          else this.renderResult(result);
         } catch (error) {
           this.renderError(error);
           if (this.onError) this.onError(error);
@@ -250,7 +245,6 @@ export class PresentationFlow {
 
   async start(mechanism) {
     const run = ++this.runId;
-    this.activeMechanism = mechanism;
     if (mechanism !== "qr" && this.launchDialog?.open) this.launchDialog.close();
     this.setBusy(true);
     this.setStatus("Creating the presentation request…");
@@ -343,7 +337,6 @@ export class PresentationFlow {
     code.textContent = payload.authorization_request;
     details.append(summary, code);
     dialog.append(details);
-    dialog.append(createSirosSpinner());
     const close = document.createElement("button");
     close.type = "button";
     close.textContent = "Close";
@@ -355,52 +348,29 @@ export class PresentationFlow {
     this.setStatus("Waiting for the wallet response…");
   }
 
-  outcomeView() {
-    if (this.activeMechanism === "qr" && this.launchDialog) return this.launchDialog;
+  renderResult(result) {
+    window.location.assign(result.complete_uri);
+  }
+
+  renderError(error) {
+    if (this.launchDialog?.open) this.launchDialog.close();
     if (!this.outcome) {
       this.outcome = document.createElement("section");
       this.outcome.className = "presentation-outcome";
       this.root.append(this.outcome);
     }
-    return this.outcome;
-  }
-
-  renderResult(result) {
-    const view = this.outcomeView();
-    view.replaceChildren();
-    const heading = document.createElement("h2");
-    heading.textContent = "Credential verified";
-    view.append(heading);
-    const message = document.createElement("p");
-    message.textContent = "The presentation and issuer trust were accepted.";
-    view.append(message);
-    const back = document.createElement("a");
-    back.href = result.complete_uri;
-    back.textContent = "Back to the verifier";
-    view.append(back);
-    this.showOutcome(view);
-  }
-
-  renderError(error) {
-    const view = this.outcomeView();
-    view.replaceChildren();
+    this.outcome.replaceChildren();
     const heading = document.createElement("h2");
     heading.textContent = "Presentation failed";
-    view.append(heading);
+    this.outcome.append(heading);
     const message = document.createElement("p");
     message.textContent = error.message || String(error);
-    view.append(message);
+    this.outcome.append(message);
     const back = document.createElement("a");
     back.href = "/";
     back.textContent = "Back to the verifier";
-    view.append(back);
-    this.showOutcome(view);
-  }
-
-  showOutcome(view) {
-    if (view !== this.launchDialog || view.open) return;
-    if (typeof view.showModal === "function") view.showModal();
-    else view.setAttribute("open", "");
+    this.outcome.append(back);
+    this.setStatus(error.message || String(error));
   }
 
   async poll(statusUri, run) {

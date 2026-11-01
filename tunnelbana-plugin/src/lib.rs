@@ -1253,10 +1253,14 @@ fn html_escape(s: &str) -> String {
 }
 
 fn waiting_page(module_base: &str) -> Response {
-    Response::html(format!(
-        "<!doctype html><meta charset=utf-8><meta http-equiv=refresh content=\"2;url={}/complete\"><p>Waiting for your wallet…</p>",
+    let body = format!(
+        r#"<h1>Waiting for your wallet</h1>
+<div class="siros-spinner" role="status" aria-label="Verification in progress"></div>
+<p>This page will show the verified response or an error when the presentation finishes.</p>
+<meta http-equiv="refresh" content="2;url={}/complete">"#,
         html_escape(module_base)
-    ))
+    );
+    Response::html(ui::page("Waiting for your wallet", &body))
 }
 
 fn qr_page(module_base: &str, link: &str) -> Result<Response> {
@@ -1476,6 +1480,17 @@ mod page_tests {
         assert!(html.contains("<svg"));
         assert!(html.contains("openid4vp://cb"));
         assert!(html.contains("/vp/complete"));
+    }
+
+    #[test]
+    fn complete_page_shows_a_neutral_spinner_while_pending() {
+        let response = waiting_page("https://verifier.example/vp");
+        let html = String::from_utf8(response.body).unwrap();
+        assert!(html.contains("class=\"siros-spinner\""));
+        assert!(html.contains("Verification in progress"));
+        assert!(html.contains("/vp/complete"));
+        assert!(html.contains("navbar-brand"));
+        assert!(!html.contains("siros-pulse"));
     }
 
     #[test]

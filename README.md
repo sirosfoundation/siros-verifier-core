@@ -105,11 +105,11 @@ const flow = new PresentationFlow({
 });
 ```
 
-QR launches reuse a modal, the SIROS spinner is shown while the presentation is
-pending, and completion offers a link back to the verifier result page. The
-backend remains authoritative for DCQL validation, request signing, trust, and
-verification. See the [package integration guide and backend
-contract](tunnelbana-plugin/src/assets/README.md).
+Only the QR display is modal. Completion navigates to the verifier's complete
+page, which shows a neutral spinner while pending and then the decoded verified
+response or an error. The backend remains authoritative for DCQL validation,
+request signing, trust, and verification. See the [package integration guide
+and backend contract](tunnelbana-plugin/src/assets/README.md).
 
 ### 4. Build a proximity reader with UniFFI
 

@@ -9,9 +9,6 @@ use zk_cred_vega::nymauth_vega::engine::statement::{self, Keys, Statement};
 
 use crate::backend::{check_claimed, BackendError, ProofBackend};
 use crate::circuits::Entry;
-use crate::functions::{
-    FUNCTION_AGE_CHECK, INPUT_CUTOFF, INPUT_EARLIEST, NO_LOWER_BOUND, NO_UPPER_BOUND,
-};
 use crate::nym_auth::{CONFIG_KNOWN_OFFENDER_MATCHING_SSC, SYSTEM_VEGA};
 use crate::refusal::{ZkpError, ZkpResult};
 use crate::request::Request;
@@ -32,25 +29,6 @@ impl VegaBackend {
             .map_err(|e| ZkpError::fault(format!("loading the Vega nym_auth shapes: {e}")))?;
         Ok(Self { keys })
     }
-
-    fn age_bounds(req: &Request) -> (String, String) {
-        let mut earliest = NO_LOWER_BOUND.to_owned();
-        let mut cutoff = NO_UPPER_BOUND.to_owned();
-        for input in &req.inputs {
-            if input.function_id != FUNCTION_AGE_CHECK {
-                continue;
-            }
-            for (name, value) in &input.values {
-                let value = String::from_utf8_lossy(value).into_owned();
-                match name.as_str() {
-                    INPUT_EARLIEST => earliest = value,
-                    INPUT_CUTOFF => cutoff = value,
-                    _ => {}
-                }
-            }
-        }
-        (earliest, cutoff)
-    }
 }
 
 impl ProofBackend for VegaBackend {
@@ -65,7 +43,7 @@ impl ProofBackend for VegaBackend {
         let time = req
             .time_string()
             .map_err(|e| BackendError::DidNotVerify(e.to_string()))?;
-        let (earliest, cutoff) = Self::age_bounds(req);
+        let (earliest, cutoff) = req.age_bounds();
         let challenge_digest = req
             .e2()
             .map_err(|e| BackendError::DidNotVerify(e.to_string()))?;

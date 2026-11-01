@@ -87,15 +87,17 @@ class FakeElement {
   close() { this.open = false; }
 }
 
-test("QR launches reuse one modal and replace its contents", () => {
-  const previous = globalThis.document;
+test("QR launches reuse one modal and completion uses the complete page", () => {
+  const previousDocument = globalThis.document;
+  const previousWindow = globalThis.window;
   globalThis.document = {createElement: (tagName) => new FakeElement(tagName)};
+  globalThis.window = {location: {assign(uri) { this.href = uri; }}};
   try {
     const root = new FakeElement("div");
     const flow = Object.create(PresentationFlow.prototype);
     flow.root = root;
-    flow.activeMechanism = "qr";
     flow.setStatus = () => {};
+    flow.setBusy(true);
     const payload = {authorization_request: "openid4vp://one", qr_code: "<svg>one</svg>"};
     flow.renderLaunch("qr", payload);
     const dialog = flow.launchDialog;
@@ -105,28 +107,32 @@ test("QR launches reuse one modal and replace its contents", () => {
     assert.equal(root.children.filter((child) => child === dialog).length, 1);
     assert.equal(dialog.children.length, childCount);
     assert.equal(dialog.open, true);
-    assert.equal(dialog.children.some((child) => child.className === "siros-spinner"), true);
+    assert.equal(dialog.children.some((child) => child.className === "siros-spinner"), false);
+    assert.equal(flow.busySpinner.children.length, 0);
     dialog.close();
+    flow.setBusy(false);
     flow.renderResult({complete_uri: "https://verifier.example/vp/complete"});
-    assert.equal(dialog.open, true);
-    assert.equal(dialog.children[0].textContent, "Credential verified");
-    assert.equal(dialog.children.at(-1).href, "https://verifier.example/vp/complete");
+    assert.equal(dialog.open, false);
+    assert.equal(window.location.href, "https://verifier.example/vp/complete");
     flow.renderError(new Error("no matching credential"));
-    assert.equal(dialog.children[0].textContent, "Presentation failed");
-    assert.equal(dialog.children.at(-1).href, "/");
+    assert.equal(dialog.open, false);
+    assert.equal(flow.outcome.children[0].textContent, "Presentation failed");
+    assert.equal(flow.outcome.children.at(-1).href, "/");
   } finally {
-    globalThis.document = previous;
+    globalThis.document = previousDocument;
+    globalThis.window = previousWindow;
   }
 });
 
 test("the root busy spinner is removed after every run", () => {
-  const previous = globalThis.document;
+  const previousDocument = globalThis.document;
+  const previousWindow = globalThis.window;
   globalThis.document = {createElement: (tagName) => new FakeElement(tagName)};
+  globalThis.window = {location: {assign() {}}};
   try {
     const root = new FakeElement("div");
     const flow = Object.create(PresentationFlow.prototype);
     flow.root = root;
-    flow.activeMechanism = "qr";
     flow.setStatus = () => {};
     for (const id of ["one", "two"]) {
       flow.setBusy(true);
@@ -137,30 +143,32 @@ test("the root busy spinner is removed after every run", () => {
       flow.renderResult({complete_uri: "https://verifier.example/vp/complete"});
     }
   } finally {
-    globalThis.document = previous;
+    globalThis.document = previousDocument;
+    globalThis.window = previousWindow;
   }
 });
 
 test("direct links do not open the QR modal", () => {
-  const previous = globalThis.document;
+  const previousDocument = globalThis.document;
+  const previousWindow = globalThis.window;
   globalThis.document = {createElement: (tagName) => new FakeElement(tagName)};
+  globalThis.window = {location: {assign(uri) { this.href = uri; }}};
   try {
     const root = new FakeElement("div");
     const flow = Object.create(PresentationFlow.prototype);
     flow.root = root;
-    flow.activeMechanism = "link";
     flow.setStatus = () => {};
     flow.renderLaunch("link", {authorization_request: "openid4vp://direct"});
     assert.equal(flow.launchDialog, undefined);
     assert.equal(flow.directLink.href, "openid4vp://direct");
     flow.renderResult({complete_uri: "https://verifier.example/vp/complete"});
     assert.equal(flow.launchDialog, undefined);
-    assert.equal(flow.outcome.children[0].textContent, "Credential verified");
-    assert.equal(flow.outcome.children.at(-1).href, "https://verifier.example/vp/complete");
+    assert.equal(window.location.href, "https://verifier.example/vp/complete");
     flow.renderError(new Error("no matching credential"));
     assert.equal(flow.outcome.children[0].textContent, "Presentation failed");
     assert.equal(flow.outcome.children.at(-1).href, "/");
   } finally {
-    globalThis.document = previous;
+    globalThis.document = previousDocument;
+    globalThis.window = previousWindow;
   }
 });

@@ -43,7 +43,7 @@ The current hard limits are 2 MiB for an HTTP body and compact JWE, and 1 MiB fo
 
 `frontend.config.presets` is an array of tables with `id`, `label`, and `dcql`. Registry-derived presets are merged by credential format and type; the registry's full claim list remains available for editing. Configure the requested claim subset for your deployment and include a subject claim—the first claim becomes the subject when no custom pointer is configured.
 
-QR launches use one modal whose contents are replaced on every request; repeated button presses do not leave stale QR codes on the page.
+Only the QR display is modal, and its contents are replaced on every request. The complete page shows a neutral spinner while pending and then renders the decoded verified response or an error.
 
 ## `zkp_req`
 
