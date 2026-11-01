@@ -380,7 +380,7 @@ pub struct VpBackend {
     signer: kryptering::SoftwareSigner,
     chain_der: Vec<Vec<u8>>,
     clock: Clock,
-    /// Set for a `zkp_req` backend; ordinary SD-JWT/mdoc fields are then unused.
+    /// Optional `zkp_req` support. Each flow selects its format from its DCQL.
     zkp: Option<ZkpMode>,
 }
 
@@ -389,6 +389,64 @@ struct ZkpMode {
     verifier: ZkpVerifier,
     plan: siros_dc_matcher_core::zkp_req::Plan,
     vp_formats: Value,
+}
+
+impl ZkpMode {
+    fn new(zcfg: ZkpBackendConfig, verifier: ZkpVerifier) -> Result<Self> {
+        let mut offered = serde_json::json!({ "system_id_values": zcfg.system_id_values });
+        if !zcfg.proof_system_values.is_empty() {
+            offered["proof_system_values"] = serde_json::json!(zcfg.proof_system_values);
+        }
+        let vp_formats = serde_json::json!({ "zkp_req": offered });
+        let plan = siros_dc_matcher_core::zkp_req::plan(
+            &zcfg.query.to_string(),
+            Some(&serde_json::json!({ "vp_formats_supported": vp_formats }).to_string()),
+        )
+        .map_err(|e| Error::Config(format!("zkp query: {}", e.code())))?;
+        siros_dc_matcher_core::zkp_req::unsatisfiable(&plan)
+            .map_err(|e| Error::Config(format!("zkp query cannot be satisfied: {}", e.code())))?;
+        let handles: Vec<&str> = plan.functions.iter().map(|f| f.handle.as_str()).collect();
+        let pseudonyms: Vec<&str> = plan
+            .functions
+            .iter()
+            .filter(|f| f.function_id == "pseudonym")
+            .map(|f| f.handle.as_str())
+            .collect();
+        if !pseudonyms.contains(&zcfg.subject_handle.as_str()) {
+            return Err(Error::Config(format!(
+                "subject_handle {:?} is not a pseudonym handle of the query ({pseudonyms:?})",
+                zcfg.subject_handle
+            )));
+        }
+        for (k, h) in &zcfg.attribute_map {
+            if !handles.contains(&h.as_str()) {
+                return Err(Error::Config(format!(
+                    "attribute {k}: no result handle {h:?} in the query"
+                )));
+            }
+        }
+        Ok(Self {
+            cfg: zcfg,
+            verifier,
+            plan,
+            vp_formats,
+        })
+    }
+
+    fn dcql(&self) -> Value {
+        serde_json::json!({ "credentials": [self.cfg.query] })
+    }
+}
+
+fn is_zkp_query(query: &Value) -> bool {
+    query
+        .get("credentials")
+        .and_then(Value::as_array)
+        .is_some_and(|credentials| {
+            credentials.iter().any(|credential| {
+                credential.get("format").and_then(Value::as_str) == Some("zkp_req")
+            })
+        })
 }
 
 fn request_profile(
@@ -518,55 +576,26 @@ impl VpBackend {
         verifier: ZkpVerifier,
         clock: Clock,
     ) -> Result<Self> {
-        let mut offered = serde_json::json!({ "system_id_values": zcfg.system_id_values });
-        if !zcfg.proof_system_values.is_empty() {
-            offered["proof_system_values"] = serde_json::json!(zcfg.proof_system_values);
-        }
-        let vp_formats = serde_json::json!({ "zkp_req": offered });
-        let plan = siros_dc_matcher_core::zkp_req::plan(
-            &zcfg.query.to_string(),
-            Some(&serde_json::json!({ "vp_formats_supported": vp_formats }).to_string()),
-        )
-        .map_err(|e| Error::Config(format!("zkp query: {}", e.code())))?;
-        siros_dc_matcher_core::zkp_req::unsatisfiable(&plan)
-            .map_err(|e| Error::Config(format!("zkp query cannot be satisfied: {}", e.code())))?;
-        let handles: Vec<&str> = plan.functions.iter().map(|f| f.handle.as_str()).collect();
-        let pseudonyms: Vec<&str> = plan
-            .functions
-            .iter()
-            .filter(|f| f.function_id == "pseudonym")
-            .map(|f| f.handle.as_str())
-            .collect();
-        if !pseudonyms.contains(&zcfg.subject_handle.as_str()) {
-            return Err(Error::Config(format!(
-                "subject_handle {:?} is not a pseudonym handle of the query ({pseudonyms:?})",
-                zcfg.subject_handle
-            )));
-        }
-        for (k, h) in &zcfg.attribute_map {
-            if !handles.contains(&h.as_str()) {
-                return Err(Error::Config(format!(
-                    "attribute {k}: no result handle {h:?} in the query"
-                )));
-            }
-        }
+        let mode = ZkpMode::new(zcfg, verifier)?;
         let cfg = VpBackendConfig {
-            dcql: serde_json::json!({ "credentials": [zcfg.query] }),
+            dcql: mode.dcql(),
             attribute_map: BTreeMap::new(),
             subject_pointer: String::new(),
-            role: zcfg.role.clone(),
+            role: mode.cfg.role.clone(),
             mdoc_role: String::new(),
-            request_ttl_secs: zcfg.request_ttl_secs,
-            auth_class_ref: zcfg.auth_class_ref.clone(),
+            request_ttl_secs: mode.cfg.request_ttl_secs,
+            auth_class_ref: mode.cfg.auth_class_ref.clone(),
         };
         let mut backend = Self::new(name, module_base, cfg, gate, signer, chain_der, clock)?;
-        backend.zkp = Some(ZkpMode {
-            cfg: zcfg,
-            verifier,
-            plan,
-            vp_formats,
-        });
+        backend.zkp = Some(mode);
         Ok(backend)
+    }
+
+    /// Add `zkp_req` alongside the backend's existing SD-JWT/mdoc profiles.
+    /// The configured query is the only ZK query accepted from the UI.
+    pub fn with_zkp(mut self, zcfg: ZkpBackendConfig, verifier: ZkpVerifier) -> Result<Self> {
+        self.zkp = Some(ZkpMode::new(zcfg, verifier)?);
+        Ok(self)
     }
 
     /// Inject shared flow/replay storage. Every replica must use the same store.
@@ -723,7 +752,17 @@ impl VpBackend {
                 )
                 .await;
         };
-        if let Some(z) = &self.zkp {
+        if is_zkp_query(&session.dcql_query) {
+            let Some(z) = &self.zkp else {
+                return self
+                    .fail(
+                        &id,
+                        &claim_id,
+                        "verifier_error",
+                        Response::text(500, "verifier error"),
+                    )
+                    .await;
+            };
             return self
                 .on_zkp_response(&id, &claim_id, z, &session, &jwe, requester, now)
                 .await;
@@ -1227,11 +1266,6 @@ impl Backend for VpBackend {
     async fn start_auth(&self, ctx: &mut Context, request: InternalData) -> Result<Response> {
         let now = (self.clock)();
         let id = new_flow_id();
-        if self.zkp.is_some() && request.attr_first(ui::DCQL_ATTRIBUTE).is_some() {
-            return Err(Error::BadRequest(
-                "custom DCQL is not supported for zkp_req; use the configured preset".into(),
-            ));
-        }
         let scheme = request
             .attr_first(ui::SCHEME_ATTRIBUTE)
             .unwrap_or("openid4vp");
@@ -1239,12 +1273,25 @@ impl Backend for VpBackend {
             return Err(Error::BadRequest("unsupported wallet URI scheme".into()));
         }
         let (dcql_query, attribute_map, subject_pointer) = request_profile(&request, &self.cfg)?;
+        let zkp = if is_zkp_query(&dcql_query) {
+            let mode = self.zkp.as_ref().ok_or_else(|| {
+                Error::BadRequest("zkp_req is not configured for this backend".into())
+            })?;
+            if dcql_query != mode.dcql() {
+                return Err(Error::BadRequest(
+                    "only the configured zkp_req preset is supported".into(),
+                ));
+            }
+            Some(mode)
+        } else {
+            None
+        };
         let cfg = RequestConfig {
             response_uri: format!("{}/response/{id}", self.module_base),
             dcql_query,
             ttl_secs: self.cfg.request_ttl_secs,
-            vp_formats_supported: self.zkp.as_ref().map(|z| z.vp_formats.clone()),
-            client_id: self.zkp.as_ref().map(|z| z.cfg.verifier_id.clone()),
+            vp_formats_supported: zkp.map(|z| z.vp_formats.clone()),
+            client_id: zkp.map(|z| z.cfg.verifier_id.clone()),
         };
         let dc_api = request.requester.as_deref() == Some(ui::DC_API_REQUESTER);
         let (jar, session) = if dc_api {

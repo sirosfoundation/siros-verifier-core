@@ -327,32 +327,20 @@ async fn build_openid4vp_backend(
         .with_previous_masters(&previous_masters, &plugin.name)?;
     let module_base = format!("{}/{}", cfg.base_url.trim_end_matches('/'), plugin.name);
     let store = build_flow_store(&deployment.storage).await?;
-    let backend = if let Some(zkp) = deployment.zkp.take() {
+    let mut backend = VpBackend::new(
+        &plugin.name,
+        &module_base,
+        deployment.vp,
+        gate,
+        request_signer,
+        chain_der,
+        system_clock(),
+    )?;
+    if let Some(zkp) = deployment.zkp.take() {
         let verifier = build_zkp_verifier(&zkp)?;
-        let zcfg = zkp.backend;
-        VpBackend::new_zkp(
-            &plugin.name,
-            &module_base,
-            zcfg,
-            gate,
-            request_signer,
-            chain_der,
-            verifier,
-            system_clock(),
-        )?
-    } else {
-        VpBackend::new(
-            &plugin.name,
-            &module_base,
-            deployment.vp,
-            gate,
-            request_signer,
-            chain_der,
-            system_clock(),
-        )?
+        backend = backend.with_zkp(zkp.backend, verifier)?;
     }
-    .with_flow_store(store)
-    .with_session_sealer(sealer);
+    let backend = backend.with_flow_store(store).with_session_sealer(sealer);
     tracing::info!(name = %plugin.name, pdp = %deployment.pdp_endpoint, storage = %deployment.storage.backend, "loaded OpenID4VP backend");
     Ok(Box::new(backend))
 }

@@ -109,16 +109,25 @@ fn build(zcfg: Value, verifier_id: Option<&str>) -> Result<Fx, String> {
         zcfg["verifier_id"] = serde_json::json!(verifier_id);
     }
     let cfg: ZkpBackendConfig = serde_json::from_value(zcfg).map_err(|e| e.to_string())?;
-    let b = VpBackend::new_zkp(
+    let base = VpBackendConfig {
+        dcql: json!({"credentials": [cfg.query.clone()]}),
+        attribute_map: BTreeMap::new(),
+        subject_pointer: String::new(),
+        role: cfg.role.clone(),
+        mdoc_role: String::new(),
+        request_ttl_secs: cfg.request_ttl_secs,
+        auth_class_ref: cfg.auth_class_ref.clone(),
+    };
+    let b = VpBackend::new(
         "vp",
         "https://proxy.example/vp",
-        cfg,
+        base,
         gate,
         siros_verifier_core::oid4vp::software_signer(&v_key).unwrap(),
         vec![v_cert],
-        verifier,
         Arc::new(move || c2.load(Ordering::SeqCst)),
     )
+    .and_then(|backend| backend.with_zkp(cfg, verifier))
     .map_err(|e| e.to_string())?;
     Ok(Fx {
         b,
@@ -143,10 +152,12 @@ fn req(path: &str, method: &str) -> HttpRequestData {
 
 async fn start(f: &Fx) -> (State, String) {
     let mut ctx = Context::new(req("vp/start", "GET"), State::new());
-    let page =
-        f.b.start_auth(&mut ctx, InternalData::request("https://rp.example"))
-            .await
-            .unwrap();
+    let mut request = InternalData::request("https://rp.example");
+    request.set_attr(
+        ui::DCQL_ATTRIBUTE,
+        json!({"credentials": [zcfg()["query"].clone()]}).to_string(),
+    );
+    let page = f.b.start_auth(&mut ctx, request).await.unwrap();
     assert!(String::from_utf8(page.body)
         .unwrap()
         .contains("openid4vp://cb"));
@@ -288,6 +299,33 @@ async fn a_pseudonym_login_reaches_the_frontend_as_a_pairwise_subject() {
         "one issuer certificate, one trust question"
     );
     assert_eq!(f.loads.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn enabling_zkp_preserves_sdjwt_request_dispatch() {
+    let f = fx();
+    let query = json!({"credentials": [{
+        "id": "pid", "format": "dc+sd-jwt",
+        "meta": {"vct_values": ["urn:eudi:pid:arf-1.8:1"]},
+        "claims": [{"path": ["given_name"]}]
+    }]});
+    let mut request = InternalData::request("https://rp.example");
+    request.set_attr(ui::DCQL_ATTRIBUTE, query.to_string());
+    let mut ctx = Context::new(req("vp/start", "GET"), State::new());
+    f.b.start_auth(&mut ctx, request).await.unwrap();
+    let id = ctx.state.get_str(NS, FLOW_KEY).unwrap();
+    let payload = jar(&f, &id).await;
+    assert_eq!(payload["dcql_query"], query);
+    assert!(payload["client_id"]
+        .as_str()
+        .unwrap()
+        .starts_with("x509_hash:"));
+    assert!(payload["client_metadata"]["vp_formats_supported"]
+        .get("dc+sd-jwt")
+        .is_some());
+    assert!(payload["client_metadata"]["vp_formats_supported"]
+        .get("zkp_req")
+        .is_none());
 }
 
 #[tokio::test]
