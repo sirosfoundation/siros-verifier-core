@@ -1,5 +1,24 @@
 use serde::Deserialize;
-use siros_verifier_core_tunnelbana::VpBackendConfig;
+use siros_verifier_core::issuer_set::IssuerSetPolicy;
+use siros_verifier_core_tunnelbana::{VpBackendConfig, ZkpBackendConfig};
+use siros_verifier_zkp::circuits::CircuitsConfig;
+use siros_verifier_zkp::verify::Tolerance;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ZkpDeploymentConfig {
+    #[serde(flatten)]
+    pub backend: ZkpBackendConfig,
+    pub circuits: CircuitsConfig,
+    #[serde(default = "default_issuer_set_policy")]
+    pub issuer_set: IssuerSetPolicy,
+    #[serde(default)]
+    pub tolerance: Tolerance,
+}
+
+fn default_issuer_set_policy() -> IssuerSetPolicy {
+    IssuerSetPolicy::AllTrusted
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -38,6 +57,8 @@ pub struct DeploymentConfig {
     pub receipt_audience: Option<String>,
     #[serde(default)]
     pub max_receipt_ttl_secs: Option<i64>,
+    #[serde(default)]
+    pub zkp: Option<ZkpDeploymentConfig>,
     #[serde(flatten)]
     pub vp: VpBackendConfig,
 }

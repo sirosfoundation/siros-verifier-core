@@ -20,8 +20,10 @@ use siros_verifier_core::receipt::{
 };
 use siros_verifier_core::sdjwt::X5cLeaf;
 use siros_verifier_core::session_seal::SessionSealer;
+use siros_verifier_zkp::refusal::ZkpError;
+use siros_verifier_zkp::verify::{Channel, Exchange, VerifiedPresentation, ZkpVerifier};
 use tunnelbana_core::context::Context;
-use tunnelbana_core::internal::{AuthenticationInformation, InternalData};
+use tunnelbana_core::internal::{AuthenticationInformation, InternalData, SubjectType};
 use tunnelbana_core::plugin::{Backend, BackendAction, BuildContext, Registry, Route};
 
 pub mod flow;
@@ -65,6 +67,31 @@ fn default_mdoc_role() -> String {
 
 fn default_ttl() -> i64 {
     300
+}
+
+/// Configuration of a `zkp_req` (nym_auth) backend.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ZkpBackendConfig {
+    /// The `zkp_req` credential query (one element of `dcql_query.credentials`).
+    pub query: Value,
+    pub system_id_values: Vec<String>,
+    #[serde(default)]
+    pub proof_system_values: Vec<String>,
+    /// go-trust `action.name` for attestation issuers.
+    pub role: String,
+    #[serde(default = "default_ttl")]
+    pub request_ttl_secs: i64,
+    /// Pseudonym handle that becomes `subject_id`.
+    pub subject_handle: String,
+    /// Internal attribute name -> result handle.
+    #[serde(default)]
+    pub attribute_map: BTreeMap<String, String>,
+    #[serde(default)]
+    pub auth_class_ref: Option<String>,
+    /// Rulebook verifier identity (`x509_san_dns:` or `semantic_id:`), which
+    /// is deliberately distinct from the OpenID4VP x509_hash client ID.
+    pub verifier_id: String,
 }
 
 // ---- seams ---------------------------------------------------------------------------------
@@ -353,6 +380,15 @@ pub struct VpBackend {
     signer: kryptering::SoftwareSigner,
     chain_der: Vec<Vec<u8>>,
     clock: Clock,
+    /// Set for a `zkp_req` backend; ordinary SD-JWT/mdoc fields are then unused.
+    zkp: Option<ZkpMode>,
+}
+
+struct ZkpMode {
+    cfg: ZkpBackendConfig,
+    verifier: ZkpVerifier,
+    plan: siros_dc_matcher_core::zkp_req::Plan,
+    vp_formats: Value,
 }
 
 fn request_profile(
@@ -465,7 +501,72 @@ impl VpBackend {
             signer,
             chain_der,
             clock,
+            zkp: None,
         })
+    }
+
+    /// A `zkp_req` backend. Responses are verified by `verifier`, with every
+    /// attestation issuer judged through the same trust gate as other formats.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_zkp(
+        name: &str,
+        module_base: &str,
+        zcfg: ZkpBackendConfig,
+        gate: TrustGate,
+        signer: kryptering::SoftwareSigner,
+        chain_der: Vec<Vec<u8>>,
+        verifier: ZkpVerifier,
+        clock: Clock,
+    ) -> Result<Self> {
+        let mut offered = serde_json::json!({ "system_id_values": zcfg.system_id_values });
+        if !zcfg.proof_system_values.is_empty() {
+            offered["proof_system_values"] = serde_json::json!(zcfg.proof_system_values);
+        }
+        let vp_formats = serde_json::json!({ "zkp_req": offered });
+        let plan = siros_dc_matcher_core::zkp_req::plan(
+            &zcfg.query.to_string(),
+            Some(&serde_json::json!({ "vp_formats_supported": vp_formats }).to_string()),
+        )
+        .map_err(|e| Error::Config(format!("zkp query: {}", e.code())))?;
+        siros_dc_matcher_core::zkp_req::unsatisfiable(&plan)
+            .map_err(|e| Error::Config(format!("zkp query cannot be satisfied: {}", e.code())))?;
+        let handles: Vec<&str> = plan.functions.iter().map(|f| f.handle.as_str()).collect();
+        let pseudonyms: Vec<&str> = plan
+            .functions
+            .iter()
+            .filter(|f| f.function_id == "pseudonym")
+            .map(|f| f.handle.as_str())
+            .collect();
+        if !pseudonyms.contains(&zcfg.subject_handle.as_str()) {
+            return Err(Error::Config(format!(
+                "subject_handle {:?} is not a pseudonym handle of the query ({pseudonyms:?})",
+                zcfg.subject_handle
+            )));
+        }
+        for (k, h) in &zcfg.attribute_map {
+            if !handles.contains(&h.as_str()) {
+                return Err(Error::Config(format!(
+                    "attribute {k}: no result handle {h:?} in the query"
+                )));
+            }
+        }
+        let cfg = VpBackendConfig {
+            dcql: serde_json::json!({ "credentials": [zcfg.query] }),
+            attribute_map: BTreeMap::new(),
+            subject_pointer: String::new(),
+            role: zcfg.role.clone(),
+            mdoc_role: String::new(),
+            request_ttl_secs: zcfg.request_ttl_secs,
+            auth_class_ref: zcfg.auth_class_ref.clone(),
+        };
+        let mut backend = Self::new(name, module_base, cfg, gate, signer, chain_der, clock)?;
+        backend.zkp = Some(ZkpMode {
+            cfg: zcfg,
+            verifier,
+            plan,
+            vp_formats,
+        });
+        Ok(backend)
     }
 
     /// Inject shared flow/replay storage. Every replica must use the same store.
@@ -622,6 +723,11 @@ impl VpBackend {
                 )
                 .await;
         };
+        if let Some(z) = &self.zkp {
+            return self
+                .on_zkp_response(&id, &claim_id, z, &session, &jwe, requester, now)
+                .await;
+        }
         let verified = match oid4vp::process_response(&session, &jwe, now, &X5cLeaf) {
             Ok(v) => v,
             Err(e) => {
@@ -736,6 +842,217 @@ impl VpBackend {
             Response::json(&serde_json::json!({}))?,
         )
         .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn on_zkp_response(
+        &self,
+        id: &str,
+        claim_id: &str,
+        z: &ZkpMode,
+        session: &oid4vp::Session,
+        jwe: &str,
+        requester: Option<String>,
+        now: i64,
+    ) -> Result<Response> {
+        let opened = match oid4vp::open_response(session, jwe, now) {
+            Ok(o) => o,
+            Err(e) => {
+                return self
+                    .fail(
+                        id,
+                        claim_id,
+                        e.code(),
+                        Response::text(400, "invalid response"),
+                    )
+                    .await;
+            }
+        };
+        let thumbprint =
+            match jose_rs::jwk::thumbprint::thumbprint_sha256(&session.enc_key.to_public_jwk())
+                .and_then(|encoded| jose_rs::base64url::decode(&encoded))
+            {
+                Ok(t) => t,
+                Err(_) => {
+                    return self
+                        .fail(
+                            id,
+                            claim_id,
+                            "verifier_error",
+                            Response::text(500, "verifier error"),
+                        )
+                        .await;
+                }
+            };
+        let channel = Channel::Redirect {
+            client_id: session.client_id.clone(),
+            response_uri: session.response_uri.clone(),
+            encrypted: true,
+        };
+        let exchange = Exchange {
+            plan: &z.plan,
+            channel: &channel,
+            nonce: &session.nonce,
+            reader_thumbprint: Some(&thumbprint),
+            verifier_id: &z.cfg.verifier_id,
+            now,
+        };
+        let pending = match z.verifier.begin(&exchange, &opened.vp_token_text()) {
+            Ok(p) => p,
+            Err(e) => return self.zkp_failure(id, claim_id, &e).await,
+        };
+        let mut verdicts = Vec::new();
+        for queries in pending.trust_queries() {
+            let mut per = Vec::with_capacity(queries.len());
+            for q in queries {
+                let now_ok = self.gate.permits(&q.now.to_authzen(), now).await;
+                let at_expiry = match &q.at_expiry {
+                    Some(x) => Some(self.gate.permits(&x.to_authzen(), now).await),
+                    None => None,
+                };
+                match (now_ok, at_expiry) {
+                    (Ok(trusted_now), None) => {
+                        per.push(siros_verifier_core::issuer_set::MemberVerdict {
+                            trusted_now,
+                            trusted_at_expiry: None,
+                        })
+                    }
+                    (Ok(trusted_now), Some(Ok(at))) => {
+                        per.push(siros_verifier_core::issuer_set::MemberVerdict {
+                            trusted_now,
+                            trusted_at_expiry: Some(at),
+                        })
+                    }
+                    _ => {
+                        return self
+                            .fail(
+                                id,
+                                claim_id,
+                                "trust_unavailable",
+                                Response::text(503, "trust evaluation unavailable"),
+                            )
+                            .await;
+                    }
+                }
+            }
+            verdicts.push(per);
+        }
+        let verified = match pending.finish(&verdicts) {
+            Ok(v) => v,
+            Err(e) => return self.zkp_failure(id, claim_id, &e).await,
+        };
+        let Some(first) = verified.first() else {
+            return self
+                .fail(
+                    id,
+                    claim_id,
+                    "no_presentation",
+                    Response::text(400, "no presentation"),
+                )
+                .await;
+        };
+        let mut data = match self.map_zkp(z, first) {
+            Ok(d) => d,
+            Err(code) => {
+                return self
+                    .fail(
+                        id,
+                        claim_id,
+                        &code,
+                        Response::text(422, "cannot map attributes"),
+                    )
+                    .await;
+            }
+        };
+        data.requester = requester;
+        let sealed_result = match self
+            .sealer
+            .seal_json(&data, format!("result:{id}").as_bytes())
+        {
+            Ok(result) => result,
+            Err(e) => {
+                return self
+                    .fail(
+                        id,
+                        claim_id,
+                        e.code(),
+                        Response::text(500, "result cannot be sealed"),
+                    )
+                    .await;
+            }
+        };
+        self.finish_response(
+            id,
+            claim_id,
+            TerminalOutcome::Done(sealed_result),
+            Response::json(&serde_json::json!({}))?,
+        )
+        .await
+    }
+
+    fn map_zkp(
+        &self,
+        z: &ZkpMode,
+        presentation: &VerifiedPresentation,
+    ) -> std::result::Result<InternalData, String> {
+        use base64::Engine;
+        let encode = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        let mut data = InternalData {
+            auth_info: AuthenticationInformation {
+                auth_class_ref: z.cfg.auth_class_ref.clone(),
+                issuer: Some(format!(
+                    "zkp:{}:{}",
+                    presentation.system_id, presentation.issuer_key_thumbprint
+                )),
+                ..Default::default()
+            },
+            subject_type: SubjectType::Pairwise,
+            ..Default::default()
+        };
+        for (name, handle) in &z.cfg.attribute_map {
+            if let Some(pseudonym) = presentation.pseudonyms.get(handle) {
+                data.attributes
+                    .insert(name.clone(), vec![encode(pseudonym)]);
+            } else if presentation.satisfied.contains(handle) {
+                data.attributes.insert(name.clone(), vec!["true".into()]);
+            }
+        }
+        let subject = presentation
+            .pseudonyms
+            .get(&z.cfg.subject_handle)
+            .ok_or_else(|| "no_pseudonym_for_handle".to_owned())?;
+        data.subject_id = Some(encode(subject));
+        Ok(data)
+    }
+
+    async fn zkp_failure(&self, id: &str, claim_id: &str, e: &ZkpError) -> Result<Response> {
+        match e {
+            ZkpError::Refused { code, detail } => {
+                let body = serde_json::to_vec(&serde_json::json!({
+                    "error": code,
+                    "error_description": detail,
+                }))
+                .unwrap_or_else(|_| b"{\"error\":\"zkp_req\"}".to_vec());
+                self.fail(
+                    id,
+                    claim_id,
+                    code,
+                    Response::new(400)
+                        .with_header("content-type", "application/json")
+                        .with_body(body),
+                )
+                .await
+            }
+            ZkpError::Fault(_) => {
+                self.fail(
+                    id,
+                    claim_id,
+                    "verifier_error",
+                    Response::text(500, "verifier error"),
+                )
+                .await
+            }
+        }
     }
 
     async fn status(&self, ctx: &Context) -> Result<BackendAction> {
@@ -910,6 +1227,11 @@ impl Backend for VpBackend {
     async fn start_auth(&self, ctx: &mut Context, request: InternalData) -> Result<Response> {
         let now = (self.clock)();
         let id = new_flow_id();
+        if self.zkp.is_some() && request.attr_first(ui::DCQL_ATTRIBUTE).is_some() {
+            return Err(Error::BadRequest(
+                "custom DCQL is not supported for zkp_req; use the configured preset".into(),
+            ));
+        }
         let scheme = request
             .attr_first(ui::SCHEME_ATTRIBUTE)
             .unwrap_or("openid4vp");
@@ -921,6 +1243,8 @@ impl Backend for VpBackend {
             response_uri: format!("{}/response/{id}", self.module_base),
             dcql_query,
             ttl_secs: self.cfg.request_ttl_secs,
+            vp_formats_supported: self.zkp.as_ref().map(|z| z.vp_formats.clone()),
+            client_id: self.zkp.as_ref().map(|z| z.cfg.verifier_id.clone()),
         };
         let dc_api = request.requester.as_deref() == Some(ui::DC_API_REQUESTER);
         let (jar, session) = if dc_api {

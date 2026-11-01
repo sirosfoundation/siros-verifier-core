@@ -63,6 +63,8 @@ fn start(w: &World, q: Value) -> (String, Session) {
         response_uri: "https://verify.example/resp".into(),
         dcql_query: q,
         ttl_secs: 300,
+        vp_formats_supported: None,
+        client_id: None,
     };
     create_request(
         &cfg,
@@ -155,6 +157,8 @@ fn dc_api_uses_the_browser_origin_for_holder_binding() {
         response_uri: "https://verify.example/resp".into(),
         dcql_query: dcql(&["given_name"]),
         ttl_secs: 300,
+        vp_formats_supported: None,
+        client_id: None,
     };
     let origin = "https://verify.example";
     let (jar, session) = create_dc_api_request(
@@ -202,6 +206,8 @@ fn dc_api_origin_must_be_a_bare_http_origin() {
         response_uri: "https://verify.example/resp".into(),
         dcql_query: dcql(&[]),
         ttl_secs: 300,
+        vp_formats_supported: None,
+        client_id: None,
     };
     for origin in [
         "https://verify.example/path",
@@ -703,6 +709,8 @@ fn start_mdoc(w: &World, dc_api: bool) -> (String, Session) {
         response_uri: "https://verify.example/resp".into(),
         dcql_query: mdoc_query(),
         ttl_secs: 300,
+        vp_formats_supported: None,
+        client_id: None,
     };
     if dc_api {
         create_dc_api_request(
@@ -793,6 +801,8 @@ fn mixed_sd_jwt_and_mdoc_presentations_stay_distinct() {
         response_uri: "https://verify.example/resp".into(),
         dcql_query: query,
         ttl_secs: 300,
+        vp_formats_supported: None,
+        client_id: None,
     };
     let (jar, session) = create_request(
         &cfg,
@@ -851,6 +861,8 @@ fn mdoc_rejects_wrong_doctype_missing_claims_and_wrong_handover() {
         response_uri: session.response_uri.clone(),
         dcql_query: wrong_doctype,
         ttl_secs: 300,
+        vp_formats_supported: None,
+        client_id: None,
     };
     let (_jar, wrong_session) = create_request(
         &cfg,
@@ -888,6 +900,8 @@ fn mdoc_rejects_missing_claim_and_remote_device_mac() {
         response_uri: "https://verify.example/resp".into(),
         dcql_query: query,
         ttl_secs: 300,
+        vp_formats_supported: None,
+        client_id: None,
     };
     let (_jar, session) = create_request(
         &cfg,

@@ -13,6 +13,7 @@
 //! Everything is sans-IO: callers pass `now` and key material explicitly.
 
 pub mod error;
+pub mod issuer_set;
 pub mod json_strict;
 pub mod mdoc;
 pub mod mdoc_session;

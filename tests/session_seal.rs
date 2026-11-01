@@ -13,6 +13,8 @@ fn session() -> siros_verifier_core::oid4vp::Session {
         response_uri: "https://v.example/r/x".into(),
         dcql_query: serde_json::json!({"credentials": []}),
         ttl_secs: 300,
+        vp_formats_supported: None,
+        client_id: None,
     };
     create_request(&cfg, &signer, "ES256", &[cert], NOW)
         .unwrap()

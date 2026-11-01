@@ -1,0 +1,32 @@
+[package]
+name = "siros-verifier-zkp"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "zkp_req (nym_auth) verification: handover and challenge derivation, age bounds, circuit allowlist, issuer-key trust, dispatch to a proof backend"
+
+[dependencies]
+siros-verifier-core = { path = "..", version = "0.1.0" }
+siros-dc-matcher-core = { git = "https://github.com/sirosfoundation/siros-dc-matcher.git", rev = "93047bc7b8a22117fbc9b4c8cd59ce7cd742e8d3" }
+zk-cred-longfellow = { git = "https://github.com/sirosfoundation/zk-cred-longfellow.git", rev = "115bfec9bb58a7e3210062ece7c5c7ab0e936ae7" }
+base64 = "0.22"
+ciborium = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+p256 = { version = "0.14", features = ["ecdsa"] }
+subtle = "2"
+zeroize = "1"
+rcgen = { version = "0.14", optional = true }
+
+[features]
+# The model circuit and prover used by this crate's tests and by the gateway's. Not for production builds.
+testutil = ["dep:rcgen", "siros-verifier-core/testutil"]
+
+[dev-dependencies]
+siros-verifier-core = { path = "..", version = "0.1.0", features = ["testutil"] }
+siros-verifier-zkp = { path = ".", features = ["testutil"] }
+zstd = "0.14.3"

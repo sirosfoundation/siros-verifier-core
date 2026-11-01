@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer};
 use anyhow::{anyhow, bail, Context as _};
-use config::{DeploymentConfig, FlowStorageConfig};
+use config::{DeploymentConfig, FlowStorageConfig, ZkpDeploymentConfig};
 use grindvakt::provider::TokenUseStore;
 use http::ReqwestClient;
 use mongo_store::{MongoFlowStore, MongoTokenUseStore};
@@ -20,6 +20,12 @@ use siros_verifier_core_tunnelbana::{
     system_clock, ui::UiFrontend, FlowStore, HttpPdp, MemoryFlowStore, PdpClient, TrustGate,
     VpBackend,
 };
+use siros_verifier_zkp::backend::{BackendRegistry, ProofBackend, SystemProfile};
+use siros_verifier_zkp::circuits::{Allowlist, FsArtifactSource};
+use siros_verifier_zkp::functions::FunctionRegistry;
+use siros_verifier_zkp::longfellow::LongfellowBackend;
+use siros_verifier_zkp::nym_auth::SYSTEM_LONGFELLOW;
+use siros_verifier_zkp::verify::{VerifierPolicy, ZkpVerifier};
 use tunnelbana_core::attributes::AttributeMapper;
 use tunnelbana_core::config::ProxyConfig;
 use tunnelbana_core::http::{HttpClient, HttpRequestData, Response};
@@ -219,12 +225,44 @@ async fn build_flow_store(config: &FlowStorageConfig) -> anyhow::Result<Arc<dyn 
     }
 }
 
+fn build_zkp_verifier(config: &ZkpDeploymentConfig) -> anyhow::Result<ZkpVerifier> {
+    let allowlist = Allowlist::new(&config.circuits).map_err(|e| anyhow!(e))?;
+    let mut backends = BackendRegistry::new();
+    for allowed in allowlist.allowed() {
+        let system = allowed.split(' ').next().unwrap_or_default();
+        if system != SYSTEM_LONGFELLOW {
+            anyhow::bail!("proof system {system:?} has no registered native backend in this build");
+        }
+        backends
+            .register(
+                system,
+                SystemProfile::single_issuer_age_check(),
+                |entry, bytes| {
+                    LongfellowBackend::from_entry(entry, bytes)
+                        .map(|backend| Box::new(backend) as Box<dyn ProofBackend>)
+                },
+            )
+            .map_err(|e| anyhow!(e))?;
+    }
+    Ok(ZkpVerifier::new(
+        allowlist,
+        Box::new(FsArtifactSource),
+        FunctionRegistry::with_builtins(),
+        backends,
+        VerifierPolicy {
+            role: config.backend.role.clone(),
+            issuer_set: config.issuer_set,
+            tolerance: config.tolerance,
+        },
+    )?)
+}
+
 async fn build_openid4vp_backend(
     cfg: &ProxyConfig,
     plugin: &tunnelbana_core::config::PluginConfig,
     config_path: &str,
 ) -> anyhow::Result<Box<dyn tunnelbana_core::plugin::Backend>> {
-    let deployment: DeploymentConfig = serde_json::from_value(plugin.config_json())?;
+    let mut deployment: DeploymentConfig = serde_json::from_value(plugin.config_json())?;
     let key_path = resolve_sibling(config_path, &deployment.request_signing_key_path);
     let key_pem = std::fs::read_to_string(&key_path)
         .with_context(|| format!("reading request signing key {}", key_path.display()))?;
@@ -289,15 +327,30 @@ async fn build_openid4vp_backend(
         .with_previous_masters(&previous_masters, &plugin.name)?;
     let module_base = format!("{}/{}", cfg.base_url.trim_end_matches('/'), plugin.name);
     let store = build_flow_store(&deployment.storage).await?;
-    let backend = VpBackend::new(
-        &plugin.name,
-        &module_base,
-        deployment.vp,
-        gate,
-        request_signer,
-        chain_der,
-        system_clock(),
-    )?
+    let backend = if let Some(zkp) = deployment.zkp.take() {
+        let verifier = build_zkp_verifier(&zkp)?;
+        let zcfg = zkp.backend;
+        VpBackend::new_zkp(
+            &plugin.name,
+            &module_base,
+            zcfg,
+            gate,
+            request_signer,
+            chain_der,
+            verifier,
+            system_clock(),
+        )?
+    } else {
+        VpBackend::new(
+            &plugin.name,
+            &module_base,
+            deployment.vp,
+            gate,
+            request_signer,
+            chain_der,
+            system_clock(),
+        )?
+    }
     .with_flow_store(store)
     .with_session_sealer(sealer);
     tracing::info!(name = %plugin.name, pdp = %deployment.pdp_endpoint, storage = %deployment.storage.backend, "loaded OpenID4VP backend");
@@ -473,7 +526,39 @@ mod tests {
 
               [backend.config.storage]
               backend = "memory"
+
+              [backend.config.zkp]
+              query = {{ id = "nym_attestation", format = "zkp_req",
+                meta = {{ source_format = "mso_mdoc", doctype_value = "eu.europa.ec.eudi.nym_auth.1" }},
+                _req = [
+                  {{ fn_id = "pseudonym", return = "nym-1", params = {{
+                    config = "known-offender-matching-ssc", ver = 1, prf = "sha-256" }} }},
+                  {{ fn_id = "age_check", return = "age-1", params = {{
+                    ge = "2008-10-10", le = "2013-10-09" }} }},
+                ] }}
+              system_id_values = ["urn:circuits:longfellow:nym_auth:v1"]
+              proof_system_values = ["longfellow-libzk-v1"]
+              role = "mdoc-issuer"
+              verifier_id = "x509_san_dns:verifier.example"
+              subject_handle = "nym-1"
+              attribute_map = {{ pseudonym = "nym-1", ageOver = "age-1" }}
+              auth_class_ref = "urn:eudi:loa:high"
+
+              [backend.config.zkp.circuits]
+              sources = []
+
+              [[backend.config.zkp.circuits.allow]]
+              system_id = "urn:circuits:longfellow:nym_auth:v1"
+              config = "known-offender-matching-ssc"
+              hash_circuit_id = "5f8c75ae5c3893ef6ab6a079628cb385ba85e95a85437d58570c455289d75729"
+              sig_circuit_id = "00513797c75b2eab1a9db75004977c15317d4e40c0db1d00674523431baa75cb"
+              block_enc_hash = 6983
+              block_enc_sig = 4679
+              artifact_path = "{dir}/nymauth.bin"
+              artifact_sha256 = "92dd42fdf99673249eec33c7d07850bd9da66fbdab01ef26391e04c8341c1b7f"
+              artifact_bytes = 1062842
         "#,
+            dir = dir.display(),
             key = dir.join("key.pem").display(),
             chain = dir.join("chain.pem").display()
         ))

@@ -812,6 +812,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
+name = "byteorder"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
+
+[[package]]
 name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1705,6 +1711,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "educe"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d7bc049e1bd8cdeb31b68bbd586a9464ecf9f3944af3958a7a9d0f8b9799417"
+dependencies = [
+ "enum-ordinalize",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "elliptic-curve"
 version = "0.13.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1759,6 +1777,26 @@ dependencies = [
  "rustversion",
  "scopeguard",
  "simdutf8",
+]
+
+[[package]]
+name = "enum-ordinalize"
+version = "4.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89dd01549b09589510cf0647475075d12071456586d70f5c75c98ae2a5537677"
+dependencies = [
+ "enum-ordinalize-derive",
+]
+
+[[package]]
+name = "enum-ordinalize-derive"
+version = "4.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a65863d15a4ce2888bd2f0f543cc963d3879c3a022c8ee43f6141d479a3ac815"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
 ]
 
 [[package]]
@@ -4648,6 +4686,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "33f4fe9184a62d842c9ef383018f3306d8ba224fd9d836f56d7288308847c256"
 
 [[package]]
+name = "siros-dc-matcher-core"
+version = "0.10.0"
+source = "git+https://github.com/sirosfoundation/siros-dc-matcher.git?rev=93047bc7b8a22117fbc9b4c8cd59ce7cd742e8d3#93047bc7b8a22117fbc9b4c8cd59ce7cd742e8d3"
+dependencies = [
+ "ciborium",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "siros-dcql",
+]
+
+[[package]]
+name = "siros-dcql"
+version = "0.10.0"
+source = "git+https://github.com/sirosfoundation/siros-dc-matcher.git?rev=93047bc7b8a22117fbc9b4c8cd59ce7cd742e8d3#93047bc7b8a22117fbc9b4c8cd59ce7cd742e8d3"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "siros-verifier-core"
 version = "0.1.0"
 dependencies = [
@@ -4664,6 +4723,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "siros-dc-matcher-core",
  "thiserror 2.0.21",
  "url",
  "x509-cert",
@@ -4697,7 +4757,9 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "siros-dc-matcher-core",
  "siros-verifier-core",
+ "siros-verifier-zkp",
  "tokio",
  "tracing",
  "tunnelbana-core",
@@ -4725,12 +4787,33 @@ dependencies = [
  "serde_json",
  "siros-verifier-core",
  "siros-verifier-core-tunnelbana",
+ "siros-verifier-zkp",
  "tokio",
  "toml 1.1.8+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
  "tunnelbana-core",
  "tunnelbana-plugins",
+]
+
+[[package]]
+name = "siros-verifier-zkp"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "ciborium",
+ "p256 0.14.0",
+ "rcgen",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "siros-dc-matcher-core",
+ "siros-verifier-core",
+ "siros-verifier-zkp",
+ "subtle",
+ "zeroize",
+ "zk-cred-longfellow",
+ "zstd",
 ]
 
 [[package]]
@@ -6210,6 +6293,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "zk-cred-longfellow"
+version = "0.1.2"
+source = "git+https://github.com/sirosfoundation/zk-cred-longfellow.git?rev=115bfec9bb58a7e3210062ece7c5c7ab0e936ae7#115bfec9bb58a7e3210062ece7c5c7ab0e936ae7"
+dependencies = [
+ "aes 0.8.4",
+ "anyhow",
+ "byteorder",
+ "ciborium",
+ "ciborium-ll",
+ "crypto-common 0.1.7",
+ "educe",
+ "getrandom 0.3.4",
+ "hex",
+ "num-bigint",
+ "num-integer",
+ "rand 0.9.5",
+ "serde",
+ "sha2 0.10.9",
+ "static_assertions",
+ "subtle",
+ "wasm-bindgen",
+ "x509-cert",
+ "zstd",
+]
+
+[[package]]
 name = "zlib-rs"
 version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6220,3 +6329,31 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+
+[[package]]
+name = "zstd"
+version = "0.14.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db3ae9bf90af6e40197bef767eeefc46ad6397420fe873830bd85e5fbbfb3c70"
+dependencies = [
+ "zstd-safe",
+]
+
+[[package]]
+name = "zstd-safe"
+version = "8.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ded520f16b29e1a9b771c722221b2b0a0398c2316d9bb3c42b458a5414d7434b"
+dependencies = [
+ "zstd-sys",
+]
+
+[[package]]
+name = "zstd-sys"
+version = "2.1.2+zstd.1.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "481ada9c543b2323cbb7bbdbb5249177fbf0188ed959ed2c15e4b22421c84ed3"
+dependencies = [
+ "cc",
+ "pkg-config",
+]

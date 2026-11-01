@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = [".", "ffi", "tunnelbana-plugin", "service"]
+members = [".", "ffi", "tunnelbana-plugin", "service", "zkp"]
 
 [workspace.package]
 edition = "2021"
@@ -37,6 +37,7 @@ thiserror = "2"
 url = "2"
 x509-cert = "0.2"
 zeroize = "1"
+siros-dc-matcher-core = { git = "https://github.com/sirosfoundation/siros-dc-matcher.git", rev = "93047bc7b8a22117fbc9b4c8cd59ce7cd742e8d3" }
 rcgen = { version = "0.14", optional = true }
 
 [features]

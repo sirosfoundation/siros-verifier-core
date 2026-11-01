@@ -1,0 +1,19 @@
+{
+  "block_enc_hash": 6983,
+  "block_enc_sig": 4679,
+  "challenge_digest": "7eea0f8e073961c3e82e9562e0f79edaa66dbfc17eaf0ac0596a987733516dd9",
+  "client_id": "x509_san_dns:verifier.example",
+  "cutoff": "2008-10-07",
+  "doc_type": "eu.europa.ec.eudi.nym_auth.1",
+  "earliest": "0000-00-00",
+  "hash_circuit_id": "5f8c75ae5c3893ef6ab6a079628cb385ba85e95a85437d58570c455289d75729",
+  "issuer_key_x": "b626aa933b215bc28f3b4924bf675454d2121f28bbb146415c181092f7fd9080",
+  "issuer_key_y": "bf779357652d68be5ab61c667bde4ebff67b9efa2535c1138508fad656a2ab63",
+  "nonce": "pOA0oqEAhLnqug2r7Ve4tQ",
+  "origin": "https://verifier.example",
+  "pseudonym": "155f433796d1f282268a87100cd08510893f97f6e5607bc5e4c66afadb71aad1",
+  "session_transcript": "83f6f682764f70656e4944345650444341504948616e646f766572582019fb903434402eb496b9a26aefcd28e9c84f0cf27ca6521f71c3f678e080075e",
+  "sig_circuit_id": "00513797c75b2eab1a9db75004977c15317d4e40c0db1d00674523431baa75cb",
+  "time": "2026-10-07T12:00:00Z",
+  "verifier_input": "6eae85a0b2dfcd7d8b716291e54a004da798f93a26a248c265becd33a04a6bab"
+}

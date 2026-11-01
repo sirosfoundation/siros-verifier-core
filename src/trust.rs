@@ -18,6 +18,8 @@ pub struct TrustQuery {
     pub jwk: Value,
     pub role: String,
     pub credential_types: Vec<String>,
+    /// Ask whether the key was trusted at this instant (unix seconds) instead of now.
+    pub as_of: Option<i64>,
 }
 
 impl TrustQuery {
@@ -28,6 +30,7 @@ impl TrustQuery {
             jwk: serde_json::to_value(ev.jwk.to_public_jwk()).expect("jwk serializes"),
             role: role.to_owned(),
             credential_types: vec![vct.to_owned()],
+            as_of: None,
         }
     }
 
@@ -46,6 +49,7 @@ impl TrustQuery {
             jwk: Value::Null,
             role: role.to_owned(),
             credential_types: vec![doc_type.to_owned()],
+            as_of: None,
         }
     }
 
@@ -59,10 +63,16 @@ impl TrustQuery {
         } else {
             ("x5c", json!(self.x5c))
         };
-        json!({
+        let mut query = json!({
             "subject":  { "type": "key", "id": self.subject_id },
             "resource": { "type": rtype, "id": self.subject_id, "key": key },
             "action":   { "name": self.role, "parameters": { "credential_types": self.credential_types } },
-        })
+        });
+        if let Some(t) = self.as_of {
+            if let Ok(as_of) = crate::mdoc::format_utc(t) {
+                query["context"] = json!({ "as_of": as_of });
+            }
+        }
+        query
     }
 }

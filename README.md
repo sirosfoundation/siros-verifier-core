@@ -25,6 +25,9 @@ production-ready yet.
 - `service/` (`siros-verifier-service`): Actix gateway with a real OIDC frontend
   and a self-contained verifier UI offering QR-code and W3C DC API presentations
   plus a verified-claims result page.
+- `zkp/` (`siros-verifier-zkp`): `zkp_req` response validation, nym_auth
+  transcripts and predicates, issuer-set trust policy, and a real Longfellow
+  proof backend. Vega and BBS are not enabled.
 - `src/ts11.rs`: sans-I/O TS 119 602 schema parsing, VCTM/MDDL metadata
   extraction, SRI validation, and registry-backed DCQL preset generation. The
   tunnelbana adapter adds bounded HTTPS fetching and last-known-good caching.
@@ -39,8 +42,9 @@ MongoDB flow/replay storage with atomic response claims, sealed sessions and
 results, one-time collection, and bounded retention. Single-process memory
 storage remains available only through explicit configuration. Database
 failover itself requires a MongoDB replica set or managed HA service.
-`zkp_req` support is the next major protocol target after the gateway slice and
-will follow the rulebook 0.4/0.5 work landing in SUNET/vc.
+`zkp_req` currently supports `mso_mdoc` nym_auth with the Longfellow proof
+system, pseudonym and `age_check`. Vega, BBS, and predicate-only requests remain
+outside the supported profile and fail closed.
 
 ## Build and test
 

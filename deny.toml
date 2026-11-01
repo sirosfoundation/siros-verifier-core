@@ -46,4 +46,9 @@ deny = [
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = ["https://github.com/SUNET/tunnelbana"]
+allow-git = [
+    "https://github.com/SUNET/tunnelbana",
+    "https://github.com/sirosfoundation/tunnelbana",
+    "https://github.com/sirosfoundation/siros-dc-matcher",
+    "https://github.com/sirosfoundation/zk-cred-longfellow",
+]

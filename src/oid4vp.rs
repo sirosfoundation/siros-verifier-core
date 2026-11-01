@@ -30,6 +30,12 @@ pub struct RequestConfig {
     pub response_uri: String,
     pub dcql_query: Value,
     pub ttl_secs: i64,
+    /// `client_metadata.vp_formats_supported` to advertise. `None` derives the
+    /// existing SD-JWT/mdoc metadata from the requested credentials.
+    pub vp_formats_supported: Option<Value>,
+    /// Explicit client ID for formats that require a different scheme from the
+    /// default x509_hash. `zkp_req` uses x509_san_dns or semantic_id.
+    pub client_id: Option<String>,
 }
 
 /// Everything the verifier must remember between request and response.
@@ -305,7 +311,15 @@ fn create_request_with_response_mode(
     let leaf = chain_der
         .first()
         .ok_or_else(|| malformed("certificate chain is empty"))?;
-    let client_id = x509_hash_client_id(leaf);
+    let client_id = match &cfg.client_id {
+        Some(id) => {
+            if !(id.starts_with("x509_san_dns:") || id.starts_with("semantic_id:")) {
+                return Err(malformed("unsupported explicit client_id scheme"));
+            }
+            id.clone()
+        }
+        None => x509_hash_client_id(leaf),
+    };
 
     let mut enc_key = jose_rs::jwk::generate_ec("P-256")?;
     enc_key.alg = Some("ECDH-ES".into());
@@ -333,16 +347,18 @@ fn create_request_with_response_mode(
         .into_iter()
         .flatten()
         .any(|query| query.get("format").and_then(Value::as_str) == Some("mso_mdoc"));
-    let vp_formats_supported = if mdoc_requested {
-        json!({
-            "dc+sd-jwt": { "sd-jwt_alg_values": ["ES256"], "kb-jwt_alg_values": ["ES256"] },
-            "mso_mdoc": { "issuerauth_alg_values": [-7], "deviceauth_alg_values": [-7] }
-        })
-    } else {
-        json!({
-            "dc+sd-jwt": { "sd-jwt_alg_values": ["ES256"], "kb-jwt_alg_values": ["ES256"] }
-        })
-    };
+    let vp_formats_supported = cfg.vp_formats_supported.clone().unwrap_or_else(|| {
+        if mdoc_requested {
+            json!({
+                "dc+sd-jwt": { "sd-jwt_alg_values": ["ES256"], "kb-jwt_alg_values": ["ES256"] },
+                "mso_mdoc": { "issuerauth_alg_values": [-7], "deviceauth_alg_values": [-7] }
+            })
+        } else {
+            json!({
+                "dc+sd-jwt": { "sd-jwt_alg_values": ["ES256"], "kb-jwt_alg_values": ["ES256"] }
+            })
+        }
+    });
     let payload = json!({
         "iat": now,
         "exp": session.expires_at,
@@ -392,6 +408,28 @@ pub fn validate_dcql_query(query: &Value) -> Result<()> {
         .ok_or_else(|| malformed("dcql_query without credentials"))?;
     if credentials.is_empty() {
         return Err(policy("dcql_query must request a credential"));
+    }
+    if credentials
+        .iter()
+        .any(|query| query.get("format").and_then(Value::as_str) == Some("zkp_req"))
+    {
+        if credentials.len() != 1 {
+            return Err(policy("zkp_req must be the only credential query"));
+        }
+        let metadata = serde_json::json!({
+            "vp_formats_supported": {
+                "zkp_req": {"system_id_values": ["urn:circuits:longfellow:nym_auth:v1"]}
+            }
+        });
+        let plan = siros_dc_matcher_core::zkp_req::plan(
+            &credentials[0].to_string(),
+            Some(&metadata.to_string()),
+        )
+        .map_err(|e| Error::Policy(format!("zkp_req query: {}", e.code())))?;
+        siros_dc_matcher_core::zkp_req::unsatisfiable(&plan).map_err(|e| {
+            Error::Policy(format!("zkp_req query cannot be satisfied: {}", e.code()))
+        })?;
+        return Ok(());
     }
     let mut credential_ids = std::collections::BTreeSet::new();
     for query in credentials {
@@ -663,13 +701,23 @@ fn decrypt_response(session: &Session, jwe: &str) -> Result<jose_rs::Authenticat
     Ok(dec)
 }
 
-/// Process the wallet's `direct_post.jwt` response (the `response` form value).
-pub fn process_response(
-    session: &Session,
-    jwe: &str,
-    now: i64,
-    resolver: &dyn IssuerKeyResolver,
-) -> Result<Vec<PresentationResult>> {
+/// A wallet response that decrypted, is addressed to this session, and carries its state.
+pub struct OpenedResponse {
+    /// The `vp_token` object, parsed with repeated member names refused.
+    pub vp_token: serde_json::Map<String, Value>,
+}
+
+impl OpenedResponse {
+    /// The `vp_token` as JSON text, for validators that take text. Repeated
+    /// names were refused when it was parsed, so nothing is lost by serializing.
+    pub fn vp_token_text(&self) -> String {
+        Value::Object(self.vp_token.clone()).to_string()
+    }
+}
+
+/// Decrypt a `direct_post.jwt` response and perform the format-independent
+/// request, key, error, state, and `vp_token` checks.
+pub fn open_response(session: &Session, jwe: &str, now: i64) -> Result<OpenedResponse> {
     if now >= session.expires_at {
         return Err(policy("request has expired"));
     }
@@ -685,10 +733,23 @@ pub fn process_response(
     if body.get("state").and_then(Value::as_str) != Some(session.state.as_str()) {
         return Err(integrity("state mismatch"));
     }
-    let vp = body
+    let vp_token = body
         .get("vp_token")
         .and_then(Value::as_object)
+        .cloned()
         .ok_or_else(|| malformed("missing vp_token object"))?;
+    Ok(OpenedResponse { vp_token })
+}
+
+/// Process the wallet's `direct_post.jwt` response (the `response` form value).
+pub fn process_response(
+    session: &Session,
+    jwe: &str,
+    now: i64,
+    resolver: &dyn IssuerKeyResolver,
+) -> Result<Vec<PresentationResult>> {
+    let opened = open_response(session, jwe, now)?;
+    let vp = &opened.vp_token;
 
     if session.dcql_query.get("credential_sets").is_some() {
         return Err(policy("credential_sets are not supported in the spike"));
