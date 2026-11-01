@@ -10,9 +10,6 @@ kept separate from transport, storage, time, key management, and issuer-trust
 policy. Issuer trust is delegated to a tenant-configured policy decision point,
 normally [go-trust](https://github.com/sirosfoundation/go-trust), over AuthZEN.
 
-This repository is being productized from the `vp-spike` experiments. It is not
-production-ready yet.
-
 ## Components
 
 - Root crate (`siros-verifier-core`): SD-JWT VC and mdoc OpenID4VP with the
@@ -100,10 +97,6 @@ scripts/interop.sh
 
 See [fuzz/README.md](fuzz/README.md) for the fuzz targets and seed-generation
 commands, and [deny.toml](deny.toml) for the narrowly scoped advisory exceptions.
-
-See [FINDINGS.md](FINDINGS.md) for the spike evidence, interoperability results,
-known gaps, and upstream references. The findings are historical evidence, not a
-claim that those gaps have all been resolved in this workspace.
 
 ## License
 
