@@ -4,99 +4,165 @@
 [![npm](https://img.shields.io/npm/v/%40sirosfoundation%2Fpresentation-flow)](https://www.npmjs.com/package/@sirosfoundation/presentation-flow)
 [![License: BSD-2-Clause](https://img.shields.io/badge/license-BSD--2--Clause-blue.svg)](LICENSE)
 
-A Rust digital-credential verifier core with native and gateway adapters. The
-core is sans-I/O: parsing, protocol checks, and cryptographic verification are
-kept separate from transport, storage, time, key management, and issuer-trust
-policy. Issuer trust is delegated to a tenant-configured policy decision point,
-normally [go-trust](https://github.com/sirosfoundation/go-trust), over AuthZEN.
+Reusable Rust building blocks and a deployable gateway for verifying digital
+credential presentations. Use the complete OpenID4VP/OIDC service, embed the
+sans-I/O verification crates, or integrate the browser and mobile adapters.
 
-## Components
+The core separates parsing, protocol checks, and cryptographic verification
+from transport, storage, time, key management, and trust policy. **All issuer
+and verifier trust decisions are delegated to a tenant-configured policy
+decision point, normally [go-trust](https://github.com/sirosfoundation/go-trust),
+over AuthZEN.**
 
-- Root crate (`siros-verifier-core`): SD-JWT VC and mdoc OpenID4VP with the
-  distinct redirect/DC API handovers, ISO 18013-5 reader sessions, mdoc
-  DeviceResponse verification, and signed decision receipts.
-- `ffi/` (`siros-verifier-core-ffi`): UniFFI facade for proximity-reader
-  applications. BLE and NFC transport remain application responsibilities.
-- `tunnelbana-plugin/` (`siros-verifier-core-tunnelbana`): OpenID4VP verifier
-  backend for tunnelbana, intended for the gateway/OIDC/wallet flow.
-- `service/` (`siros-verifier-service`): Actix gateway with a real OIDC frontend
-  and a self-contained verifier UI offering QR-code and W3C DC API presentations
-  plus a verified-claims result page.
-- `zkp/` (`siros-verifier-zkp`): `zkp_req` response validation, nym_auth
-  transcripts and predicates, issuer-set trust policy, and a real Longfellow
-  proof backend. Circuits can be pinned local files or resolved through the
-  SIROS circuit catalog API. Vega and BBS are not enabled.
-- `src/ts11.rs`: sans-I/O TS 119 602 schema parsing, VCTM/MDDL metadata
-  extraction, SRI validation, and registry-backed DCQL preset generation. The
-  tunnelbana adapter adds bounded HTTPS fetching and last-known-good caching.
-- `tunnelbana-plugin/src/assets/presentation-flow.js`: independently publishable
-  ES module for registry-driven request editing, configurable presets, QR,
-  direct-link and inline DC API invocation, backend/tenant binding, and an async
-  result/error API. See the package README and Node tests in that directory.
+## Supported verification flows
 
-The initial operational target is an end-to-end gateway flow using the SIROS SDK
-sample wallet, deployed through `sirosid-dev`. The gateway supports shared
-MongoDB flow/replay storage with atomic response claims, sealed sessions and
-results, one-time collection, and bounded retention. Single-process memory
-storage remains available only through explicit configuration. Database
-failover itself requires a MongoDB replica set or managed HA service.
-`zkp_req` currently supports `mso_mdoc` nym_auth with the Longfellow proof
-system, pseudonym and `age_check`. Vega, BBS, and predicate-only requests remain
-outside the supported profile and fail closed.
+| Flow | Functionality |
+| --- | --- |
+| SD-JWT VC over OpenID4VP | Signed requests, redirect and W3C DC API handovers, encrypted responses, SD-JWT and key-binding verification, and verified-claim extraction |
+| ISO/IEC 18013-5 mdoc | DeviceResponse verification, issuer and device authentication, reader sessions, and OpenID4VP or proximity engagement |
+| `zkp_req` nym_auth | Pseudonym and `age_check` verification with native Longfellow and Vega backends, exact circuit pins, and verifier-scoped pseudonyms |
+| TS 119 602 metadata | Schema and VCTM/MDDL parsing, SRI validation, and registry-backed DCQL preset generation |
 
-### Circuit catalog
+BBS and predicate-only ZK requests are not part of the supported profile and
+fail closed.
 
-Set `zkp.circuits.sources` to ordered mirrors of the SIROS API, normally
-`["https://api.circuits.siros.org"]`, and use `artifact_id` instead of
-`artifact_path` in an allowlist entry. The service fetches
-`/v1/circuits/{id}.json` and the content-addressed artifact at startup. It
-checks descriptor system/configuration/parameters, served hash and size, any
-uncompressed hash and size, and finally the operator's `artifact_sha256` and
-`artifact_bytes`. Verified artifacts are kept in memory; request processing
-performs no catalog network access. Startup fails if no mirror yields the exact
-allowed artifact. `circuits.siros.org` is the human-facing site, not the API
-origin.
+## Choose an integration
+
+### 1. Deploy the verifier gateway
+
+`siros-verifier-service` combines the tunnelbana OIDC frontend, OpenID4VP
+backend, verifier UI, and native proof backends. It is the shortest path when
+you need a relying-party-facing verification service rather than a library.
+
+```sh
+cargo build --release -p siros-verifier-service
+
+TUNNELBANA_BIND=127.0.0.1:9001 \
+  ./target/release/siros-verifier-service /path/to/proxy.toml
+```
+
+The service exposes `/health` and expects TLS to be terminated upstream. See
+[the configuration guide](docs/CONFIGURATION.md) for signing keys, AuthZEN/PDP
+settings, UI presets, ZK profiles, circuit pins, cookies, and storage.
+
+For more than one service process, configure the shared MongoDB backend. It
+provides atomic flow claims, replay protection, OIDC token-use storage, sealed
+one-time results, and bounded retention across replicas. Use a MongoDB replica
+set or managed HA service for database failover; the in-memory backend is only
+for explicitly single-process deployments.
+
+### 2. Embed the Rust libraries
+
+| Crate | Use it for |
+| --- | --- |
+| `siros-verifier-core` | SD-JWT VC, mdoc, OpenID4VP, reader sessions, AuthZEN query construction, session sealing, decision receipts, and TS 119 602 metadata |
+| `siros-verifier-zkp` | `zkp_req` validation, nym_auth transcripts and functions, circuit allowlists/catalog artifacts, and native Longfellow/Vega verification |
+| `siros-verifier-core-tunnelbana` | The OpenID4VP backend and registry-driven UI adapter for a tunnelbana deployment |
+| `siros-verifier-core-ffi` | UniFFI proximity-reader bindings for Kotlin and Swift applications |
+
+The root and ZK crates are sans-I/O at their verification boundaries. An
+embedding application supplies time, keys, transport, storage, and trust
+verdicts. A typical OpenID4VP integration:
+
+1. Constructs a request from verifier-owned DCQL, nonce, client identity, and
+   signing key.
+2. Sends it through the redirect or DC API channel and receives the encrypted
+   wallet response.
+3. Uses the core to authenticate the response and credential cryptography.
+4. Sends the resulting AuthZEN query to go-trust and accepts the credential only
+   when the PDP permits it.
+5. Maps verified claims into its own identity or authorization model.
+
+For ZK verification, register the native backends and keep circuit artifacts
+behind an exact allowlist. Catalog artifacts are prefetched at startup and
+checked by decompressed size and SHA-256; wallet requests never trigger catalog
+network access. The catalog provides artifact integrity, not issuer or verifier
+trust.
+
+Start with the public modules in [`src/lib.rs`](src/lib.rs) and
+[`zkp/src/lib.rs`](zkp/src/lib.rs), or follow the service composition in
+[`service/src/main.rs`](service/src/main.rs).
+
+### 3. Add the browser presentation UI
+
+The independently published, dependency-free ES module provides preset and
+attribute selection, editable DCQL, QR/direct-link/DC API invocation, status
+polling, and result handling:
+
+```sh
+npm install @sirosfoundation/presentation-flow
+```
+
+```js
+import { PresentationFlow } from "@sirosfoundation/presentation-flow";
+
+const flow = new PresentationFlow({
+  root: document.querySelector("#app"),
+  presets: registryBackedPresets,
+  invocations: ["qr", "dc-api", "link"],
+  startPath: "/ui/start",
+  tenant: "example-tenant",
+});
+```
+
+QR launches reuse a modal, the SIROS spinner is shown while the presentation is
+pending, and completion offers a link back to the verifier result page. The
+backend remains authoritative for DCQL validation, request signing, trust, and
+verification. See the [package integration guide and backend
+contract](tunnelbana-plugin/src/assets/README.md).
+
+### 4. Build a proximity reader with UniFFI
+
+The FFI `Reader` accepts whole CBOR messages and leaves BLE/NFC transport to the
+application:
+
+1. `Reader.start(deviceEngagement, handover)` establishes the reader session.
+2. `establishment_message(deviceRequest)` and `data_message(deviceRequest)`
+   produce messages for the wallet.
+3. `open_response(sessionData, now, acceptedDocTypes)` decrypts and verifies the
+   DeviceResponse.
+4. The application submits each document's AuthZEN request to its PDP and uses
+   the returned elements only after a permit decision.
+
+See [`ffi/src/lib.rs`](ffi/src/lib.rs) for the exported API and
+[`ffi/scripts/kotlin-test.sh`](ffi/scripts/kotlin-test.sh) for the native/Kotlin
+test setup.
+
+## Trust and security boundary
+
+Cryptographic validity is not a trust decision. The verifier can establish that
+a presentation is intact and signed by a key; go-trust decides whether that key,
+issuer, verifier, role, and credential type are acceptable for the tenant.
+
+Keep request signing keys and session-sealing keys in a secret manager, use a
+dedicated verifier identity, and pin ZK artifacts exactly. `zkp_req` commonly
+uses an `x509_san_dns` verifier identity; other formats retain `x509_hash`.
+Response bodies, decrypted plaintext, artifacts, metadata, and protocol parsers
+are bounded, and flow completion and result collection are replay-protected.
 
 ## Build and test
 
-The workspace uses stable Rust. Production builds have no default core features;
-test simulators are opt-in through `testutil`.
+The workspace uses stable Rust. Production builds have no default core
+features; issuer and wallet simulators are opt-in through `testutil`.
 
 ```sh
-cargo build --workspace
-cargo test --workspace --all-features
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+python3 scripts/mutate.py
+scripts/audit.sh
+npm test --prefix tunnelbana-plugin/src/assets
+```
 
-# Also exercise the MongoDB contract against a real server.
+To exercise the MongoDB contract against a real server:
+
+```sh
 SIROS_VERIFIER_TEST_MONGODB_URI=mongodb://127.0.0.1:27017 \
   cargo test --workspace --all-features
 ```
 
-Additional checks:
-
-```sh
-# Mutation-check the security rules.
-python3 scripts/mutate.py
-
-# RustSec advisories, dependency policy, licenses, and sources.
-scripts/audit.sh
-
-# Short fuzz smoke runs for CBOR, SD-JWT, and OpenID4VP JWE parsers.
-# Requires a nightly Rust toolchain and cargo-fuzz.
-scripts/fuzz-smoke.sh
-
-# Run the generated Kotlin bindings against the real native library.
-# Requires JDK 21 and Gradle 8.11 or newer.
-ffi/scripts/kotlin-test.sh
-
-# Cross-check against go-jose and SUNET/vc. Requires a sibling ../vc checkout.
-scripts/interop.sh gen
-scripts/interop.sh
-```
-
-See [fuzz/README.md](fuzz/README.md) for the fuzz targets and seed-generation
-commands, and [deny.toml](deny.toml) for the narrowly scoped advisory exceptions.
+Additional parser fuzz and Kotlin interoperability checks are documented in
+[`fuzz/README.md`](fuzz/README.md) and [`AGENTS.md`](AGENTS.md).
 
 ## License
 

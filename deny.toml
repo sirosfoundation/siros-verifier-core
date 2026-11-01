@@ -51,4 +51,6 @@ allow-git = [
     "https://github.com/sirosfoundation/tunnelbana",
     "https://github.com/sirosfoundation/siros-dc-matcher",
     "https://github.com/sirosfoundation/zk-cred-longfellow",
+    "https://github.com/sirosfoundation/zk-cred-vega",
+    "https://github.com/sirosfoundation/vega-prover",
 ]

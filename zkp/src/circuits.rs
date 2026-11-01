@@ -236,6 +236,15 @@ fn check_params(e: &CircuitConfig, where_: &str) -> ZkpResult<()> {
             Ok(())
         }
         SYSTEM_VEGA => {
+            if e.config != CONFIG_KNOWN_OFFENDER_MATCHING_SSC {
+                return Err(bad(
+                    where_,
+                    format!(
+                        "Vega nym_auth only supports {CONFIG_KNOWN_OFFENDER_MATCHING_SSC}, not {}",
+                        e.config
+                    ),
+                ));
+            }
             for (what, set) in [
                 ("hash_circuit_id", !e.hash_circuit_id.is_empty()),
                 ("sig_circuit_id", !e.sig_circuit_id.is_empty()),

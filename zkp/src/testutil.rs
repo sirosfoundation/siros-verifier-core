@@ -208,6 +208,24 @@ pub fn presentation_cbor(
     proof_time: Option<i64>,
     pseudonym: &[u8],
 ) -> Vec<u8> {
+    presentation_cbor_with_age(system_id, proof, key_set, proof_time, pseudonym, true)
+}
+
+pub fn presentation_cbor_with_age(
+    system_id: &str,
+    proof: &[u8],
+    key_set: &[Vec<u8>],
+    proof_time: Option<i64>,
+    pseudonym: &[u8],
+    include_age: bool,
+) -> Vec<u8> {
+    let mut results = vec![(
+        Value::Text("nym-1".into()),
+        Value::Bytes(pseudonym.to_vec()),
+    )];
+    if include_age {
+        results.push((Value::Text("age-1".into()), Value::Bool(true)));
+    }
     let mut m = vec![
         (
             Value::Text("system_id".into()),
@@ -218,16 +236,7 @@ pub fn presentation_cbor(
             Value::Text("issuer_key_set".into()),
             Value::Array(key_set.iter().map(|k| Value::Bytes(k.clone())).collect()),
         ),
-        (
-            Value::Text("results".into()),
-            Value::Map(vec![
-                (
-                    Value::Text("nym-1".into()),
-                    Value::Bytes(pseudonym.to_vec()),
-                ),
-                (Value::Text("age-1".into()), Value::Bool(true)),
-            ]),
-        ),
+        (Value::Text("results".into()), Value::Map(results)),
     ];
     if let Some(t) = proof_time {
         m.push((

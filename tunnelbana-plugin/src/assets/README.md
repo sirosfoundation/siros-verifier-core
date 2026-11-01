@@ -33,8 +33,10 @@ const result = await flow.start("dc-api");
 ```
 
 The invocation list controls which buttons appear. Scheme selection affects QR
-and direct links only; it never changes DCQL or the DC API request. The demo
-shows a SIROS spinner while a start is pending.
+and direct links only; it never changes DCQL or the DC API request. QR launches
+reuse one modal rather than appending QR codes. The SIROS spinner remains
+visible while the presentation is pending; success and error views provide a
+link back to the verifier.
 
 ## Backend contract and tenancy
 
