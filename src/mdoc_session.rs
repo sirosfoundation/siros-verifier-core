@@ -84,6 +84,14 @@ impl ReaderSession {
         &self.transcript
     }
 
+    /// Build a DeviceRequest and any ReaderAuth against this session's own transcript.
+    pub fn build_device_request(
+        &self,
+        documents: &[crate::mdoc_request::RequestedDocument<'_>],
+    ) -> Result<Vec<u8>> {
+        crate::mdoc_request::build_device_request(&self.transcript, documents)
+    }
+
     /// Verify a decrypted DeviceResponse against this session (transcript and reader key are the session's own).
     pub fn verify_response(
         &self,
@@ -239,6 +247,54 @@ fn cose_key_bytes(pk: &PublicKey) -> Vec<u8> {
     out
 }
 
+/// QR or NFC engagement handover. NDEF messages remain opaque application data;
+/// their exact bytes are bound into the session transcript.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Handover<'a> {
+    Qr,
+    Nfc {
+        select: &'a [u8],
+        request: Option<&'a [u8]>,
+    },
+}
+
+impl Handover<'_> {
+    pub fn to_cbor(&self) -> Result<Vec<u8>> {
+        match self {
+            Self::Qr => Ok(vec![0xf6]),
+            Self::Nfc { select, request } => {
+                if select.is_empty() || request.is_some_and(|message| message.is_empty()) {
+                    return Err(Error::Malformed("handover_empty_ndef".into()));
+                }
+                to_cbor(&Value::Array(vec![
+                    Value::Bytes(select.to_vec()),
+                    request.map_or(Value::Null, |message| Value::Bytes(message.to_vec())),
+                ]))
+            }
+        }
+    }
+}
+
+fn validate_handover_cbor(handover: &[u8]) -> Result<()> {
+    match parse_exact(handover, "handover_cbor")? {
+        Value::Null => Ok(()),
+        Value::Array(items) if items.len() == 2 => {
+            let select = matches!(&items[0], Value::Bytes(message) if !message.is_empty());
+            let request = match &items[1] {
+                Value::Null => true,
+                Value::Bytes(message) if !message.is_empty() => true,
+                _ => false,
+            };
+            if select && request {
+                Ok(())
+            } else {
+                Err(Error::Malformed("handover_shape".into()))
+            }
+        }
+        _ => Err(Error::Malformed("handover_shape".into())),
+    }
+}
+
 /// The reader's side of the handshake: owns a fresh ephemeral key that never leaves Rust.
 pub struct ReaderHandshake {
     sk: SecretKey,
@@ -260,6 +316,16 @@ impl ReaderHandshake {
     /// `EReaderKey` as a CBOR COSE_Key (public part only).
     pub fn ereader_cose_key(&self) -> Vec<u8> {
         cose_key_bytes(&self.sk.public_key())
+    }
+
+    /// Complete the handshake using a typed QR/NFC handover.
+    pub fn establish_with_handover(
+        self,
+        device_engagement: &[u8],
+        handover: Handover<'_>,
+    ) -> Result<ReaderSession> {
+        let handover = handover.to_cbor()?;
+        self.establish(device_engagement, &handover)
     }
 
     /// Complete the handshake from the scanned or received DeviceEngagement (raw CBOR, not tag-24 wrapped) and
@@ -292,7 +358,7 @@ impl ReaderHandshake {
             return Err(Error::Malformed("device_key_not_bytes".into()));
         };
         let edevice = crate::mdoc::cose_key_p256(&parse_exact(key_bytes, "device_key_cbor")?)?;
-        parse_exact(handover, "handover_cbor")?;
+        validate_handover_cbor(handover)?;
 
         let mut st = vec![0x83];
         st.extend(to_cbor(&Value::Tag(

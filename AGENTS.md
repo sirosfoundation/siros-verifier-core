@@ -15,6 +15,7 @@ This workspace contains a sans-I/O verification core, UniFFI and tunnelbana adap
 
 - `docs/CONFIGURATION.md` for the complete service schema and the canonical TOML files under `fixtures/siros-verifier/`.
 - `src/oid4vp.rs` for request/response policy, handovers, and bounded ECDH-ES decryption.
+- `src/mdoc_request.rs` for ordered DeviceRequest construction and ReaderAuth; `src/mdoc_session.rs` for QR/NFC handover and transport-independent session messages.
 - `zkp/src/verify.rs` for the two-phase response/trust/proof flow.
 - `zkp/src/circuits.rs` and `zkp/src/catalog.rs` for artifact integrity and startup prefetch.
 - `tunnelbana-plugin/src/lib.rs` for per-flow dispatch and independently validated ZK profiles.
@@ -47,6 +48,9 @@ Also run format-specific checks after relevant changes:
 cargo test -p siros-verifier-zkp --test longfellow_native
 cargo test -p siros-verifier-zkp --test vega_native
 cargo test -p siros-verifier-core-tunnelbana --test zkp_flow
+cargo test -p siros-verifier-core --test mdoc_request
+cargo test -p siros-verifier-core-ffi --all-features
+ffi/scripts/kotlin-test.sh
 cargo test -p siros-verifier-zkp --test catalog the_live_siros_nymauth_circuit_matches_the_native_test_vector -- --ignored
 npm test --prefix tunnelbana-plugin/src/assets
 ```
@@ -61,7 +65,8 @@ Native tests use genuine proof vectors and negative mutations. Do not replace th
 2. Register native backends through `BackendRegistry` and the existing `ProofBackend` trait. Do not bypass `check_claimed`, issuer-set policy, or go-trust.
 3. Keep catalog and file sources behind `ArtifactSource`; production uses startup `prefetch`.
 4. Add UI/backend profiles together and validate each plan at construction. Reject unknown systems and unsupported functions at startup.
-5. Add positive and negative tests, including public-input mutations and refusal codes. Update `docs/CONFIGURATION.md` for any schema change and this file for changed workflows.
+5. Keep proximity transport and NDEF parsing in the application. Use `kryptering::Signer` for the reader's long-term ReaderAuth key, never the ephemeral session key; sign exact tag-24 values and preserve their bytes. Do not hold the FFI session lock during a foreign signing callback.
+6. Add positive and negative tests, including public-input mutations and refusal codes. Update `docs/CONFIGURATION.md` for any schema change and this file for changed workflows.
 
 ## Releases
 

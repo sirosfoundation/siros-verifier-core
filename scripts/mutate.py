@@ -6,7 +6,7 @@ being removed. Usage: scripts/mutate.py  (run from the crate root)
 """
 import subprocess, sys, pathlib
 
-F = {"sd": "src/sdjwt.rs", "vp": "src/oid4vp.rs", "md": "src/mdoc.rs", "ms": "src/mdoc_session.rs", "rc": "src/receipt.rs", "tb": "tunnelbana-plugin/src/lib.rs", "tf": "tunnelbana-plugin/src/flow.rs", "js": "src/json_strict.rs", "ss": "src/session_seal.rs"}
+F = {"sd": "src/sdjwt.rs", "vp": "src/oid4vp.rs", "md": "src/mdoc.rs", "mr": "src/mdoc_request.rs", "ms": "src/mdoc_session.rs", "rc": "src/receipt.rs", "tb": "tunnelbana-plugin/src/lib.rs", "tf": "tunnelbana-plugin/src/flow.rs", "js": "src/json_strict.rs", "ss": "src/session_seal.rs"}
 M = [
  ("sd", 'if kbc.get("sd_hash").and_then(Value::as_str) != Some(expected.as_str()) {', 'if false {', "KB sd_hash"),
  ("sd", 'if w.used.len() != count {', 'if false {', "unreferenced disclosure"),
@@ -68,10 +68,16 @@ M = [
  ("md", 'return Err(malformed("duplicate_map_key"));', '', "mdoc duplicate map key"),
  ("md", '-4 => return Err(policy("cose_key_has_private_part")),', '-4 => {}', "mdoc cose key private"),
  ("md", 'if total > MAX_ITEMS {', 'if false {', "mdoc item limit"),
+ ("mr", 'if documents.is_empty() {', 'if false {', "request empty documents"),
+ ("mr", 'if duplicate(document.namespaces.iter().map(|ns| ns.namespace.as_str())) {', 'if false {', "request duplicate namespace"),
+ ("mr", 'if duplicate(\n            namespace\n                .elements\n                .iter()\n                .map(|element| element.identifier.as_str()),\n        ) {', 'if false {', "request duplicate element"),
+ ("mr", 'if params.signer.algorithm()\n        != (SignatureAlgorithm::Ecdsa(EcCurve::P256, HashAlgorithm::Sha256))', 'if false', "reader auth algorithm"),
+ ("mr", 'verify_es256(&leaf_key(leaf)?, &signing_input, &signature)?;', '', "reader auth signature"),
+ ("ms", 'if select.is_empty() || request.is_some_and(|message| message.is_empty()) {', 'if false {', "handover empty NDEF"),
  ("ms", 'Some(Value::Text(v)) if v == "1.0" || v == "1.1" => {}', 'Some(Value::Text(_)) => {}', "handshake engagement version"),
  ("ms", 'if sec.len() != 2 || sec[0] != Value::Integer(1.into()) {', 'if sec.len() != 2 {', "handshake cipher suite"),
  ("ms", 'let Value::Tag(24, inner) = &sec[1] else', 'let inner = &sec[1]; let Value::Tag(_, inner) = inner else', "handshake device key tag24"),
- ("ms", 'parse_exact(handover, "handover_cbor")?;', '', "handshake handover validated"),
+ ("ms", 'validate_handover_cbor(handover)?;', '', "handshake handover validated"),
  ("ms", 'if !cur.is_empty() {\n        return Err(Error::Malformed(format!("{what}_trailing_bytes")));', 'if false {\n        return Err(Error::Malformed(format!("{what}_trailing_bytes")));', "handshake trailing bytes"),
  ("ms", 'if self.sent != 0 {\n            return Err(Error::Policy("already_established".into()));', 'if false {\n            return Err(Error::Policy("already_established".into()));', "handshake establishment once"),
  ("ms", 'if self.sent == 0 {\n            return Err(Error::Policy("not_established".into()));', 'if false {\n            return Err(Error::Policy("not_established".into()));', "handshake data before establishment"),

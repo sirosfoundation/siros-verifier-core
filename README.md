@@ -117,11 +117,16 @@ The FFI `Reader` accepts whole CBOR messages and leaves BLE/NFC transport to the
 application:
 
 1. `Reader.start(deviceEngagement, handover)` establishes the reader session.
-2. `establishment_message(deviceRequest)` and `data_message(deviceRequest)`
+   `nfcHandoverCbor(select, request)` encodes static or negotiated NFC handovers.
+2. `buildDeviceRequest` builds ordered DocumentRequests. For ReaderAuth, supply
+   the leaf-first certificate chain and a `ReaderAuthSigner` callback; the host
+   signs the exact COSE input with its long-term P-256 key and returns raw
+   `r || s`. The ephemeral session key remains inside Rust.
+3. `establishment_message(deviceRequest)` and `data_message(deviceRequest)`
    produce messages for the wallet.
-3. `open_response(sessionData, now, acceptedDocTypes)` decrypts and verifies the
+4. `open_response(sessionData, now, acceptedDocTypes)` decrypts and verifies the
    DeviceResponse.
-4. The application submits each document's AuthZEN request to its PDP and uses
+5. The application submits each document's AuthZEN request to its PDP and uses
    the returned elements only after a permit decision.
 
 See [`ffi/src/lib.rs`](ffi/src/lib.rs) for the exported API and
