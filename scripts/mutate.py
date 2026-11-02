@@ -126,7 +126,7 @@ M = [
  ("tb", 'max_ttl: if answer.trust_data.is_empty() {\n                self.max_ttl.min(self.no_freshness_ttl)\n            } else {\n                self.max_ttl\n            },', 'max_ttl: self.max_ttl,', "plugin no-freshness lifetime cap"),
  ("tb", 'if url.scheme() != "https" && !(url.scheme() == "http" && (loopback || allow_http)) {', 'if false {', "plugin pdp scheme"),
  ("tb", 'let loopback = matches!(\n            url.host_str(),\n            Some("127.0.0.1") | Some("localhost") | Some("[::1]")\n        );', 'let loopback = true;', "plugin pdp loopback only"),
- ("tb", '.redirect(reqwest::redirect::Policy::none())', '', "plugin pdp no redirects"),
+ ("tb", '.timeout(timeout)\n            .redirect(reqwest::redirect::Policy::none())', '.timeout(timeout)\n            .redirect(reqwest::redirect::Policy::limited(10))', "plugin pdp no redirects"),
  ("tb", 'if !resp.status().is_success() {', 'if false {', "plugin pdp status"),
  ("tb", 'rb = rb.bearer_auth(b);', '', "plugin pdp bearer"),
  ("tb", 'if body.len() > 1 << 20 {', 'if false {', "plugin pdp size limit"),
