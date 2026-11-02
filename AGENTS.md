@@ -4,7 +4,7 @@
 
 This workspace contains a sans-I/O verification core, UniFFI and tunnelbana adapters, the HTTP service, and native Longfellow/Vega nym_auth backends. Keep changes small and protocol-specific.
 
-- **go-trust makes every issuer and verifier trust decision.** Never create a parallel trust decision in Rust, the circuit catalog, the UI, or deployment fixtures.
+- **go-trust makes every issuer and verifier trust decision, including status-list signer trust.** Never create a parallel trust decision in Rust, the circuit catalog, the UI, or deployment fixtures.
 - The circuit catalog supplies artifacts only. Enforce exact allowlist parameters and decompressed hash/size; startup prefetch must not become request-time network I/O.
 - Keep SD-JWT and mdoc dispatch intact when adding formats. A flow selects its verifier from its own validated DCQL and sealed session.
 - Do not take the verifier's statement from wallet input. Transcript, nonce, verifier identity, age bounds, and acceptable issuer keys are verifier-owned; the pseudonym is an output.
@@ -16,6 +16,7 @@ This workspace contains a sans-I/O verification core, UniFFI and tunnelbana adap
 - `docs/CONFIGURATION.md` for the complete service schema and the canonical TOML files under `fixtures/siros-verifier/`.
 - `src/oid4vp.rs` for request/response policy, handovers, and bounded ECDH-ES decryption.
 - `src/mdoc_request.rs` for ordered DeviceRequest construction and ReaderAuth; `src/mdoc_session.rs` for QR/NFC handover and transport-independent session messages.
+- `src/status_list.rs` for sans-I/O JWT status-list verification; the tunnelbana adapter owns bounded fetching and go-trust signer evaluation.
 - `zkp/src/verify.rs` for the two-phase response/trust/proof flow.
 - `zkp/src/circuits.rs` and `zkp/src/catalog.rs` for artifact integrity and startup prefetch.
 - `tunnelbana-plugin/src/lib.rs` for per-flow dispatch and independently validated ZK profiles.

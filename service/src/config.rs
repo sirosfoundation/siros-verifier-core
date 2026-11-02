@@ -49,6 +49,9 @@ pub struct DeploymentConfig {
     /// development network. Leave false in production.
     #[serde(default)]
     pub allow_insecure_http: bool,
+    /// Local test-only escape hatch for a self-signed status-list endpoint.
+    #[serde(default)]
+    pub allow_invalid_status_list_certificates: bool,
     #[serde(default)]
     pub receipt_key_id: Option<String>,
     #[serde(default)]

@@ -102,6 +102,15 @@ fn happy_path_end_to_end() {
         .get("d")
         .is_none());
     assert_eq!(payload["aud"], "https://self-issued.me/v2");
+    for key in ["nonce", "state"] {
+        assert_eq!(
+            jose_rs::base64url::decode(payload[key].as_str().unwrap())
+                .unwrap()
+                .len(),
+            32,
+            "{key} must carry 256 bits of fresh entropy"
+        );
+    }
     assert!(session.client_id.starts_with("x509_hash:"));
 
     let sel = [

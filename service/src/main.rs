@@ -17,8 +17,8 @@ use mongo_store::{MongoFlowStore, MongoTokenUseStore};
 use siros_verifier_core::oid4vp;
 use siros_verifier_core::session_seal::SessionSealer;
 use siros_verifier_core_tunnelbana::{
-    system_clock, ui::UiFrontend, FlowStore, HttpPdp, MemoryFlowStore, PdpClient, TrustGate,
-    VpBackend,
+    system_clock, ui::UiFrontend, FlowStore, HttpPdp, MemoryFlowStore, PdpClient,
+    ReqwestStatusListClient, TrustGate, VpBackend,
 };
 use siros_verifier_zkp::backend::{BackendRegistry, ProofBackend, SystemProfile};
 use siros_verifier_zkp::catalog::CatalogArtifactSource;
@@ -355,7 +355,18 @@ async fn build_openid4vp_backend(
         let verifier = build_zkp_verifier(&zkp)?;
         backend = backend.with_zkp(zkp.backend, verifier)?;
     }
-    let backend = backend.with_flow_store(store).with_session_sealer(sealer);
+    let status_list_client = if deployment.allow_invalid_status_list_certificates {
+        ReqwestStatusListClient::new_allow_invalid_certificates_for_testing(
+            std::time::Duration::from_secs(5),
+        )
+    } else {
+        ReqwestStatusListClient::new(std::time::Duration::from_secs(5))
+    }
+    .map_err(|e| anyhow!(e))?;
+    let backend = backend
+        .with_flow_store(store)
+        .with_session_sealer(sealer)
+        .with_status_list_client(Arc::new(status_list_client));
     tracing::info!(name = %plugin.name, pdp = %deployment.pdp_endpoint, storage = %deployment.storage.backend, "loaded OpenID4VP backend");
     Ok(Box::new(backend))
 }

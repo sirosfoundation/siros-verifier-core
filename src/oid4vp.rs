@@ -259,7 +259,7 @@ pub fn x509_hash_client_id(leaf_der: &[u8]) -> String {
 }
 
 fn random_token() -> String {
-    let mut b = [0u8; 16];
+    let mut b = [0u8; 32];
     getrandom::fill(&mut b).expect("OS randomness");
     b64u(&b)
 }

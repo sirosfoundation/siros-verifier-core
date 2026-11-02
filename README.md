@@ -18,7 +18,7 @@ over AuthZEN.**
 
 | Flow | Functionality |
 | --- | --- |
-| SD-JWT VC over OpenID4VP | Signed requests, redirect and W3C DC API handovers, encrypted responses, SD-JWT and key-binding verification, and verified-claim extraction |
+| SD-JWT VC over OpenID4VP | Signed requests, redirect and W3C DC API handovers, encrypted responses, SD-JWT and key-binding verification, verified-claim extraction, and JWT status-list revocation checks |
 | ISO/IEC 18013-5 mdoc | DeviceResponse verification, issuer and device authentication, reader sessions, and OpenID4VP or proximity engagement |
 | `zkp_req` nym_auth | Pseudonym and `age_check` verification with native Longfellow and Vega backends, exact circuit pins, and verifier-scoped pseudonyms |
 | TS 119 602 metadata | Schema and VCTM/MDDL parsing, SRI validation, and registry-backed DCQL preset generation |
