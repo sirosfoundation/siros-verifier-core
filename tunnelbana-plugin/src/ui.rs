@@ -5,6 +5,7 @@
 //! the verified internal attributes when the backend completes.
 
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use siros_verifier_core::oid4vp;
@@ -285,37 +286,43 @@ impl Frontend for UiFrontend {
 }
 
 pub(crate) fn page(title: &str, body: &str) -> String {
+    let logo = BASE64.encode(include_bytes!("assets/siros-logo.png"));
     format!(
         r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{title} · SIROS verifier</title>
 <style>
-:root {{ color-scheme: light dark; font-family: system-ui,sans-serif; }}
-body {{ margin:0; min-height:100vh; display:grid; place-items:center; background:#f3f5f8; color:#172033; }}
-main {{ box-sizing:border-box; width:min(92vw,680px); margin:32px 0; padding:32px; border-radius:16px; background:#fff; box-shadow:0 8px 32px #17203318; }}
-h1 {{ margin-top:0; font-size:1.7rem; }} p {{ line-height:1.5; }}
+:root {{ color-scheme: light dark; font-family:'Helvetica Neue',Arial,system-ui,sans-serif; }}
+body {{ margin:0; min-height:100vh; background:#f3f5f8; color:#172033; }}
+.navbar {{ background:#fff; border-bottom:1px solid #e0e0e0; }}
+.navbar-inner {{ box-sizing:border-box; width:min(92vw,680px); margin:0 auto; padding:10px 0; display:flex; align-items:center; }}
+.navbar-brand {{ display:flex; align-items:center; gap:12px; color:#1C4587; text-decoration:none; font-weight:600; font-size:1.1rem; }}
+.navbar-brand img {{ display:block; height:40px; width:auto; }}
+main {{ box-sizing:border-box; width:min(92vw,680px); margin:32px auto; padding:32px; border-radius:16px; background:#fff; box-shadow:0 8px 32px #17203318; }}
+h1 {{ margin-top:0; color:#1C4587; font-size:1.7rem; }} h2 {{ color:#1C4587; }} p {{ line-height:1.5; }}
 .choices {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:16px; margin-top:28px; }}
 a.choice {{ display:block; padding:20px; border:1px solid #d8dee9; border-radius:12px; color:inherit; text-decoration:none; }}
-a.choice:hover,a.choice:focus {{ border-color:#3167d5; outline:none; }}
-.choice strong {{ display:block; color:#214faa; margin-bottom:8px; }}
+a.choice:hover,a.choice:focus {{ border-color:#1C4587; outline:none; }}
+.choice strong {{ display:block; color:#1C4587; margin-bottom:8px; }}
 .presentation-flow > label {{ display:block; margin:18px 0 8px; font-weight:600; }}
 .presentation-flow select,.presentation-flow textarea {{ box-sizing:border-box; width:100%; margin-top:6px; padding:10px; border:1px solid #aab5c5; border-radius:8px; background:inherit; color:inherit; font:inherit; }}
 .presentation-flow textarea {{ min-height:260px; font-family:ui-monospace,monospace; font-size:.88rem; }}
 .claim-options {{ display:block; margin:16px 0; }}
 .claim-options option::before {{ content:"☐ "; }} .claim-options option:checked::before {{ content:"☑ "; }}
 .flow-actions {{ display:flex; flex-wrap:wrap; gap:12px; margin-top:20px; }}
-.flow-actions button {{ padding:11px 18px; border:1px solid #3167d5; border-radius:8px; background:#3167d5; color:white; cursor:pointer; }}
-.flow-actions button:nth-child(n+2) {{ background:transparent; color:#3167d5; }}
-.wallet-launch {{ margin-top:24px; }} .wallet-launch a {{ color:#214faa; overflow-wrap:anywhere; }}
+.flow-actions button {{ padding:11px 18px; border:1px solid #1C4587; border-radius:8px; background:#1C4587; color:white; cursor:pointer; }}
+.flow-actions button:nth-child(n+2) {{ background:transparent; color:#1C4587; }}
+.wallet-launch {{ margin-top:24px; }} .wallet-launch a {{ color:#1C4587; overflow-wrap:anywhere; }}
+.wallet-launch-dialog {{ max-width:min(92vw,560px); border:0; border-radius:16px; }}
+.wallet-launch-dialog::backdrop {{ background:#17203380; }}
 .qr-code {{ display:grid; place-items:center; background:white; padding:16px; border-radius:12px; margin:16px 0; }}
-.siros-spinner {{ display:flex; gap:5px; align-items:center; justify-content:center; margin:20px 0; font-weight:800; letter-spacing:.2em; color:#3167d5; }}
-.siros-spinner span {{ animation:siros-pulse 1.2s infinite ease-in-out; }} .siros-spinner span:nth-child(2) {{ animation-delay:.1s; }} .siros-spinner span:nth-child(3) {{ animation-delay:.2s; }} .siros-spinner span:nth-child(4) {{ animation-delay:.3s; }} .siros-spinner span:nth-child(5) {{ animation-delay:.4s; }}
-@keyframes siros-pulse {{ 0%,100% {{ opacity:.25; transform:translateY(0); }} 50% {{ opacity:1; transform:translateY(-4px); }} }}
+.siros-spinner {{ box-sizing:border-box; width:28px; height:28px; margin:20px auto; border:3px solid #1C458733; border-top-color:#1C4587; border-radius:50%; animation:siros-spin .8s linear infinite; }}
+@keyframes siros-spin {{ to {{ transform:rotate(360deg); }} }}
 dl {{ display:grid; grid-template-columns:minmax(0,1fr) minmax(0,2fr); gap:10px 16px; }}
 dt {{ font-weight:650; overflow-wrap:anywhere; }} dd {{ margin:0; overflow-wrap:anywhere; }}
-a.back {{ display:inline-block; margin-top:24px; color:#214faa; }}
-@media (prefers-color-scheme:dark) {{ body {{ background:#111722; color:#e7ebf3; }} main {{ background:#1b2432; }} a.choice {{ border-color:#3a4658; }} .choice strong,a.back {{ color:#8eb2ff; }} }}
-</style></head><body><main>{body}</main></body></html>"#
+a.back {{ display:inline-block; margin-top:24px; color:#1C4587; }}
+@media (prefers-color-scheme:dark) {{ body {{ background:#111722; color:#e7ebf3; }} main,.wallet-launch-dialog {{ background:#1b2432; }} h1,h2,.choice strong,a.back {{ color:#8eb2ff; }} a.choice {{ border-color:#3a4658; }} }}
+</style></head><body><header class="navbar"><div class="navbar-inner"><a class="navbar-brand" href="/"><img src="data:image/png;base64,{logo}" alt="SIROS Foundation"><span>Verifier</span></a></div></header><main>{body}</main></body></html>"#
     )
 }
 
@@ -424,6 +431,10 @@ mod tests {
         assert!(html.contains("/ui/assets/demo.js"));
         assert!(html.contains("presentation-catalog"));
         assert!(html.contains("dc-api"));
+        assert!(html.contains("navbar-brand"));
+        assert!(html.contains("data:image/png;base64,"));
+        assert!(html.contains("alt=\"SIROS Foundation\""));
+        assert!(!html.contains("<footer"));
         assert!(html.contains(".claim-options option::before"));
         assert!(html.contains(".claim-options option:checked::before"));
         assert!(!html.contains("haip-vp"));

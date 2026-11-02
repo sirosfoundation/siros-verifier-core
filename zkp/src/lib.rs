@@ -12,4 +12,5 @@ pub mod request;
 #[cfg(feature = "testutil")]
 pub mod testutil;
 pub mod transcript;
+pub mod vega;
 pub mod verify;

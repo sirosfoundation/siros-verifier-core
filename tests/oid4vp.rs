@@ -617,6 +617,15 @@ fn response_jwe_policy_and_structure_checks_survive_the_library_migration() {
             "header {name}"
         );
     }
+    let unsupported_enc =
+        mutate_jwe_header(&token, |header| header["enc"] = json!("A128CBC-HS256"));
+    match process_response(&s, &unsupported_enc, NOW, &X5cLeaf) {
+        Err(Error::Policy(message)) => {
+            assert_eq!(message, "unsupported response enc in protected header")
+        }
+        other => panic!("unexpected unsupported-enc result: {:?}", other.err()),
+    }
+
     let private_epk = mutate_jwe_header(&token, |header| {
         header["epk"]["d"] = json!(jose_rs::base64url::encode(&[3u8; 32]));
     });

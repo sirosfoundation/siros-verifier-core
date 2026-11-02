@@ -102,6 +102,9 @@ fn unknown_systems_and_configurations_are_refused() {
     let mut c = longfellow();
     c.system_id.clear();
     assert!(Allowlist::new(&cfg(vec![c])).is_err());
+    let mut c = vega();
+    c.config = CONFIG_KNOWN_OFFENDER_MATCHING_PSC.into();
+    assert!(err(Allowlist::new(&cfg(vec![c]))).contains("Vega nym_auth only supports"));
 }
 
 #[test]

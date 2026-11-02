@@ -73,8 +73,12 @@ fn default_ttl() -> i64 {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ZkpBackendConfig {
-    /// The `zkp_req` credential query (one element of `dcql_query.credentials`).
-    pub query: Value,
+    /// The legacy single `zkp_req` credential query. New configurations may
+    /// instead use `profiles` for multiple independently validated presets.
+    #[serde(default)]
+    pub query: Option<Value>,
+    #[serde(default)]
+    pub profiles: Vec<ZkpProfileConfig>,
     pub system_id_values: Vec<String>,
     #[serde(default)]
     pub proof_system_values: Vec<String>,
@@ -82,7 +86,8 @@ pub struct ZkpBackendConfig {
     pub role: String,
     #[serde(default = "default_ttl")]
     pub request_ttl_secs: i64,
-    /// Pseudonym handle that becomes `subject_id`.
+    /// Pseudonym handle for the legacy single-query form.
+    #[serde(default)]
     pub subject_handle: String,
     /// Internal attribute name -> result handle.
     #[serde(default)]
@@ -92,6 +97,18 @@ pub struct ZkpBackendConfig {
     /// Rulebook verifier identity (`x509_san_dns:` or `semantic_id:`), which
     /// is deliberately distinct from the OpenID4VP x509_hash client ID.
     pub verifier_id: String,
+}
+
+/// One independently validated `zkp_req` preset.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ZkpProfileConfig {
+    pub query: Value,
+    /// Pseudonym handle that becomes `subject_id`.
+    pub subject_handle: String,
+    /// Internal attribute name -> result handle.
+    #[serde(default)]
+    pub attribute_map: BTreeMap<String, String>,
 }
 
 // ---- seams ---------------------------------------------------------------------------------
@@ -387,8 +404,13 @@ pub struct VpBackend {
 struct ZkpMode {
     cfg: ZkpBackendConfig,
     verifier: ZkpVerifier,
-    plan: siros_dc_matcher_core::zkp_req::Plan,
+    profiles: Vec<ZkpProfile>,
     vp_formats: Value,
+}
+
+struct ZkpProfile {
+    cfg: ZkpProfileConfig,
+    plan: siros_dc_matcher_core::zkp_req::Plan,
 }
 
 impl ZkpMode {
@@ -398,43 +420,80 @@ impl ZkpMode {
             offered["proof_system_values"] = serde_json::json!(zcfg.proof_system_values);
         }
         let vp_formats = serde_json::json!({ "zkp_req": offered });
-        let plan = siros_dc_matcher_core::zkp_req::plan(
-            &zcfg.query.to_string(),
-            Some(&serde_json::json!({ "vp_formats_supported": vp_formats }).to_string()),
-        )
-        .map_err(|e| Error::Config(format!("zkp query: {}", e.code())))?;
-        siros_dc_matcher_core::zkp_req::unsatisfiable(&plan)
-            .map_err(|e| Error::Config(format!("zkp query cannot be satisfied: {}", e.code())))?;
-        let handles: Vec<&str> = plan.functions.iter().map(|f| f.handle.as_str()).collect();
-        let pseudonyms: Vec<&str> = plan
-            .functions
-            .iter()
-            .filter(|f| f.function_id == "pseudonym")
-            .map(|f| f.handle.as_str())
-            .collect();
-        if !pseudonyms.contains(&zcfg.subject_handle.as_str()) {
-            return Err(Error::Config(format!(
-                "subject_handle {:?} is not a pseudonym handle of the query ({pseudonyms:?})",
-                zcfg.subject_handle
-            )));
+        let metadata = serde_json::json!({ "vp_formats_supported": vp_formats }).to_string();
+        let mut configs = Vec::new();
+        if let Some(query) = zcfg.query.clone() {
+            configs.push(ZkpProfileConfig {
+                query,
+                subject_handle: zcfg.subject_handle.clone(),
+                attribute_map: zcfg.attribute_map.clone(),
+            });
         }
-        for (k, h) in &zcfg.attribute_map {
-            if !handles.contains(&h.as_str()) {
+        configs.extend(zcfg.profiles.clone());
+        if configs.is_empty() {
+            return Err(Error::Config(
+                "at least one zkp_req query profile is required".into(),
+            ));
+        }
+        let mut profiles: Vec<ZkpProfile> = Vec::with_capacity(configs.len());
+        for cfg in configs {
+            let dcql = Self::dcql(&cfg);
+            if profiles
+                .iter()
+                .any(|profile| Self::dcql(&profile.cfg) == dcql)
+            {
+                return Err(Error::Config(
+                    "two zkp_req profiles contain the same query".into(),
+                ));
+            }
+            let plan =
+                siros_dc_matcher_core::zkp_req::plan(&cfg.query.to_string(), Some(&metadata))
+                    .map_err(|e| Error::Config(format!("zkp query: {}", e.code())))?;
+            siros_dc_matcher_core::zkp_req::unsatisfiable(&plan).map_err(|e| {
+                Error::Config(format!("zkp query cannot be satisfied: {}", e.code()))
+            })?;
+            let handles: Vec<&str> = plan.functions.iter().map(|f| f.handle.as_str()).collect();
+            let pseudonyms: Vec<&str> = plan
+                .functions
+                .iter()
+                .filter(|f| f.function_id == "pseudonym")
+                .map(|f| f.handle.as_str())
+                .collect();
+            if !pseudonyms.contains(&cfg.subject_handle.as_str()) {
                 return Err(Error::Config(format!(
-                    "attribute {k}: no result handle {h:?} in the query"
+                    "subject_handle {:?} is not a pseudonym handle of the query ({pseudonyms:?})",
+                    cfg.subject_handle
                 )));
             }
+            for (k, h) in &cfg.attribute_map {
+                if !handles.contains(&h.as_str()) {
+                    return Err(Error::Config(format!(
+                        "attribute {k}: no result handle {h:?} in the query"
+                    )));
+                }
+            }
+            profiles.push(ZkpProfile { cfg, plan });
         }
         Ok(Self {
             cfg: zcfg,
             verifier,
-            plan,
+            profiles,
             vp_formats,
         })
     }
 
-    fn dcql(&self) -> Value {
-        serde_json::json!({ "credentials": [self.cfg.query] })
+    fn dcql(cfg: &ZkpProfileConfig) -> Value {
+        serde_json::json!({ "credentials": [cfg.query] })
+    }
+
+    fn default_profile(&self) -> &ZkpProfile {
+        &self.profiles[0]
+    }
+
+    fn profile_for_query(&self, query: &Value) -> Option<&ZkpProfile> {
+        self.profiles
+            .iter()
+            .find(|profile| Self::dcql(&profile.cfg) == *query)
     }
 }
 
@@ -578,7 +637,7 @@ impl VpBackend {
     ) -> Result<Self> {
         let mode = ZkpMode::new(zcfg, verifier)?;
         let cfg = VpBackendConfig {
-            dcql: mode.dcql(),
+            dcql: ZkpMode::dcql(&mode.default_profile().cfg),
             attribute_map: BTreeMap::new(),
             subject_pointer: String::new(),
             role: mode.cfg.role.clone(),
@@ -908,6 +967,16 @@ impl VpBackend {
                     .await;
             }
         };
+        let Some(profile) = z.profile_for_query(&session.dcql_query) else {
+            return self
+                .fail(
+                    id,
+                    claim_id,
+                    "verifier_error",
+                    Response::text(500, "verifier error"),
+                )
+                .await;
+        };
         let thumbprint =
             match jose_rs::jwk::thumbprint::thumbprint_sha256(&session.enc_key.to_public_jwk())
                 .and_then(|encoded| jose_rs::base64url::decode(&encoded))
@@ -930,7 +999,7 @@ impl VpBackend {
             encrypted: true,
         };
         let exchange = Exchange {
-            plan: &z.plan,
+            plan: &profile.plan,
             channel: &channel,
             nonce: &session.nonce,
             reader_thumbprint: Some(&thumbprint),
@@ -991,7 +1060,7 @@ impl VpBackend {
                 )
                 .await;
         };
-        let mut data = match self.map_zkp(z, first) {
+        let mut data = match self.map_zkp(z, profile, first) {
             Ok(d) => d,
             Err(code) => {
                 return self
@@ -1033,6 +1102,7 @@ impl VpBackend {
     fn map_zkp(
         &self,
         z: &ZkpMode,
+        profile: &ZkpProfile,
         presentation: &VerifiedPresentation,
     ) -> std::result::Result<InternalData, String> {
         use base64::Engine;
@@ -1049,7 +1119,7 @@ impl VpBackend {
             subject_type: SubjectType::Pairwise,
             ..Default::default()
         };
-        for (name, handle) in &z.cfg.attribute_map {
+        for (name, handle) in &profile.cfg.attribute_map {
             if let Some(pseudonym) = presentation.pseudonyms.get(handle) {
                 data.attributes
                     .insert(name.clone(), vec![encode(pseudonym)]);
@@ -1059,7 +1129,7 @@ impl VpBackend {
         }
         let subject = presentation
             .pseudonyms
-            .get(&z.cfg.subject_handle)
+            .get(&profile.cfg.subject_handle)
             .ok_or_else(|| "no_pseudonym_for_handle".to_owned())?;
         data.subject_id = Some(encode(subject));
         Ok(data)
@@ -1183,10 +1253,14 @@ fn html_escape(s: &str) -> String {
 }
 
 fn waiting_page(module_base: &str) -> Response {
-    Response::html(format!(
-        "<!doctype html><meta charset=utf-8><meta http-equiv=refresh content=\"2;url={}/complete\"><p>Waiting for your wallet…</p>",
+    let body = format!(
+        r#"<h1>Waiting for your wallet</h1>
+<div class="siros-spinner" role="status" aria-label="Verification in progress"></div>
+<p>This page will show the verified response or an error when the presentation finishes.</p>
+<meta http-equiv="refresh" content="2;url={}/complete">"#,
         html_escape(module_base)
-    ))
+    );
+    Response::html(ui::page("Waiting for your wallet", &body))
 }
 
 fn qr_page(module_base: &str, link: &str) -> Result<Response> {
@@ -1278,9 +1352,9 @@ impl Backend for VpBackend {
             let mode = self.zkp.as_ref().ok_or_else(|| {
                 Error::BadRequest("zkp_req is not configured for this backend".into())
             })?;
-            if dcql_query != mode.dcql() {
+            if mode.profile_for_query(&dcql_query).is_none() {
                 return Err(Error::BadRequest(
-                    "only the configured zkp_req preset is supported".into(),
+                    "only a configured zkp_req preset is supported".into(),
                 ));
             }
             Some(mode)
@@ -1406,6 +1480,17 @@ mod page_tests {
         assert!(html.contains("<svg"));
         assert!(html.contains("openid4vp://cb"));
         assert!(html.contains("/vp/complete"));
+    }
+
+    #[test]
+    fn complete_page_shows_a_neutral_spinner_while_pending() {
+        let response = waiting_page("https://verifier.example/vp");
+        let html = String::from_utf8(response.body).unwrap();
+        assert!(html.contains("class=\"siros-spinner\""));
+        assert!(html.contains("Verification in progress"));
+        assert!(html.contains("/vp/complete"));
+        assert!(html.contains("navbar-brand"));
+        assert!(!html.contains("siros-pulse"));
     }
 
     #[test]

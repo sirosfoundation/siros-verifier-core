@@ -75,6 +75,14 @@ export function claimLabel(claim) {
   return claim.path?.[claim.path.length - 1] ?? "claim";
 }
 
+function createSirosSpinner() {
+  const spinner = document.createElement("div");
+  spinner.className = "siros-spinner";
+  spinner.setAttribute("role", "status");
+  spinner.setAttribute("aria-label", "Verification in progress");
+  return spinner;
+}
+
 export class PresentationFlow {
   constructor({root, presets, invocations, schemes = ["openid4vp"], startPath = "/ui/start", tenant = "", backendOrigins = [window.location.origin], dcApiAdapter = null, pollMs = 2000, onResult = null, onError = null}) {
     if (!(root instanceof HTMLElement)) throw new TypeError("root must be an HTMLElement");
@@ -167,8 +175,9 @@ export class PresentationFlow {
         try {
           const result = await this.start(mechanism);
           if (this.onResult) this.onResult(result);
-          else window.location.assign(result.complete_uri);
+          else this.renderResult(result);
         } catch (error) {
+          this.renderError(error);
           if (this.onError) this.onError(error);
           else this.setStatus(error.message || String(error));
         }
@@ -236,6 +245,7 @@ export class PresentationFlow {
 
   async start(mechanism) {
     const run = ++this.runId;
+    if (mechanism !== "qr" && this.launchDialog?.open) this.launchDialog.close();
     this.setBusy(true);
     this.setStatus("Creating the presentation request…");
     try {
@@ -292,30 +302,75 @@ export class PresentationFlow {
   }
 
   renderLaunch(mechanism, payload) {
-    const section = document.createElement("section");
-    section.className = "wallet-launch";
+    if (mechanism !== "qr") {
+      if (!this.directLink) {
+        this.directLink = document.createElement("a");
+        this.root.append(this.directLink);
+      }
+      this.directLink.href = payload.authorization_request;
+      this.directLink.textContent = "Open the presentation request in your wallet";
+      this.setStatus("Waiting for the wallet response…");
+      return;
+    }
+    if (!this.launchDialog) {
+      this.launchDialog = document.createElement("dialog");
+      this.launchDialog.className = "wallet-launch wallet-launch-dialog";
+      this.root.append(this.launchDialog);
+    }
+    const dialog = this.launchDialog;
+    dialog.replaceChildren();
     const heading = document.createElement("h2");
-    heading.textContent = mechanism === "qr" ? "Scan with your wallet" : "Open your wallet";
-    section.append(heading);
+    heading.textContent = "Scan with your wallet";
+    dialog.append(heading);
+    const container = document.createElement("div");
+    container.className = "qr-code";
+    container.innerHTML = payload.qr_code;
+    dialog.append(container);
     const anchor = document.createElement("a");
     anchor.href = payload.authorization_request;
     anchor.textContent = "Open the presentation request in your wallet";
-    section.append(anchor);
-    if (mechanism === "qr") {
-      const container = document.createElement("div");
-      container.className = "qr-code";
-      container.innerHTML = payload.qr_code;
-      section.append(container);
-    }
+    dialog.append(anchor);
     const details = document.createElement("details");
     const summary = document.createElement("summary");
     summary.textContent = "Authorization request URI";
     const code = document.createElement("code");
     code.textContent = payload.authorization_request;
     details.append(summary, code);
-    section.append(details);
-    this.root.append(section);
+    dialog.append(details);
+    const close = document.createElement("button");
+    close.type = "button";
+    close.textContent = "Close";
+    close.addEventListener("click", () => dialog.close());
+    dialog.append(close);
+    if (dialog.open) dialog.close();
+    if (typeof dialog.showModal === "function") dialog.showModal();
+    else dialog.setAttribute("open", "");
     this.setStatus("Waiting for the wallet response…");
+  }
+
+  renderResult(result) {
+    window.location.assign(result.complete_uri);
+  }
+
+  renderError(error) {
+    if (this.launchDialog?.open) this.launchDialog.close();
+    if (!this.outcome) {
+      this.outcome = document.createElement("section");
+      this.outcome.className = "presentation-outcome";
+      this.root.append(this.outcome);
+    }
+    this.outcome.replaceChildren();
+    const heading = document.createElement("h2");
+    heading.textContent = "Presentation failed";
+    this.outcome.append(heading);
+    const message = document.createElement("p");
+    message.textContent = error.message || String(error);
+    this.outcome.append(message);
+    const back = document.createElement("a");
+    back.href = "/";
+    back.textContent = "Back to the verifier";
+    this.outcome.append(back);
+    this.setStatus(error.message || String(error));
   }
 
   async poll(statusUri, run) {
@@ -342,18 +397,11 @@ export class PresentationFlow {
   }
 
   setBusy(busy) {
-    this.root.querySelector(".siros-spinner")?.remove();
+    this.busySpinner?.remove();
+    this.busySpinner = null;
     if (!busy) return;
-    const spinner = document.createElement("div");
-    spinner.className = "siros-spinner";
-    spinner.setAttribute("role", "status");
-    spinner.setAttribute("aria-label", "Verification in progress");
-    for (const letter of "SIROS") {
-      const span = document.createElement("span");
-      span.textContent = letter;
-      spinner.append(span);
-    }
-    this.root.append(spinner);
+    this.busySpinner = createSirosSpinner();
+    this.root.append(this.busySpinner);
   }
 
   stopPolling() {

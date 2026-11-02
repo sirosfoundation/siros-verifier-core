@@ -25,7 +25,8 @@ use siros_verifier_zkp::catalog::CatalogArtifactSource;
 use siros_verifier_zkp::circuits::Allowlist;
 use siros_verifier_zkp::functions::FunctionRegistry;
 use siros_verifier_zkp::longfellow::LongfellowBackend;
-use siros_verifier_zkp::nym_auth::SYSTEM_LONGFELLOW;
+use siros_verifier_zkp::nym_auth::{SYSTEM_LONGFELLOW, SYSTEM_VEGA};
+use siros_verifier_zkp::vega::VegaBackend;
 use siros_verifier_zkp::verify::{VerifierPolicy, ZkpVerifier};
 use tunnelbana_core::attributes::AttributeMapper;
 use tunnelbana_core::config::ProxyConfig;
@@ -236,16 +237,23 @@ fn build_zkp_verifier(config: &ZkpDeploymentConfig) -> anyhow::Result<ZkpVerifie
     let mut backends = BackendRegistry::new();
     for allowed in allowlist.allowed() {
         let system = allowed.split(' ').next().unwrap_or_default();
-        if system != SYSTEM_LONGFELLOW {
-            anyhow::bail!("proof system {system:?} has no registered native backend in this build");
-        }
         backends
             .register(
                 system,
                 SystemProfile::single_issuer_age_check(),
                 |entry, bytes| {
-                    LongfellowBackend::from_entry(entry, bytes)
-                        .map(|backend| Box::new(backend) as Box<dyn ProofBackend>)
+                    if entry.system_id == SYSTEM_LONGFELLOW {
+                        LongfellowBackend::from_entry(entry, bytes)
+                            .map(|backend| Box::new(backend) as Box<dyn ProofBackend>)
+                    } else if entry.system_id == SYSTEM_VEGA {
+                        VegaBackend::from_entry(entry, bytes)
+                            .map(|backend| Box::new(backend) as Box<dyn ProofBackend>)
+                    } else {
+                        Err(siros_verifier_zkp::refusal::ZkpError::fault(format!(
+                            "proof system {:?} has no registered native backend in this build",
+                            entry.system_id
+                        )))
+                    }
                 },
             )
             .map_err(|e| anyhow!(e))?;

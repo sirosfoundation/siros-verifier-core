@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "UniFFI bindings for the SIROS verifier core"
-publish = false
+publish = true
 
 [lib]
 crate-type = ["cdylib", "lib"]
@@ -17,7 +17,7 @@ name = "uniffi-bindgen"
 path = "src/bin.rs"
 
 [dependencies]
-siros-verifier-core = { path = "..", default-features = false }
+siros-verifier-core = { path = "..", version = "0.1.0", default-features = false }
 uniffi = { version = "0.28", features = ["cli"] }
 ciborium = "0.2"
 serde_json = "1"

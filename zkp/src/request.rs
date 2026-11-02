@@ -10,7 +10,10 @@ use std::collections::BTreeSet;
 
 use siros_verifier_core::{Error, Result};
 
-use crate::functions::{CircuitInput, FunctionRegistry};
+use crate::functions::{
+    CircuitInput, FunctionRegistry, FUNCTION_AGE_CHECK, INPUT_CUTOFF, INPUT_EARLIEST,
+    NO_LOWER_BOUND, NO_UPPER_BOUND,
+};
 use crate::transcript;
 
 #[derive(Clone, Debug)]
@@ -73,6 +76,26 @@ impl Request {
             ));
         }
         Ok(())
+    }
+
+    /// Inclusive age bounds in the form the native circuits take.
+    pub fn age_bounds(&self) -> (String, String) {
+        let mut earliest = NO_LOWER_BOUND.to_owned();
+        let mut cutoff = NO_UPPER_BOUND.to_owned();
+        for input in &self.inputs {
+            if input.function_id != FUNCTION_AGE_CHECK {
+                continue;
+            }
+            for (name, value) in &input.values {
+                let value = String::from_utf8_lossy(value).into_owned();
+                match name.as_str() {
+                    INPUT_EARLIEST => earliest = value,
+                    INPUT_CUTOFF => cutoff = value,
+                    _ => {}
+                }
+            }
+        }
+        (earliest, cutoff)
     }
 
     /// T as the circuits take it, in UTC.

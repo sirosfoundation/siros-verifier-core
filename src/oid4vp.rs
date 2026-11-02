@@ -680,7 +680,7 @@ fn decrypt_response(session: &Session, jwe: &str) -> Result<(Vec<u8>, JoseHeader
     }
     let enc = header.enc.as_deref().unwrap_or_default();
     if !matches!(enc, "A128GCM" | "A256GCM") {
-        return Err(policy("unsupported response enc"));
+        return Err(policy("unsupported response enc in protected header"));
     }
     if header.crit.is_some() || header.extra.contains_key("zip") {
         return Err(policy("unsupported response header parameter"));

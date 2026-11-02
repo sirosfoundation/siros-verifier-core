@@ -68,6 +68,33 @@ fn zcfg() -> Value {
     })
 }
 
+fn multi_zcfg() -> Value {
+    let mut config = zcfg();
+    let query = config["query"].clone();
+    config
+        .as_object_mut()
+        .unwrap()
+        .retain(|key, _| !matches!(key.as_str(), "query" | "subject_handle" | "attribute_map"));
+    let mut pseudonym = query.clone();
+    pseudonym["id"] = json!("nym_auth");
+    pseudonym["_req"] = json!([query["_req"][0].clone()]);
+    let mut age = query;
+    age["id"] = json!("nym_auth");
+    config["profiles"] = json!([
+        {
+            "query": pseudonym,
+            "subject_handle": "nym-1",
+            "attribute_map": {"pseudonym": "nym-1"}
+        },
+        {
+            "query": age,
+            "subject_handle": "nym-1",
+            "attribute_map": {"pseudonym": "nym-1", "ageOver": "age-1"}
+        }
+    ]);
+    config
+}
+
 fn build(zcfg: Value, verifier_id: Option<&str>) -> Result<Fx, String> {
     let (v_cert, v_key) = self_signed_ec("verifier.example", "ES256");
     let (artifact, circuit) = zk::artifact(b"a model circuit artifact");
@@ -151,11 +178,15 @@ fn req(path: &str, method: &str) -> HttpRequestData {
 }
 
 async fn start(f: &Fx) -> (State, String) {
+    start_query(f, &zcfg()["query"]).await
+}
+
+async fn start_query(f: &Fx, query: &Value) -> (State, String) {
     let mut ctx = Context::new(req("vp/start", "GET"), State::new());
     let mut request = InternalData::request("https://rp.example");
     request.set_attr(
         ui::DCQL_ATTRIBUTE,
-        json!({"credentials": [zcfg()["query"].clone()]}).to_string(),
+        json!({"credentials": [query]}).to_string(),
     );
     let page = f.b.start_auth(&mut ctx, request).await.unwrap();
     assert!(String::from_utf8(page.body)
@@ -184,6 +215,26 @@ fn wallet_body(
     proof_key: &p256::PublicKey,
     prove_for: Option<&str>,
 ) -> (String, Vec<u8>) {
+    wallet_body_with_options(
+        payload,
+        now,
+        holder_cert,
+        proof_key,
+        prove_for,
+        zk::QUERY_ID,
+        true,
+    )
+}
+
+fn wallet_body_with_options(
+    payload: &Value,
+    now: i64,
+    holder_cert: &[u8],
+    proof_key: &p256::PublicKey,
+    prove_for: Option<&str>,
+    query_id: &str,
+    include_age: bool,
+) -> (String, Vec<u8>) {
     let client_id = payload["client_id"].as_str().unwrap().to_owned();
     let nonce = payload["nonce"].as_str().unwrap().to_owned();
     let response_uri = payload["response_uri"].as_str().unwrap().to_owned();
@@ -204,18 +255,27 @@ fn wallet_body(
         verifier_id: verifier_id.to_owned(),
         issuer_key: *proof_key,
         proof_time: now - 3,
-        age_earliest: "2008-10-10".into(),
-        age_cutoff: "2013-10-09".into(),
+        age_earliest: if include_age {
+            "2008-10-10".into()
+        } else {
+            String::new()
+        },
+        age_cutoff: if include_age {
+            "2013-10-09".into()
+        } else {
+            String::new()
+        },
         config: zk::CONFIG.into(),
     };
-    let pres = zk::presentation_cbor(
+    let pres = zk::presentation_cbor_with_age(
         SYSTEM_LONGFELLOW,
         &zk::model_proof(&st),
         &[holder_cert.to_vec()],
         Some(st.proof_time),
         &zk::reference_pseudonym("x509_san_dns:verifier.example"),
+        include_age,
     );
-    let body = json!({"vp_token": {zk::QUERY_ID: [zk::b64(&pres)]}, "state": payload["state"]});
+    let body = json!({"vp_token": {query_id: [zk::b64(&pres)]}, "state": payload["state"]});
     let mut header = JoseHeader::for_jwe(JweAlgorithm::EcdhEs, JweEncryption::A128GCM);
     header.kid = enc.kid.clone();
     let jwe = jose_rs::jwe::compact::encrypt_with_jwk_header(
@@ -326,6 +386,37 @@ async fn enabling_zkp_preserves_sdjwt_request_dispatch() {
     assert!(payload["client_metadata"]["vp_formats_supported"]
         .get("zkp_req")
         .is_none());
+}
+
+#[tokio::test]
+async fn pseudonym_and_age_profiles_are_independently_verified() {
+    let f = build(multi_zcfg(), None).unwrap();
+    let profiles = multi_zcfg()["profiles"].clone();
+    for (index, include_age) in [(0, false), (1, true)] {
+        let query = profiles[index]["query"].clone();
+        let (state, id) = start_query(&f, &query).await;
+        let payload = jar(&f, &id).await;
+        assert_eq!(payload["dcql_query"]["credentials"][0], query);
+        let (jwe, pseudonym) = wallet_body_with_options(
+            &payload,
+            T0,
+            &f.issuer_cert,
+            &key_of(&f.issuer_cert),
+            None,
+            "nym_auth",
+            include_age,
+        );
+        let (status, body) = post(&f, &id, &jwe).await;
+        assert_eq!(status, 200, "{body}");
+        let BackendAction::AuthResponse(data) = complete(&f, &state).await.unwrap() else {
+            panic!("expected auth response")
+        };
+        use base64::Engine;
+        let expected = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(pseudonym);
+        assert_eq!(data.subject_id.as_deref(), Some(expected.as_str()));
+        assert_eq!(data.attr_first("pseudonym"), Some(expected.as_str()));
+        assert_eq!(data.attr_first("ageOver"), include_age.then_some("true"));
+    }
 }
 
 #[tokio::test]

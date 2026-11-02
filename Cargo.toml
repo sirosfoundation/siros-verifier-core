@@ -16,7 +16,7 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Sans-I/O digital credential verification core"
-publish = false
+publish = true
 
 [dependencies]
 # default-features = false drops PKCS#11 (cryptoki) so the crate can target wasm32;
@@ -37,7 +37,7 @@ thiserror = "2"
 url = "2"
 x509-cert = "0.2"
 zeroize = "1"
-siros-dc-matcher-core = { git = "https://github.com/sirosfoundation/siros-dc-matcher.git", rev = "49946a331bd15021f5665eee21111d925cd10434" }
+siros-dc-matcher-core = { version = "0.12.0", git = "https://github.com/sirosfoundation/siros-dc-matcher.git", rev = "49946a331bd15021f5665eee21111d925cd10434" }
 rcgen = { version = "0.14", optional = true }
 
 [features]
