@@ -3,8 +3,10 @@
 
 use std::sync::{Arc, Mutex};
 
+use kryptering::{EcCurve, HashAlgorithm, SignatureAlgorithm, Signer};
+use siros_verifier_core::mdoc_request::{ReaderAuthParams, RequestedDocument as CoreDocument};
 use siros_verifier_core::mdoc_session::{
-    session_termination, Incoming, ReaderHandshake, ReaderSession,
+    session_termination, Handover, Incoming, ReaderHandshake, ReaderSession,
 };
 use siros_verifier_core::trust::TrustQuery;
 
@@ -49,6 +51,72 @@ pub struct VerifiedDocument {
     pub authzen_request_json: String,
 }
 
+#[derive(uniffi::Record)]
+pub struct RequestedElement {
+    pub identifier: String,
+    pub intent_to_retain: bool,
+}
+
+#[derive(uniffi::Record)]
+pub struct RequestedNamespace {
+    pub namespace: String,
+    pub elements: Vec<RequestedElement>,
+}
+
+/// Host-backed ReaderAuth key. The callback receives the exact COSE signing
+/// input and must return a raw P-256 `r || s` signature.
+#[uniffi::export(with_foreign)]
+pub trait ReaderAuthSigner: Send + Sync {
+    fn sign_es256(&self, data: Vec<u8>) -> Result<Vec<u8>, FfiError>;
+}
+
+#[derive(uniffi::Object)]
+pub struct ReaderAuth {
+    /// DER certificates, leaf first. The wallet decides whether to trust them.
+    pub x5c_der: Vec<Vec<u8>>,
+    pub signer: Arc<dyn ReaderAuthSigner>,
+}
+
+#[uniffi::export]
+impl ReaderAuth {
+    #[uniffi::constructor]
+    pub fn new(x5c_der: Vec<Vec<u8>>, signer: Arc<dyn ReaderAuthSigner>) -> Self {
+        Self { x5c_der, signer }
+    }
+}
+
+#[derive(uniffi::Record)]
+pub struct RequestedDocument {
+    pub doc_type: String,
+    pub namespaces: Vec<RequestedNamespace>,
+    pub reader_auth: Option<Arc<ReaderAuth>>,
+}
+
+struct CallbackSigner(Arc<dyn ReaderAuthSigner>);
+
+impl Signer for CallbackSigner {
+    fn algorithm(&self) -> SignatureAlgorithm {
+        SignatureAlgorithm::Ecdsa(EcCurve::P256, HashAlgorithm::Sha256)
+    }
+
+    fn sign(&self, data: &[u8]) -> kryptering::Result<Vec<u8>> {
+        self.0
+            .sign_es256(data.to_vec())
+            .map_err(|error| kryptering::Error::Crypto(error.to_string()))
+    }
+}
+
+/// Encode a static or negotiated NFC handover without interpreting NDEF or
+/// performing transport I/O.
+#[uniffi::export]
+pub fn nfc_handover_cbor(select: Vec<u8>, request: Option<Vec<u8>>) -> Result<Vec<u8>, FfiError> {
+    Ok(Handover::Nfc {
+        select: &select,
+        request: request.as_deref(),
+    }
+    .to_cbor()?)
+}
+
 #[derive(uniffi::Object)]
 pub struct Reader {
     session: Mutex<ReaderSession>,
@@ -71,6 +139,68 @@ impl Reader {
     pub fn start(device_engagement: Vec<u8>, handover: Vec<u8>) -> Result<Arc<Self>, FfiError> {
         let session = ReaderHandshake::generate().establish(&device_engagement, &handover)?;
         Ok(Self::from_session(session))
+    }
+
+    /// Build a DeviceRequest against this session's transcript. Foreign signing
+    /// callbacks run after the session lock has been released.
+    pub fn build_device_request(
+        &self,
+        documents: Vec<RequestedDocument>,
+    ) -> Result<Vec<u8>, FfiError> {
+        let transcript = self
+            .session
+            .lock()
+            .expect("session lock")
+            .transcript_bytes()
+            .to_vec();
+        let signers: Vec<Option<CallbackSigner>> = documents
+            .iter()
+            .map(|document| {
+                document
+                    .reader_auth
+                    .as_ref()
+                    .map(|auth| CallbackSigner(auth.signer.clone()))
+            })
+            .collect();
+        let documents: Vec<CoreDocument<'_>> = documents
+            .iter()
+            .zip(&signers)
+            .map(|(document, signer)| CoreDocument {
+                doc_type: document.doc_type.clone(),
+                namespaces: document
+                    .namespaces
+                    .iter()
+                    .map(
+                        |namespace| siros_verifier_core::mdoc_request::RequestedNamespace {
+                            namespace: namespace.namespace.clone(),
+                            elements: namespace
+                                .elements
+                                .iter()
+                                .map(|element| {
+                                    siros_verifier_core::mdoc_request::RequestedElement {
+                                        identifier: element.identifier.clone(),
+                                        intent_to_retain: element.intent_to_retain,
+                                    }
+                                })
+                                .collect(),
+                        },
+                    )
+                    .collect(),
+                request_info: vec![],
+                reader_auth: match (&document.reader_auth, signer) {
+                    (Some(auth), Some(signer)) => Some(ReaderAuthParams {
+                        signer,
+                        x5c_der: &auth.x5c_der,
+                    }),
+                    (None, None) => None,
+                    _ => unreachable!("each document has one optional signer"),
+                },
+            })
+            .collect();
+        Ok(siros_verifier_core::mdoc_request::build_device_request(
+            &transcript,
+            &documents,
+        )?)
     }
 
     /// The first message to send to the device: carries the reader key and the encrypted DeviceRequest.

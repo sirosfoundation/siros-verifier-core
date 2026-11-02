@@ -16,6 +16,7 @@ pub mod error;
 pub mod issuer_set;
 pub mod json_strict;
 pub mod mdoc;
+pub mod mdoc_request;
 pub mod mdoc_session;
 pub mod oid4vp;
 pub mod receipt;

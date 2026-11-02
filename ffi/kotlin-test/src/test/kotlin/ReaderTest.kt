@@ -1,6 +1,14 @@
 import org.json.JSONObject
 import uniffi.siros_verifier_core_ffi.FfiException
 import uniffi.siros_verifier_core_ffi.Reader
+import uniffi.siros_verifier_core_ffi.ReaderAuth
+import uniffi.siros_verifier_core_ffi.ReaderAuthSigner
+import uniffi.siros_verifier_core_ffi.RequestedDocument
+import uniffi.siros_verifier_core_ffi.RequestedElement
+import uniffi.siros_verifier_core_ffi.RequestedNamespace
+import java.io.ByteArrayInputStream
+import java.security.cert.CertificateFactory
+import java.security.cert.X509Certificate
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -17,6 +25,14 @@ class ReaderTest {
     private fun reader() = Reader.startWithKeyForVectors(
         hexOf(v.getJSONObject("ereader").getString("d")), hex("device_engagement"), hex("handover"),
     )
+
+    private fun specRequest(): ByteArray {
+        val ct = extractData(hex("session_establishment"))
+        val iv = ByteArray(12).also { it[11] = 1 }
+        val cipher = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(javax.crypto.Cipher.DECRYPT_MODE, javax.crypto.spec.SecretKeySpec(hex("sk_reader"), "AES"), javax.crypto.spec.GCMParameterSpec(128, iv))
+        return cipher.doFinal(ct)
+    }
 
     @Test
     fun specResponseVerifiesThroughKotlin() {
@@ -35,11 +51,7 @@ class ReaderTest {
     fun establishmentMessageMatchesTheSpecByteForByte() {
         // decrypt the spec's request with the spec's SKReader (JCA, independent of the Rust code), re-send it through the library
         val est = hex("session_establishment")
-        val ct = extractData(est)
-        val iv = ByteArray(12).also { it[11] = 1 }
-        val c = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding")
-        c.init(javax.crypto.Cipher.DECRYPT_MODE, javax.crypto.spec.SecretKeySpec(hex("sk_reader"), "AES"), javax.crypto.spec.GCMParameterSpec(128, iv))
-        val plain = c.doFinal(ct)
+        val plain = specRequest()
         assertContentEquals(est, reader().establishmentMessage(plain))
     }
 
@@ -64,6 +76,69 @@ class ReaderTest {
         val r = reader()
         r.establishmentMessage(byteArrayOf(0xa0.toByte()))
         assertFailsWith<FfiException.Rejected> { r.establishmentMessage(byteArrayOf(0xa0.toByte())) }
+    }
+
+    @Test
+    fun hostReaderAuthSignerMatchesTheSpecAndVerifiesWithJca() {
+        val spec = specRequest()
+        val signature = spec.copyOfRange(spec.size - 64, spec.size)
+        val certificate = certificate(spec)
+        val signer = ReplaySigner(signature)
+        val auth = ReaderAuth(listOf(certificate.encoded), signer)
+        val elements = listOf(
+            "family_name" to true,
+            "document_number" to true,
+            "driving_privileges" to true,
+            "issue_date" to true,
+            "expiry_date" to true,
+            "portrait" to false,
+        ).map { (identifier, retain) -> RequestedElement(identifier, retain) }
+        val document = RequestedDocument(
+            "org.iso.18013.5.1.mDL",
+            listOf(RequestedNamespace("org.iso.18013.5.1", elements)),
+            auth,
+        )
+        val built = reader().buildDeviceRequest(listOf(document))
+        assertContentEquals(spec, built)
+
+        val signingInput = signer.signingInput!!
+        assertEquals(775, signingInput.size)
+        val verifier = java.security.Signature.getInstance("SHA256withECDSA")
+        verifier.initVerify(certificate.publicKey)
+        verifier.update(signingInput)
+        assertTrue(verifier.verify(rawSignatureToDer(signature)))
+    }
+
+    private class ReplaySigner(private val signature: ByteArray) : ReaderAuthSigner {
+        var signingInput: ByteArray? = null
+        override fun signEs256(`data`: ByteArray): ByteArray {
+            signingInput = data
+            return signature
+        }
+    }
+
+    private fun certificate(request: ByteArray): X509Certificate {
+        val factory = CertificateFactory.getInstance("X.509")
+        for (offset in 0 until request.size - 4) {
+            if (request[offset] != 0x30.toByte() || request[offset + 1] != 0x82.toByte()) continue
+            try {
+                return factory.generateCertificate(ByteArrayInputStream(request, offset, request.size - offset)) as X509Certificate
+            } catch (_: java.security.cert.CertificateException) {
+                // Not the certificate's DER SEQUENCE; keep looking.
+            }
+        }
+        error("no X.509 certificate in DeviceRequest")
+    }
+
+    private fun rawSignatureToDer(signature: ByteArray): ByteArray {
+        fun integer(value: ByteArray): ByteArray {
+            val unsigned = value.dropWhile { it == 0.toByte() }.ifEmpty { listOf(0.toByte()) }.toByteArray()
+            val needsZero = unsigned[0].toInt() and 0x80 != 0
+            val content = if (needsZero) byteArrayOf(0) + unsigned else unsigned
+            return byteArrayOf(0x02, content.size.toByte()) + content
+        }
+        val body = integer(signature.copyOfRange(0, 32)) + integer(signature.copyOfRange(32, 64))
+        return byteArrayOf(0x30, body.size.toByte()) + body
     }
 
     /** { "eReaderKey": ..., "data": bstr } -> the data bytes (minimal CBOR walk for this one shape). */

@@ -72,13 +72,13 @@ pub struct Params<'a> {
 
 // ---- CBOR helpers --------------------------------------------------------------------------
 
-fn enc(v: &Value) -> Vec<u8> {
+pub(crate) fn enc(v: &Value) -> Vec<u8> {
     let mut out = Vec::new();
     ciborium::into_writer(v, &mut out).expect("in-memory cbor write");
     out
 }
 
-fn parse(bytes: &[u8]) -> Result<Value> {
+pub(crate) fn parse(bytes: &[u8]) -> Result<Value> {
     // from_reader leaves trailing bytes unread; require exact consumption.
     let mut cur = bytes;
     let v: Value = ciborium::from_reader(&mut cur).map_err(|_| malformed("cbor"))?;
@@ -144,7 +144,7 @@ fn get<'a>(m: &BTreeMap<String, &'a Value>, k: &str) -> Result<&'a Value> {
         .copied()
         .ok_or_else(|| Error::Malformed(format!("missing_{k}")))
 }
-fn tag24(v: &Value) -> Result<&[u8]> {
+pub(crate) fn tag24(v: &Value) -> Result<&[u8]> {
     match v {
         Value::Tag(24, inner) => as_bytes(inner),
         _ => Err(malformed("expected_tag24")),
@@ -250,7 +250,7 @@ fn protected_alg(protected: &[u8]) -> Result<CoseHeader> {
     })
 }
 
-fn sig_structure(context: &str, protected: &[u8], payload: &[u8]) -> Vec<u8> {
+pub(crate) fn sig_structure(context: &str, protected: &[u8], payload: &[u8]) -> Vec<u8> {
     enc(&Value::Array(vec![
         Value::Text(context.into()),
         Value::Bytes(protected.to_vec()),
@@ -259,7 +259,7 @@ fn sig_structure(context: &str, protected: &[u8], payload: &[u8]) -> Vec<u8> {
     ]))
 }
 
-fn verify_es256(key: &VerifyingKey, tbs: &[u8], sig: &[u8]) -> Result<()> {
+pub(crate) fn verify_es256(key: &VerifyingKey, tbs: &[u8], sig: &[u8]) -> Result<()> {
     let sig = Signature::from_slice(sig).map_err(|_| malformed("signature_length"))?;
     key.verify(tbs, &sig)
         .map_err(|_| Error::Integrity("cose_signature".into()))
@@ -296,7 +296,7 @@ pub(crate) fn cose_key_p256(v: &Value) -> Result<PublicKey> {
     PublicKey::from_sec1_bytes(&sec1).map_err(|_| malformed("device_key_off_curve"))
 }
 
-fn leaf_key(der: &[u8]) -> Result<VerifyingKey> {
+pub(crate) fn leaf_key(der: &[u8]) -> Result<VerifyingKey> {
     let cert = x509_cert::Certificate::from_der(der).map_err(|_| malformed("x5chain_cert"))?;
     let spki = cert.tbs_certificate.subject_public_key_info;
     spki.to_der().map_err(|_| malformed("x5chain_spki"))?;
