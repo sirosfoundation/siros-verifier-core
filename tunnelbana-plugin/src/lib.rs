@@ -57,6 +57,10 @@ pub struct VpBackendConfig {
     pub mdoc_role: String,
     #[serde(default = "default_ttl")]
     pub request_ttl_secs: i64,
+    /// Method advertised for request object retrieval. GET remains the default;
+    /// POST echoes the wallet's `wallet_nonce` in a re-signed request object.
+    #[serde(default = "default_request_uri_method")]
+    pub request_uri_method: String,
     /// Reported as `auth_class_ref`.
     #[serde(default)]
     pub auth_class_ref: Option<String>,
@@ -64,6 +68,10 @@ pub struct VpBackendConfig {
 
 fn default_mdoc_role() -> String {
     "mdoc-issuer".into()
+}
+
+fn default_request_uri_method() -> String {
+    "get".into()
 }
 
 fn default_ttl() -> i64 {
@@ -662,6 +670,11 @@ impl VpBackend {
         if cfg.request_ttl_secs <= 0 || cfg.request_ttl_secs > 900 {
             return Err(Error::Config("request_ttl_secs must be 1..=900".into()));
         }
+        if !matches!(cfg.request_uri_method.as_str(), "get" | "post") {
+            return Err(Error::Config(
+                "request_uri_method must be get or post".into(),
+            ));
+        }
         for (k, p) in cfg
             .attribute_map
             .iter()
@@ -710,6 +723,7 @@ impl VpBackend {
             role: mode.cfg.role.clone(),
             mdoc_role: String::new(),
             request_ttl_secs: mode.cfg.request_ttl_secs,
+            request_uri_method: default_request_uri_method(),
             auth_class_ref: mode.cfg.auth_class_ref.clone(),
         };
         let mut backend = Self::new(name, module_base, cfg, gate, signer, chain_der, clock)?;
@@ -1481,6 +1495,7 @@ impl Backend for VpBackend {
         } else {
             None
         };
+        let request_uri_method = self.cfg.request_uri_method.clone();
         let cfg = RequestConfig {
             response_uri: format!("{}/response/{id}", self.module_base),
             dcql_query,
@@ -1523,7 +1538,7 @@ impl Backend for VpBackend {
         ctx.state.set_str(NS, FLOW_KEY, id.clone());
         let request_uri = format!("{}/request/{id}", self.module_base);
         let link = format!(
-            "{scheme}://cb?client_id={}&request_uri={}&request_uri_method=get",
+            "{scheme}://cb?client_id={}&request_uri={}&request_uri_method={request_uri_method}",
             pct(&client_id),
             pct(&request_uri)
         );
@@ -1559,11 +1574,41 @@ impl Backend for VpBackend {
                 if flow.expired(now) {
                     return Err(Error::BadRequest("expired flow".into()));
                 }
+                if !matches!(ctx.request.method.as_str(), "GET" | "POST") {
+                    return Ok(BackendAction::Respond(Response::text(
+                        405,
+                        "method not allowed",
+                    )));
+                }
+                let mut jar = flow.jar;
+                if ctx.request.method == "POST" {
+                    let pair_count = if ctx.request.form_pairs.is_empty() {
+                        ctx.request.form.len()
+                    } else {
+                        ctx.request.form_pairs.len()
+                    };
+                    let nonce = ctx.request.form.get("wallet_nonce").cloned();
+                    if pair_count != 1 || nonce.is_none() {
+                        let mut response = Response::json(&serde_json::json!({
+                            "error": "invalid_wallet_nonce",
+                            "error_description": "exactly one wallet_nonce is required",
+                        }))?;
+                        response.status = 400;
+                        return Ok(BackendAction::Respond(response));
+                    }
+                    jar = oid4vp::reissue_request_with_wallet_nonce(
+                        &jar,
+                        &nonce.unwrap_or_default(),
+                        &self.signer,
+                        &self.chain_der,
+                    )
+                    .map_err(|e| Error::BadRequest(e.to_string()))?;
+                }
                 Ok(BackendAction::Respond(
                     Response::new(200)
                         .with_header("content-type", "application/oauth-authz-req+jwt")
                         .with_header("cache-control", "no-store")
-                        .with_body(flow.jar.into_bytes()),
+                        .with_body(jar.into_bytes()),
                 ))
             }
             "response" => Ok(BackendAction::Respond(self.on_wallet_response(ctx).await?)),

@@ -18,6 +18,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use jose_rs::jwk::agreement::{agreement_key, peer_key};
 use jose_rs::jwk::Jwk;
+use jose_rs::jws;
 use jose_rs::jws::compact::{sign_with_options, SignOptions};
 use jose_rs::JoseHeader;
 use serde::{Deserialize, Serialize};
@@ -262,6 +263,48 @@ fn random_token() -> String {
     let mut b = [0u8; 32];
     getrandom::fill(&mut b).expect("OS randomness");
     b64u(&b)
+}
+
+/// Reissue a stored request object with the wallet's POSTed `wallet_nonce`.
+/// The signing key, encryption key, flow nonce, state, and response parameters
+/// remain those of the original flow; only `wallet_nonce` is added.
+pub fn reissue_request_with_wallet_nonce(
+    jar: &str,
+    wallet_nonce: &str,
+    signer: &dyn kryptering::Signer,
+    chain_der: &[Vec<u8>],
+) -> Result<String> {
+    if wallet_nonce.is_empty()
+        || wallet_nonce.len() > 256
+        || !wallet_nonce
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
+        return Err(policy("invalid wallet_nonce"));
+    }
+    let mut header =
+        jws::decode_header(jar).map_err(|e| malformed(format!("request object header: {e}")))?;
+    if header.alg != "ES256" || header.typ.as_deref() != Some("oauth-authz-req+jwt") {
+        return Err(policy("unsupported request object type"));
+    }
+    let payload = jar
+        .split('.')
+        .nth(1)
+        .ok_or_else(|| malformed("request object has no payload"))?;
+    let mut payload: Value = crate::json_strict::from_slice(&b64u_decode(payload)?)?;
+    let object = payload
+        .as_object_mut()
+        .ok_or_else(|| malformed("request object payload is not an object"))?;
+    object.insert("wallet_nonce".into(), json!(wallet_nonce));
+    header.x5c = Some(chain_der.iter().map(|der| B64.encode(der)).collect());
+    let opts = SignOptions::new().with_key_reference_headers(true);
+    sign_with_options(
+        signer,
+        &serde_json::to_vec(&payload).unwrap(),
+        &header,
+        &opts,
+    )
+    .map_err(|e| Error::Crypto(format!("request signing failed: {e}")))
 }
 
 /// Build a signed request object. `signer` is any kryptering `Signer`, so the

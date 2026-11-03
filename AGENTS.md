@@ -27,6 +27,7 @@ This workspace contains a sans-I/O verification core, UniFFI and tunnelbana adap
 - Prefer `[[backend.config.zkp.profiles]]` for multiple nym_auth presets. The legacy single `query` form remains supported. Duplicate byte-equivalent queries are a startup error; sharing a query ID with different function lists is valid.
 - UI and backend queries must match exactly, including result handles, age bounds, and attribute mapping. `subject_handle` must name a pseudonym function.
 - Use exactly one of `artifact_path` and `artifact_id`. Hash/size always mean decompressed bytes. Vega entries reject Longfellow parameters.
+- `request_uri_method = "post"` must echo the wallet's posted `wallet_nonce` in a re-signed request object and require exactly one valid form field at retrieval. GET remains the default and is always available alongside POST.
 - Use `api.circuits.siros.org` for the API. `circuits.siros.org` is only the human site.
 - Registry presets merge by format and type. A default claim subset must be answerable by the intended wallet; the first claim becomes the subject when no pointer is configured.
 - Only the QR display is modal. Do not reintroduce appended QR sections or result modals. Completion navigates to the complete page, which shows a neutral spinner while pending and then the decoded response or an error.

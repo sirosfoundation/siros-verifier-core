@@ -43,6 +43,10 @@ SD-JWT `status.status_list` references are fetched over HTTPS with a 5-second ti
 
 `allow_invalid_status_list_certificates = true` disables TLS certificate validation for status-list fetches and exists only for local conformance fixtures with self-signed servers. Never enable it in a real deployment.
 
+## Request object retrieval
+
+The default is `request_uri_method = "get"`. Set `request_uri_method = "post"` for wallets that require POST retrieval. The wallet supplies `wallet_nonce` in its form POST; the service echoes it in a re-signed request object and requires exactly one valid field. Missing, duplicate, unknown, or malformed fields are refused. GET retrieval remains unchanged and is always available alongside POST retrieval.
+
 ## UI presets
 
 `frontend.config.presets` is an array of tables with `id`, `label`, and `dcql`. Registry-derived presets are merged by credential format and type; the registry's full claim list remains available for editing. Configure the requested claim subset for your deployment and include a subject claim—the first claim becomes the subject when no custom pointer is configured.

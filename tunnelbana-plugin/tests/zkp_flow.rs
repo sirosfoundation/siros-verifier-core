@@ -143,6 +143,7 @@ fn build(zcfg: Value, verifier_id: Option<&str>) -> Result<Fx, String> {
         role: cfg.role.clone(),
         mdoc_role: String::new(),
         request_ttl_secs: cfg.request_ttl_secs,
+        request_uri_method: "get".into(),
         auth_class_ref: cfg.auth_class_ref.clone(),
     };
     let b = VpBackend::new(
