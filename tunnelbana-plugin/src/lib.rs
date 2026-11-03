@@ -18,8 +18,9 @@ use siros_verifier_core::oid4vp::{self, RequestConfig};
 use siros_verifier_core::receipt::{
     self, Cache, IssuePolicy, Lookup, PdpAnswer, TrustData, Verifier,
 };
-use siros_verifier_core::sdjwt::X5cLeaf;
+use siros_verifier_core::sdjwt::{CryptoVerified, X5cLeaf};
 use siros_verifier_core::session_seal::SessionSealer;
+use siros_verifier_core::trust::TrustQuery;
 use siros_verifier_zkp::refusal::ZkpError;
 use siros_verifier_zkp::verify::{Channel, Exchange, VerifiedPresentation, ZkpVerifier};
 use tunnelbana_core::context::Context;
@@ -118,6 +119,70 @@ pub struct ZkpProfileConfig {
 #[async_trait]
 pub trait PdpClient: Send + Sync {
     async fn evaluate(&self, request: &Value) -> std::result::Result<Value, String>;
+}
+
+/// Fetches a JWT status list without doing trust evaluation. The caller still
+/// verifies the token and asks go-trust about its signer.
+#[async_trait]
+pub trait StatusListClient: Send + Sync {
+    async fn fetch(&self, uri: &str) -> std::result::Result<String, String>;
+}
+
+/// Bounded HTTPS status-list transport for the gateway.
+#[cfg(feature = "http")]
+pub struct ReqwestStatusListClient {
+    client: reqwest::Client,
+}
+
+#[cfg(feature = "http")]
+impl ReqwestStatusListClient {
+    pub fn new(timeout: std::time::Duration) -> std::result::Result<Self, String> {
+        Self::build(timeout, false)
+    }
+
+    /// Local conformance testing only. Never use this for a real deployment.
+    pub fn new_allow_invalid_certificates_for_testing(
+        timeout: std::time::Duration,
+    ) -> std::result::Result<Self, String> {
+        Self::build(timeout, true)
+    }
+
+    fn build(
+        timeout: std::time::Duration,
+        allow_invalid_certificates: bool,
+    ) -> std::result::Result<Self, String> {
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(timeout)
+            .danger_accept_invalid_certs(allow_invalid_certificates)
+            .build()
+            .map_err(|e| e.to_string())?;
+        Ok(Self { client })
+    }
+}
+
+#[cfg(feature = "http")]
+#[async_trait]
+impl StatusListClient for ReqwestStatusListClient {
+    async fn fetch(&self, uri: &str) -> std::result::Result<String, String> {
+        if !uri.starts_with("https://") {
+            return Err("status_list_uri_not_https".into());
+        }
+        let response = self
+            .client
+            .get(uri)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !response.status().is_success() {
+            return Err(format!("status_list_http_{}", response.status()));
+        }
+        let bytes = response.bytes().await.map_err(|e| e.to_string())?;
+        if bytes.len() > 64 * 1024 {
+            return Err("status_list_response_too_large".into());
+        }
+        String::from_utf8(bytes.to_vec()).map_err(|_| "status_list_not_utf8".into())
+    }
 }
 
 /// Used when no PDP is configured: every evaluation fails, so every presentation is rejected.
@@ -397,6 +462,7 @@ pub struct VpBackend {
     signer: kryptering::SoftwareSigner,
     chain_der: Vec<Vec<u8>>,
     clock: Clock,
+    status_list_client: Option<Arc<dyn StatusListClient>>,
     /// Optional `zkp_req` support. Each flow selects its format from its DCQL.
     zkp: Option<ZkpMode>,
 }
@@ -618,6 +684,7 @@ impl VpBackend {
             signer,
             chain_der,
             clock,
+            status_list_client: None,
             zkp: None,
         })
     }
@@ -667,6 +734,13 @@ impl VpBackend {
     /// instance from the same high-entropy master secret and tenant name.
     pub fn with_session_sealer(mut self, sealer: SessionSealer) -> Self {
         self.sealer = sealer;
+        self
+    }
+
+    /// Enable bounded HTTPS status-list retrieval for SD-JWT credentials that
+    /// carry a `status.status_list` reference.
+    pub fn with_status_list_client(mut self, client: Arc<dyn StatusListClient>) -> Self {
+        self.status_list_client = Some(client);
         self
     }
 
@@ -756,6 +830,13 @@ impl VpBackend {
         code: &str,
         response: Response,
     ) -> Result<Response> {
+        let status = response.status;
+        let description = String::from_utf8_lossy(&response.body).into_owned();
+        let mut response = Response::json(&serde_json::json!({
+            "error": code,
+            "error_description": description,
+        }))?;
+        response.status = status;
         self.finish_response(
             id,
             claim_id,
@@ -763,6 +844,38 @@ impl VpBackend {
             response,
         )
         .await
+    }
+
+    async fn check_sd_jwt_status(
+        &self,
+        verified: &CryptoVerified,
+        now: i64,
+    ) -> std::result::Result<(), (String, u16)> {
+        let Some(reference) = &verified.status else {
+            return Ok(());
+        };
+        let Some(client) = &self.status_list_client else {
+            return Err(("status_list_unavailable".into(), 503));
+        };
+        let token = client
+            .fetch(&reference.uri)
+            .await
+            .map_err(|_| ("status_list_unavailable".to_owned(), 503))?;
+        let token = siros_verifier_core::status_list::verify_token(&token, &X5cLeaf, now)
+            .map_err(|_| ("invalid_status_list".to_owned(), 400))?;
+        let query = TrustQuery::for_issuer(&token.issuer, "status-list-signer", "status-list");
+        match self.gate.permits(&query.to_authzen(), now).await {
+            Ok(true) => {}
+            Ok(false) => return Err(("status_list_signer_not_trusted".into(), 403)),
+            Err(_) => return Err(("trust_unavailable".into(), 503)),
+        }
+        if siros_verifier_core::status_list::status_at(&token, reference)
+            .map_err(|_| ("invalid_status_list".to_owned(), 400))?
+            != 0
+        {
+            return Err(("credential_revoked".into(), 403));
+        }
+        Ok(())
     }
 
     async fn on_wallet_response(&self, ctx: &mut Context) -> Result<Response> {
@@ -842,6 +955,13 @@ impl VpBackend {
         // Every presented credential's issuer must be trusted; a single denial fails the flow.
         let mut result: Option<InternalData> = None;
         for p in &verified {
+            if let oid4vp::VerifiedCredential::SdJwt(credential) = &p.verified {
+                if let Err((code, status)) = self.check_sd_jwt_status(credential, now).await {
+                    return self
+                        .fail(&id, &claim_id, &code, Response::text(status, &code))
+                        .await;
+                }
+            }
             let q = p
                 .verified
                 .trust_query(&self.cfg.role, &self.cfg.mdoc_role)

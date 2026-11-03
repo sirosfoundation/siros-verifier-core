@@ -301,6 +301,9 @@ async fn untrusted_issuer_fails_the_flow_and_no_attributes_leak() {
     let jar = fetch_jar(&f, &id).await;
     let (st, body) = post(&f, &id, &wallet(&f, &jar)).await;
     assert_eq!(st, 403);
+    let error: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(error["error"], "issuer_not_trusted");
+    assert!(error["error_description"].is_string());
     assert!(!body.contains("Lovelace"));
     assert_eq!(
         complete(&f, &state).await.err().unwrap(),

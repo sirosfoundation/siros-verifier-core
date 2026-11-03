@@ -10,7 +10,7 @@ Set `TUNNELBANA_BIND=0.0.0.0:9001` when the service is behind a public proxy. Ke
 
 ## Trust boundary
 
-**All issuer and verifier trust decisions belong to go-trust.** Configure `pdp_endpoint`, `pdp_id`, and issuer/verifier policies there. The circuit catalog and the local circuit allowlist are integrity controls, not a trust registry. Do not add a second issuer/verifier trust path in this service.
+**All issuer and verifier trust decisions belong to go-trust, including status-list signer trust.** Configure `pdp_endpoint`, `pdp_id`, and issuer/verifier policies there, including the `status-list-signer` action when credentials carry status references. The circuit catalog and the local circuit allowlist are integrity controls, not a trust registry. Do not add a second issuer/verifier trust path in this service.
 
 The signing certificate chain is configured separately from the issuer's keys. Use a dedicated verifier key. `zkp_req` normally uses `x509_san_dns:<host>` as `client_id`; other formats retain `x509_hash`. Put the public host in the certificate SAN and authorize both subject forms, plus the test CA when SAN chain validation is required, in go-trust.
 
@@ -38,6 +38,10 @@ collection = "presentation_flows"
 Flow claims, replay protection, OIDC token consumption, and result collection must share one database. Use a least-privilege user with `readWrite` only on `siros_verifier`. A standalone MongoDB is shared storage, not database-level HA; use a replica set or managed HA service when required. `memory` is for explicitly single-process tests only.
 
 The current hard limits are 2 MiB for an HTTP body and compact JWE, and 1 MiB for decrypted response plaintext. Genuine Longfellow and Vega responses fit these bounds.
+
+SD-JWT `status.status_list` references are fetched over HTTPS with a 5-second timeout, no redirects, a 64 KiB token limit, and a 1 MiB decompressed-list limit. Tokens must be `statuslist+jwt` with a valid ES256 signature and time window and a subject matching the reference. The signer is evaluated through go-trust with the `status-list-signer` action. Fetch/parse failures, untrusted signers, and nonzero status values fail closed.
+
+`allow_invalid_status_list_certificates = true` disables TLS certificate validation for status-list fetches and exists only for local conformance fixtures with self-signed servers. Never enable it in a real deployment.
 
 ## UI presets
 

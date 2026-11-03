@@ -22,6 +22,7 @@ pub mod oid4vp;
 pub mod receipt;
 pub mod sdjwt;
 pub mod session_seal;
+pub mod status_list;
 #[cfg(feature = "testutil")]
 pub mod testutil;
 pub mod trust;
