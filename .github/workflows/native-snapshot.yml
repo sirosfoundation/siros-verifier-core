@@ -34,10 +34,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p target/native-tools
-          curl -fsSL "https://github.com/JetBrains/kotlin/releases/download/v${KOTLIN_VERSION}/kotlin-compiler-${KOTLIN_VERSION}.zip" -o target/native-tools/kotlin.zip
+          curl --proto '=https' --proto-redir '=https' -fsSL "https://github.com/JetBrains/kotlin/releases/download/v${KOTLIN_VERSION}/kotlin-compiler-${KOTLIN_VERSION}.zip" -o target/native-tools/kotlin.zip
           unzip -q target/native-tools/kotlin.zip -d target/native-tools
-          curl -fsSL "https://repo1.maven.org/maven2/net/java/dev/jna/jna/5.14.0/jna-5.14.0.jar" -o target/native-tools/jna.jar
-          curl -fsSL "https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-stdlib/${KOTLIN_VERSION}/kotlin-stdlib-${KOTLIN_VERSION}.jar" -o target/native-tools/kotlin-stdlib.jar
+          curl --proto '=https' --proto-redir '=https' -fsSL "https://repo1.maven.org/maven2/net/java/dev/jna/jna/5.14.0/jna-5.14.0.jar" -o target/native-tools/jna.jar
+          curl --proto '=https' --proto-redir '=https' -fsSL "https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-stdlib/${KOTLIN_VERSION}/kotlin-stdlib-${KOTLIN_VERSION}.jar" -o target/native-tools/kotlin-stdlib.jar
           echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT:-$ANDROID_HOME}/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
           echo "ANDROID_API=28" >> "$GITHUB_ENV"
           echo "KOTLINC=$PWD/target/native-tools/kotlinc/bin/kotlinc" >> "$GITHUB_ENV"
