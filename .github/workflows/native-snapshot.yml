@@ -1,0 +1,60 @@
+name: Native Android snapshot
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  NDK_VERSION: 27.3.13750724
+  KOTLIN_VERSION: 2.1.0
+
+jobs:
+  publish:
+    name: Build and publish the Android snapshot
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
+        with:
+          packages: "ndk;${{ env.NDK_VERSION }}"
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+      - name: Prepare Kotlin and JNA build tools
+        run: |
+          set -euo pipefail
+          mkdir -p target/native-tools
+          curl -fsSL "https://github.com/JetBrains/kotlin/releases/download/v${KOTLIN_VERSION}/kotlin-compiler-${KOTLIN_VERSION}.zip" -o target/native-tools/kotlin.zip
+          unzip -q target/native-tools/kotlin.zip -d target/native-tools
+          curl -fsSL "https://repo1.maven.org/maven2/net/java/dev/jna/jna/5.14.0/jna-5.14.0.jar" -o target/native-tools/jna.jar
+          curl -fsSL "https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-stdlib/${KOTLIN_VERSION}/kotlin-stdlib-${KOTLIN_VERSION}.jar" -o target/native-tools/kotlin-stdlib.jar
+          echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT:-$ANDROID_HOME}/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+          echo "ANDROID_API=28" >> "$GITHUB_ENV"
+          echo "KOTLINC=$PWD/target/native-tools/kotlinc/bin/kotlinc" >> "$GITHUB_ENV"
+          echo "JNA_JAR=$PWD/target/native-tools/jna.jar" >> "$GITHUB_ENV"
+          echo "KOTLIN_STDLIB_JAR=$PWD/target/native-tools/kotlin-stdlib.jar" >> "$GITHUB_ENV"
+      - run: ffi/scripts/android-aar.sh target/native-android
+      - name: Publish the snapshot to GitHub Packages
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cat > /tmp/siros-maven-settings.xml <<'EOF'
+          <settings><servers><server><id>github</id><username>${env.GITHUB_ACTOR}</username><password>${env.GITHUB_TOKEN}</password></server></servers></settings>
+          EOF
+          aar=$(ls target/native-android/siros-verifier-core-ffi-*.aar)
+          sed 's/<version>0.1.0<\/version>/<version>0.1.0-SNAPSHOT<\/version>/' \
+            target/native-android/siros-verifier-core-ffi-0.1.0.pom > target/native-android/siros-verifier-core-ffi-0.1.0-SNAPSHOT.pom
+          mvn -B deploy:deploy-file --settings /tmp/siros-maven-settings.xml \
+            -DrepositoryId=github -Durl="https://maven.pkg.github.com/${GITHUB_REPOSITORY}" \
+            -DpomFile=target/native-android/siros-verifier-core-ffi-0.1.0-SNAPSHOT.pom \
+            -Dfile="$aar" -Dpackaging=aar
