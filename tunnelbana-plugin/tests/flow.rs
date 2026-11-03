@@ -121,6 +121,10 @@ fn fx_with(next_update_in: i64) -> Fx {
     fx_full(next_update_in, "/family_name")
 }
 fn fx_full(next_update_in: i64, subject_pointer: &str) -> Fx {
+    fx_with_method(next_update_in, subject_pointer, "get")
+}
+
+fn fx_with_method(next_update_in: i64, subject_pointer: &str, request_uri_method: &str) -> Fx {
     let (v_cert, v_key) = self_signed_ec("verifier.example", "ES256");
     let (i_cert, i_key) = self_signed_ec("issuer.example", "ES256");
     let holder = ec_jwk("ES256", "holder");
@@ -141,6 +145,7 @@ fn fx_full(next_update_in: i64, subject_pointer: &str) -> Fx {
         "subject_pointer": subject_pointer,
         "role": "pid-provider",
         "auth_class_ref": "urn:eudi:loa:high",
+        "request_uri_method": request_uri_method,
     })).unwrap();
     let pdp = Arc::new(MockPdp {
         permit: AtomicBool::new(true),
@@ -233,6 +238,40 @@ async fn fetch_jar(f: &Fx, id: &str) -> String {
     let (st, body) = respond_body(f.b.handle_endpoint(&mut ctx, "request").await.unwrap());
     assert_eq!(st, 200);
     body
+}
+
+async fn start_post(f: &Fx) -> (State, String) {
+    let mut ctx = Context::new(req("vp/start", "GET"), State::new());
+    let html = String::from_utf8(
+        f.b.start_auth(&mut ctx, InternalData::request("https://rp.example"))
+            .await
+            .unwrap()
+            .body,
+    )
+    .unwrap();
+    assert!(html.contains("request_uri_method=post"), "{html}");
+    let id = ctx.state.get_str(NS, FLOW_KEY).unwrap();
+    (ctx.state, id)
+}
+
+async fn fetch_jar_post(
+    f: &Fx,
+    id: &str,
+    fields: Vec<(String, String)>,
+) -> (u16, String, Vec<(String, String)>) {
+    let mut request = req(&format!("vp/request/{id}"), "POST");
+    request.form = fields.iter().cloned().collect();
+    request.form_pairs = fields;
+    let mut ctx = Context::new(request, State::new());
+    let BackendAction::Respond(response) = f.b.handle_endpoint(&mut ctx, "request").await.unwrap()
+    else {
+        panic!("expected response")
+    };
+    (
+        response.status,
+        String::from_utf8(response.body).unwrap(),
+        response.headers,
+    )
 }
 fn wallet(f: &Fx, jar: &str) -> String {
     wallet_respond(
@@ -726,6 +765,81 @@ fn real_go_trust_answers_parse_without_id_or_freshness() {
     // local ids are unique per answer
     let again = parse_authzen_response(&serde_json::from_str(REAL_PERMIT).unwrap()).unwrap();
     assert_ne!(p.id, again.id);
+}
+
+#[tokio::test]
+async fn post_request_uri_binds_the_wallet_nonce() {
+    let store = Arc::new(MemoryFlowStore::default());
+    let f = fx_with_method(100_000, "/family_name", "post").with_storage(store);
+    let (_state, id) = start_post(&f).await;
+    let expected_nonce = "expected-wallet-nonce".to_owned();
+    let (status, jar, headers) = fetch_jar_post(
+        &f,
+        &id,
+        vec![("wallet_nonce".into(), expected_nonce.clone())],
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(headers
+        .iter()
+        .any(|(name, value)| name == "content-type" && value == "application/oauth-authz-req+jwt"));
+    let payload: Value = serde_json::from_slice(
+        &jose_rs::base64url::decode(jar.split('.').nth(1).unwrap()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(payload["wallet_nonce"], expected_nonce);
+
+    assert_eq!(
+        fetch_jar_post(&f, &id, vec![]).await.0,
+        400,
+        "a missing nonce is refused"
+    );
+    let (status, reissued, _) =
+        fetch_jar_post(&f, &id, vec![("wallet_nonce".into(), "wrong".into())]).await;
+    assert_eq!(status, 200, "the wallet's posted nonce is echoed");
+    let payload: Value = serde_json::from_slice(
+        &jose_rs::base64url::decode(reissued.split('.').nth(1).unwrap()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(payload["wallet_nonce"], "wrong");
+    assert_eq!(
+        fetch_jar_post(
+            &f,
+            &id,
+            vec![
+                ("wallet_nonce".into(), expected_nonce.clone()),
+                ("wallet_nonce".into(), expected_nonce.clone()),
+            ],
+        )
+        .await
+        .0,
+        400,
+        "a duplicated nonce is refused"
+    );
+    assert_eq!(
+        fetch_jar_post(&f, &id, vec![("other".into(), expected_nonce)])
+            .await
+            .0,
+        400,
+        "an unknown form field is refused"
+    );
+    for malformed in [String::new(), "bad nonce".into(), "x".repeat(257)] {
+        let mut request = req(&format!("vp/request/{id}"), "POST");
+        request.form = BTreeMap::from([("wallet_nonce".into(), malformed.clone())]);
+        request.form_pairs = vec![("wallet_nonce".into(), malformed)];
+        let mut ctx = Context::new(request, State::new());
+        assert!(
+            f.b.handle_endpoint(&mut ctx, "request").await.is_err(),
+            "a malformed nonce is refused"
+        );
+    }
+    let mut ctx = Context::new(req(&format!("vp/request/{id}"), "PUT"), State::new());
+    let (status, _) = respond_body(f.b.handle_endpoint(&mut ctx, "request").await.unwrap());
+    assert_eq!(status, 405, "unsupported request methods are refused");
+    let mut ctx = Context::new(req(&format!("vp/request/{id}"), "GET"), State::new());
+    let (status, _) = respond_body(f.b.handle_endpoint(&mut ctx, "request").await.unwrap());
+    assert_eq!(status, 200, "GET remains available alongside POST");
+    assert_eq!(post(&f, &id, &wallet(&f, &jar)).await.0, 200);
 }
 
 #[tokio::test]

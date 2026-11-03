@@ -158,6 +158,46 @@ fn happy_path_end_to_end() {
 }
 
 #[test]
+fn post_request_object_echoes_wallet_nonce_and_preserves_flow() {
+    let w = world();
+    let (jar, _session) = start(&w, dcql(&["given_name"]));
+    let original: Value = serde_json::from_slice(
+        &jws::compact::verify_with_jwk(&public_of(&w.verifier_key), &jar).unwrap(),
+    )
+    .unwrap();
+    let signer = software_signer(&w.verifier_key).unwrap();
+    let reissued = reissue_request_with_wallet_nonce(
+        &jar,
+        "wallet-generated-nonce",
+        &signer,
+        std::slice::from_ref(&w.verifier_cert),
+    )
+    .unwrap();
+    let payload: Value = serde_json::from_slice(
+        &jws::compact::verify_with_jwk(&public_of(&w.verifier_key), &reissued).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(payload["wallet_nonce"], "wallet-generated-nonce");
+    let mut unchanged = payload.clone();
+    unchanged
+        .as_object_mut()
+        .unwrap()
+        .remove("wallet_nonce")
+        .unwrap();
+    assert_eq!(unchanged, original);
+    let too_long = "x".repeat(257);
+    for malformed in ["", "bad nonce", too_long.as_str()] {
+        assert!(reissue_request_with_wallet_nonce(
+            &jar,
+            malformed,
+            &signer,
+            std::slice::from_ref(&w.verifier_cert),
+        )
+        .is_err());
+    }
+}
+
+#[test]
 fn dc_api_uses_the_browser_origin_for_holder_binding() {
     let w = world();
     let signer = software_signer(&w.verifier_key).unwrap();
