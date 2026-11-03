@@ -1,6 +1,8 @@
 name: Native Android snapshot
 
 on:
+  push:
+    branches: [feat/native-verifier-integration]
   workflow_dispatch:
 
 permissions:
