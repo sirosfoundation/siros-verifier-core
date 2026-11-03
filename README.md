@@ -116,22 +116,27 @@ and backend contract](tunnelbana-plugin/src/assets/README.md).
 The FFI `Reader` accepts whole CBOR messages and leaves BLE/NFC transport to the
 application:
 
-1. `Reader.start(deviceEngagement, handover)` establishes the reader session.
-   `nfcHandoverCbor(select, request)` encodes static or negotiated NFC handovers.
-2. `buildDeviceRequest` builds ordered DocumentRequests. For ReaderAuth, supply
-   the leaf-first certificate chain and a `ReaderAuthSigner` callback; the host
-   signs the exact COSE input with its long-term P-256 key and returns raw
-   `r || s`. The ephemeral session key remains inside Rust.
-3. `establishment_message(deviceRequest)` and `data_message(deviceRequest)`
-   produce messages for the wallet.
-4. `open_response(sessionData, now, acceptedDocTypes)` decrypts and verifies the
-   DeviceResponse.
-5. The application submits each document's AuthZEN request to its PDP and uses
+1. `Reader.start(deviceEngagement, handover)` establishes the reader session
+   with the default `pid-provider` role; `Reader.startWithRole` selects an
+   explicit mdoc issuer role. `nfcHandoverCbor(select, request)` encodes static
+   or negotiated NFC handovers.
+2. `establishmentMessageFromDocuments` and `dataMessageFromDocuments`
+   atomically build and encrypt ordered DocumentRequests and retain their
+   response policy. For ReaderAuth, supply the leaf-first certificate chain and
+   a `ReaderAuthSigner` callback; the host signs the exact COSE input with its
+   long-term P-256 key and returns raw `r || s`. The ephemeral session key
+   remains inside Rust. The separate `buildDeviceRequest` and raw message
+   methods remain available for compatibility.
+3. `openResponse(sessionData, now, acceptedDocTypes)` decrypts and verifies the
+   DeviceResponse. For an atomic request it also enforces all requested document
+   types, namespaces, and elements while allowing extra disclosed claims.
+4. The application submits each document's AuthZEN request to its PDP and uses
    the returned elements only after a permit decision.
 
-See [`ffi/src/lib.rs`](ffi/src/lib.rs) for the exported API and
-[`ffi/scripts/kotlin-test.sh`](ffi/scripts/kotlin-test.sh) for the native/Kotlin
-test setup.
+See [`ffi/src/lib.rs`](ffi/src/lib.rs) for the exported API,
+[`ffi/README.md`](ffi/README.md) for Android AAR and iOS XCFramework packaging,
+and [`ffi/scripts/kotlin-test.sh`](ffi/scripts/kotlin-test.sh) for the
+native/Kotlin test setup.
 
 ## Trust and security boundary
 

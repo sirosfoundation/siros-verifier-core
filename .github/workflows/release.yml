@@ -103,6 +103,106 @@ jobs:
       upload-to-release: true
       require-sbom: true
 
+  native-android:
+    name: Build and publish the native Android Reader
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    env:
+      NDK_VERSION: 27.3.13750724
+      KOTLIN_VERSION: 2.1.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
+        with:
+          packages: "ndk;${{ env.NDK_VERSION }}"
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+      - name: Prepare Kotlin and JNA build tools
+        run: |
+          set -euo pipefail
+          mkdir -p target/native-tools
+          curl --proto '=https' --proto-redir '=https' -fsSL "https://github.com/JetBrains/kotlin/releases/download/v${KOTLIN_VERSION}/kotlin-compiler-${KOTLIN_VERSION}.zip" -o target/native-tools/kotlin.zip
+          unzip -q target/native-tools/kotlin.zip -d target/native-tools
+          curl --proto '=https' --proto-redir '=https' -fsSL "https://repo1.maven.org/maven2/net/java/dev/jna/jna/5.14.0/jna-5.14.0.jar" -o target/native-tools/jna.jar
+          curl --proto '=https' --proto-redir '=https' -fsSL "https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-stdlib/${KOTLIN_VERSION}/kotlin-stdlib-${KOTLIN_VERSION}.jar" -o target/native-tools/kotlin-stdlib.jar
+          echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT:-$ANDROID_HOME}/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+          echo "ANDROID_API=28" >> "$GITHUB_ENV"
+          echo "KOTLINC=$PWD/target/native-tools/kotlinc/bin/kotlinc" >> "$GITHUB_ENV"
+          echo "JNA_JAR=$PWD/target/native-tools/jna.jar" >> "$GITHUB_ENV"
+          echo "KOTLIN_STDLIB_JAR=$PWD/target/native-tools/kotlin-stdlib.jar" >> "$GITHUB_ENV"
+      - run: ffi/scripts/android-aar.sh target/native-android
+      - name: Publish the AAR to GitHub Packages
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cat > /tmp/siros-maven-settings.xml <<'EOF'
+          <settings><servers><server><id>github</id><username>${env.GITHUB_ACTOR}</username><password>${env.GITHUB_TOKEN}</password></server></servers></settings>
+          EOF
+          aar=$(ls target/native-android/siros-verifier-core-ffi-*.aar)
+          pom=$(ls target/native-android/siros-verifier-core-ffi-*.pom)
+          mvn -B deploy:deploy-file --settings /tmp/siros-maven-settings.xml \
+            -DrepositoryId=github -Durl="https://maven.pkg.github.com/${GITHUB_REPOSITORY}" \
+            -DpomFile="$pom" -Dfile="$aar" -Dpackaging=aar
+      - uses: actions/upload-artifact@v7
+        with:
+          name: siros-verifier-core-${{ github.ref_name }}-android
+          path: |
+            target/native-android/*.aar
+            target/native-android/*.pom
+          if-no-files-found: error
+      - name: Attach the Android artifacts to the release
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v2
+        with:
+          files: |
+            target/native-android/*.aar
+            target/native-android/*.pom
+
+  native-ios:
+    name: Build the native iOS Reader
+    needs: validate
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: ffi/scripts/ios-xcframework.sh target/native-ios
+      - name: Package and checksum the XCFramework
+        run: |
+          set -euo pipefail
+          python3 ffi/scripts/zip-directory.py target/native-ios/SirosVerifierCore.xcframework.zip target/native-ios/SirosVerifierCore.xcframework
+          swift package compute-checksum target/native-ios/SirosVerifierCore.xcframework.zip \
+            | tee target/native-ios/SirosVerifierCore.xcframework.zip.checksum
+      - uses: actions/upload-artifact@v7
+        with:
+          name: siros-verifier-core-${{ github.ref_name }}-ios
+          path: |
+            target/native-ios/SirosVerifierCore.xcframework.zip
+            target/native-ios/SirosVerifierCore.xcframework.zip.checksum
+            target/native-ios/swift/siros_verifier_core_ffi.swift
+          if-no-files-found: error
+      - name: Attach the iOS artifacts to the release
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v2
+        with:
+          files: |
+            target/native-ios/SirosVerifierCore.xcframework.zip
+            target/native-ios/SirosVerifierCore.xcframework.zip.checksum
+            target/native-ios/swift/siros_verifier_core_ffi.swift
+
   crates:
     name: Publish Rust libraries and release artifacts
     needs: [validate, docker]

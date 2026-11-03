@@ -9,7 +9,7 @@ description = "UniFFI bindings for the SIROS verifier core"
 publish = true
 
 [lib]
-crate-type = ["cdylib", "lib"]
+crate-type = ["cdylib", "staticlib", "lib"]
 name = "siros_verifier_core_ffi"
 
 [[bin]]

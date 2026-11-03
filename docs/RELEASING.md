@@ -2,6 +2,8 @@
 
 The tag workflow is [`.github/workflows/release.yml`](../.github/workflows/release.yml). It validates the tagged source, builds the GHCR image through the organization workflow, generates signed source/image SBOMs and vulnerability results, publishes the public Rust crates with OIDC trusted publishing, and attaches `.crate` files, checksums, the image digest, and provenance attestations to the GitHub release.
 
+The native Reader jobs build from the same tag. `native-android` publishes the AAR and POM to this repository's GitHub Packages Maven repository and attaches them to the release. `native-ios` attaches `SirosVerifierCore.xcframework.zip`, the Swift Package Manager checksum, and the generated Swift bindings. The Kotlin and Swift SDKs must select these artifacts from one shared version rather than generating bindings from different core revisions. Local build inputs and outputs are documented in [`ffi/README.md`](../ffi/README.md).
+
 ## Prerequisites
 
 1. Publish the exact external registry dependencies used by the public crates. For this release those are `siros-dc-matcher-core` 0.12.0, `zk-cred-longfellow` 0.1.2, `zk-cred-vega` 0.0.7, and `tunnelbana-core` 0.6.0. Git revisions remain pinned for development; crates.io packages resolve the corresponding registry versions.

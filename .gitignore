@@ -6,7 +6,8 @@
 /fuzz/target/
 /fuzz/artifacts/
 
-# Kotlin/Gradle test artifacts
+# Native packaging and Kotlin/Gradle test artifacts
+/ffi/dist/
 /ffi/kotlin-test/build/
 /ffi/kotlin-test/.gradle/
 /ffi/kotlin-test/.kotlin/
