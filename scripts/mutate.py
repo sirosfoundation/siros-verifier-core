@@ -6,7 +6,7 @@ being removed. Usage: scripts/mutate.py  (run from the crate root)
 """
 import subprocess, sys, pathlib
 
-F = {"sd": "src/sdjwt.rs", "vp": "src/oid4vp.rs", "md": "src/mdoc.rs", "mr": "src/mdoc_request.rs", "ms": "src/mdoc_session.rs", "rc": "src/receipt.rs", "tb": "tunnelbana-plugin/src/lib.rs", "tf": "tunnelbana-plugin/src/flow.rs", "js": "src/json_strict.rs", "ss": "src/session_seal.rs"}
+F = {"sd": "src/sdjwt.rs", "vp": "src/oid4vp.rs", "md": "src/mdoc.rs", "mr": "src/mdoc_request.rs", "ms": "src/mdoc_session.rs", "rc": "src/receipt.rs", "tb": "tunnelbana-plugin/src/lib.rs", "tf": "tunnelbana-plugin/src/flow.rs", "js": "src/json_strict.rs", "ss": "src/session_seal.rs", "fi": "ffi/src/lib.rs"}
 M = [
  ("sd", 'if kbc.get("sd_hash").and_then(Value::as_str) != Some(expected.as_str()) {', 'if false {', "KB sd_hash"),
  ("sd", 'if w.used.len() != count {', 'if false {', "unreferenced disclosure"),
@@ -40,6 +40,8 @@ M = [
  ("vp", '_ => return Err(policy("only dc+sd-jwt and mso_mdoc are supported")),', '_ => {}', "format"),
  ("vp", 'if session.dcql_query.get("credential_sets").is_some() {', 'if false {', "credential_sets fail-closed"),
  ("vp", 'object.insert("wallet_nonce".into(), json!(wallet_nonce));', 'object.insert("wallet_nonce".into(), json!("wrong"));', "request wallet nonce binding"),
+ ("fi", 'if role.trim().is_empty() || role.trim() != role || role.chars().any(char::is_control) {', 'if false {', "ffi issuer role validation"),
+ ("fi", 'if let Some(policy) = request_policy {', 'if let Some(policy) = None::<RequestPolicy> {', "ffi retained request policy"),
  ("vp", 'if let Some(err) = body.get("error") {', 'if let Some(err) = None::<&Value> {', "wallet error"),
  ("vp", 'if jwe.len() > MAX_RESPONSE_JWE {', 'if false {', "response JWE size limit"),
  ("vp", 'if parts.len() != 5 {', 'if false {', "response JWE parts"),
@@ -147,7 +149,10 @@ M = [
 
 ONLY = set(sys.argv[1:])
 if ONLY: M = [x for x in M if x[0] in ONLY]
-def cwd_for(key): return "tunnelbana-plugin" if F[key].startswith("tunnelbana-plugin") else "."
+def cwd_for(key):
+    if F[key].startswith("tunnelbana-plugin"): return "tunnelbana-plugin"
+    if F[key].startswith("ffi/"): return "ffi"
+    return "."
 ENV = dict(__import__("os").environ, CARGO_NET_GIT_FETCH_WITH_CLI="true")
 def cargo(key, *a): return subprocess.run(["cargo", "test", "--quiet", "--all-features", *a], capture_output=True, text=True, cwd=cwd_for(key), env=ENV)
 base = cargo(next(iter(ONLY or {"sd"})))

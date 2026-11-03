@@ -8,6 +8,10 @@ fn hex(s: &str) -> Vec<u8> {
 }
 
 fn reader() -> (std::sync::Arc<Reader>, serde_json::Value) {
+    reader_with_role(None)
+}
+
+fn reader_with_role(role: Option<&str>) -> (std::sync::Arc<Reader>, serde_json::Value) {
     use ciborium::Value as C;
     use siros_verifier_core::mdoc_session::ReaderHandshake;
     let v: serde_json::Value =
@@ -29,7 +33,11 @@ fn reader() -> (std::sync::Arc<Reader>, serde_json::Value) {
     ciborium::into_writer(&a[2], &mut ho).unwrap();
     let sk = p256::SecretKey::from_slice(&hex(v["ereader"]["d"].as_str().unwrap())).unwrap();
     let session = ReaderHandshake::from_secret(sk).establish(de, &ho).unwrap();
-    (Reader::from_session(session), v)
+    let reader = match role {
+        Some(role) => Reader::from_session_with_role(session, role.into()).unwrap(),
+        None => Reader::from_session(session),
+    };
+    (reader, v)
 }
 
 fn spec_request(v: &serde_json::Value) -> Vec<u8> {
@@ -103,6 +111,59 @@ impl ReaderAuthSigner for ReplaySigner {
     }
 }
 
+fn requested_document(doc_type: &str, namespace: &str, identifiers: &[&str]) -> RequestedDocument {
+    RequestedDocument {
+        doc_type: doc_type.into(),
+        namespaces: vec![RequestedNamespace {
+            namespace: namespace.into(),
+            elements: identifiers
+                .iter()
+                .map(|identifier| RequestedElement {
+                    identifier: (*identifier).into(),
+                    intent_to_retain: false,
+                })
+                .collect(),
+        }],
+        reader_auth: None,
+    }
+}
+
+fn expect_rejected(result: Result<Vec<VerifiedDocument>, FfiError>) -> FfiError {
+    match result {
+        Err(error) => error,
+        Ok(_) => panic!("response unexpectedly passed request policy"),
+    }
+}
+
+fn spec_document(spec: &[u8]) -> RequestedDocument {
+    let (signature, certificate) = spec_auth(spec);
+    let auth = ReaderAuth::new(
+        vec![certificate],
+        std::sync::Arc::new(ReplaySigner(signature)),
+    );
+    RequestedDocument {
+        doc_type: "org.iso.18013.5.1.mDL".into(),
+        namespaces: vec![RequestedNamespace {
+            namespace: "org.iso.18013.5.1".into(),
+            elements: [
+                ("family_name", true),
+                ("document_number", true),
+                ("driving_privileges", true),
+                ("issue_date", true),
+                ("expiry_date", true),
+                ("portrait", false),
+            ]
+            .into_iter()
+            .map(|(identifier, intent_to_retain)| RequestedElement {
+                identifier: identifier.into(),
+                intent_to_retain,
+            })
+            .collect(),
+        }],
+        reader_auth: Some(std::sync::Arc::new(auth)),
+    }
+}
+
 #[test]
 fn spec_response_through_the_facade() {
     let (r, v) = reader();
@@ -120,6 +181,7 @@ fn spec_response_through_the_facade() {
         .any(|e| e.identifier == "family_name"));
     let q: serde_json::Value = serde_json::from_str(&docs[0].authzen_request_json).unwrap();
     assert_eq!(q["resource"]["type"], "x5c");
+    assert_eq!(q["action"]["name"], "pid-provider");
 }
 
 #[test]
@@ -176,38 +238,156 @@ fn first_message_matches_the_spec_and_cannot_be_sent_twice() {
 fn request_builder_and_host_signer_reproduce_the_spec() {
     let (r, v) = reader();
     let spec = spec_request(&v);
-    let (signature, certificate) = spec_auth(&spec);
-    let auth = ReaderAuth::new(
-        vec![certificate],
-        std::sync::Arc::new(ReplaySigner(signature)),
-    );
-    let document = RequestedDocument {
-        doc_type: "org.iso.18013.5.1.mDL".into(),
-        namespaces: vec![RequestedNamespace {
-            namespace: "org.iso.18013.5.1".into(),
-            elements: [
-                ("family_name", true),
-                ("document_number", true),
-                ("driving_privileges", true),
-                ("issue_date", true),
-                ("expiry_date", true),
-                ("portrait", false),
-            ]
-            .into_iter()
-            .map(|(identifier, intent_to_retain)| RequestedElement {
-                identifier: identifier.into(),
-                intent_to_retain,
-            })
-            .collect(),
-        }],
-        reader_auth: Some(std::sync::Arc::new(auth)),
-    };
-    let request = r.build_device_request(vec![document]).unwrap();
+    let request = r.build_device_request(vec![spec_document(&spec)]).unwrap();
     assert_eq!(request, spec);
     assert_eq!(
         r.establishment_message(request).unwrap(),
         hex(v["session_establishment"].as_str().unwrap())
     );
+}
+
+#[test]
+fn atomic_request_reproduces_the_spec_and_retains_response_policy() {
+    let (r, v) = reader();
+    let spec = spec_request(&v);
+    assert_eq!(
+        r.establishment_message_from_documents(vec![spec_document(&spec)])
+            .unwrap(),
+        hex(v["session_establishment"].as_str().unwrap())
+    );
+
+    let (r, v) = reader();
+    r.establishment_message_from_documents(vec![requested_document(
+        "org.iso.18013.5.1.mDL",
+        "org.iso.18013.5.1",
+        &["family_name"],
+    )])
+    .unwrap();
+    let documents = r
+        .open_response(
+            hex(v["session_data"].as_str().unwrap()),
+            1_610_000_000,
+            vec![],
+        )
+        .unwrap();
+    assert_eq!(documents.len(), 1);
+    assert!(documents[0].elements.len() > 1, "extra claims are allowed");
+}
+
+#[test]
+fn atomic_request_rejects_wrong_or_missing_document_types() {
+    let (r, v) = reader();
+    r.establishment_message_from_documents(vec![requested_document(
+        "example.unrequested",
+        "org.iso.18013.5.1",
+        &["family_name"],
+    )])
+    .unwrap();
+    let error = expect_rejected(r.open_response(
+        hex(v["session_data"].as_str().unwrap()),
+        1_610_000_000,
+        vec![],
+    ));
+    assert!(matches!(error, FfiError::Rejected { code, .. } if code == "policy"));
+
+    let (r, v) = reader();
+    r.establishment_message_from_documents(vec![
+        requested_document(
+            "org.iso.18013.5.1.mDL",
+            "org.iso.18013.5.1",
+            &["family_name"],
+        ),
+        requested_document(
+            "example.also-required",
+            "org.iso.18013.5.1",
+            &["family_name"],
+        ),
+    ])
+    .unwrap();
+    let error = expect_rejected(r.open_response(
+        hex(v["session_data"].as_str().unwrap()),
+        1_610_000_000,
+        vec![],
+    ));
+    assert!(
+        matches!(error, FfiError::Rejected { code, detail } if code == "policy" && detail.contains("requested_doc_type_missing"))
+    );
+}
+
+#[test]
+fn atomic_request_rejects_missing_required_namespaces_and_elements() {
+    for (namespace, element, expected) in [
+        (
+            "example.missing",
+            "family_name",
+            "requested_namespace_missing",
+        ),
+        (
+            "org.iso.18013.5.1",
+            "not_disclosed",
+            "requested_element_missing",
+        ),
+    ] {
+        let (r, v) = reader();
+        r.establishment_message_from_documents(vec![requested_document(
+            "org.iso.18013.5.1.mDL",
+            namespace,
+            &[element],
+        )])
+        .unwrap();
+        let error = expect_rejected(r.open_response(
+            hex(v["session_data"].as_str().unwrap()),
+            1_610_000_000,
+            vec![],
+        ));
+        assert!(
+            matches!(&error, FfiError::Rejected { code, detail } if code == "policy" && detail.contains(expected)),
+            "{error}"
+        );
+        assert!(!error.to_string().contains("Svensson"));
+    }
+}
+
+#[test]
+fn atomic_data_message_also_retains_response_policy() {
+    let (r, v) = reader();
+    r.establishment_message(vec![0xa0]).unwrap();
+    r.data_message_from_documents(vec![requested_document(
+        "org.iso.18013.5.1.mDL",
+        "org.iso.18013.5.1",
+        &["not_disclosed"],
+    )])
+    .unwrap();
+    assert!(r
+        .open_response(
+            hex(v["session_data"].as_str().unwrap()),
+            1_610_000_000,
+            vec![]
+        )
+        .is_err());
+}
+
+#[test]
+fn explicit_mdoc_issuer_role_is_validated_and_used_only_as_authzen_evidence() {
+    let role = "https://roles.example/mdoc-issuer";
+    let (r, v) = reader_with_role(Some(role));
+    let documents = r
+        .open_response(
+            hex(v["session_data"].as_str().unwrap()),
+            1_610_000_000,
+            vec![],
+        )
+        .unwrap();
+    let query: serde_json::Value =
+        serde_json::from_str(&documents[0].authzen_request_json).unwrap();
+    assert_eq!(query["action"]["name"], role);
+
+    for role in ["", " ", " pid-provider", "pid-provider\n", "pid\0provider"] {
+        assert!(
+            matches!(Reader::start_with_role(vec![], vec![], role.into()), Err(FfiError::Rejected { code, detail }) if code == "policy" && detail.contains("invalid_mdoc_issuer_role")),
+            "accepted invalid role {role:?}"
+        );
+    }
 }
 
 #[test]
