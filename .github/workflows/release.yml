@@ -59,15 +59,6 @@ jobs:
       - run: npm pack --dry-run
         working-directory: tunnelbana-plugin/src/assets
 
-      - name: Check that external registry dependencies are released
-        run: |
-          set -euo pipefail
-          for dependency in siros-dc-matcher-core/0.12.0 zk-cred-longfellow/0.1.2 zk-cred-vega/0.0.7 tunnelbana-core/0.6.0; do
-            curl -fsS -A 'siros-verifier-release (github-actions)' \
-              "https://crates.io/api/v1/crates/$dependency" \
-              | jq -e '.version.yanked == false' > /dev/null
-          done
-
       - name: Check public package contents
         run: |
           set -euo pipefail
@@ -217,6 +208,18 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      # Registry releases are a separate track from Docker and native artifacts.
+      # Only this job requires the external Rust dependencies to be published;
+      # the Docker image and SDK artifacts build from the locked source graph.
+      - name: Check that external registry dependencies are released
+        run: |
+          set -euo pipefail
+          for dependency in siros-dc-matcher-core/0.12.0 zk-cred-longfellow/0.1.2 zk-cred-vega/0.0.7 tunnelbana-core/0.6.0; do
+            curl -fsS -A 'siros-verifier-release (github-actions)' \
+              "https://crates.io/api/v1/crates/$dependency" \
+              | jq -e '.version.yanked == false' > /dev/null
+          done
 
       # crates.io exchanges this workflow's OIDC identity for a short-lived
       # token. No long-lived registry token is stored in the repository.
