@@ -4995,6 +4995,7 @@ dependencies = [
  "tracing-subscriber",
  "tunnelbana-core",
  "tunnelbana-plugins",
+ "zstd",
 ]
 
 [[package]]

@@ -65,7 +65,7 @@ Native tests use genuine proof vectors and negative mutations. Do not replace th
 
 1. Put deployment-only settings in `service/src/config.rs`; do not leak them into the sans-I/O core.
 2. Register native backends through `BackendRegistry` and the existing `ProofBackend` trait. Do not bypass `check_claimed`, issuer-set policy, or go-trust.
-3. Keep catalog and file sources behind `ArtifactSource`; production uses startup `prefetch`.
+3. Keep catalog and file sources behind `ArtifactSource`; production uses startup `prefetch` followed by `ZkpVerifier::prewarm`, while embedded users may keep lazy backend loading.
 4. Add UI/backend profiles together and validate each plan at construction. Reject unknown systems and unsupported functions at startup.
 5. Keep proximity transport and NDEF parsing in the application. Use `kryptering::Signer` for the reader's long-term ReaderAuth key, never the ephemeral session key; sign exact tag-24 values and preserve their bytes. Do not hold the FFI session lock during a foreign signing callback.
 6. Add positive and negative tests, including public-input mutations and refusal codes. Update `docs/CONFIGURATION.md` for any schema change and this file for changed workflows.
