@@ -38,3 +38,4 @@ tunnelbana-plugins = { git = "https://github.com/sirosfoundation/tunnelbana.git"
 futures-util = "0.3"
 rcgen = "0.14"
 tokio = { version = "1", features = ["full"] }
+zstd = "0.14.3"

@@ -157,6 +157,19 @@ impl ZkpVerifier {
         &self.policy
     }
 
+    /// Initialize every allowlisted backend, validating each artifact and native circuit eagerly.
+    ///
+    /// This is an explicit startup operation for long-lived services. Embedded callers retain lazy
+    /// loading when they prefer lower memory use. Successful loads share the same per-verifier cache
+    /// as request-time loading; failures are returned and remain retryable rather than being cached.
+    /// No presentation, witness, proof result, or trust decision is prepared here.
+    pub fn prewarm(&self) -> ZkpResult<()> {
+        for entry in self.allowlist.entries() {
+            self.backend(&entry.system_id, &entry.config)?;
+        }
+        Ok(())
+    }
+
     /// Phase one. See the module documentation.
     pub fn begin(&self, ex: &Exchange, vp_token_json: &str) -> ZkpResult<Pending<'_>> {
         // The request this verifier sent must itself be satisfiable; a request that cannot be is a fault here, not a

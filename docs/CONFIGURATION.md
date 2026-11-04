@@ -123,6 +123,6 @@ artifact_sha256 = "4da5e73afb9be2682e70be793c9956a73304e21f31246aa10da0d3e95c926
 artifact_bytes = 12205144
 ```
 
-`api.circuits.siros.org` serves descriptors and immutable artifacts; `circuits.siros.org` is the human-facing site. Sources are ordered mirrors, each subject to the same operator pin. Startup prefetches and verifies catalog artifacts; wallet responses never fetch them. If startup cannot obtain the exact allowed artifact, the service fails closed.
+`api.circuits.siros.org` serves descriptors and immutable artifacts; `circuits.siros.org` is the human-facing site. Sources are ordered mirrors, each subject to the same operator pin. Startup prefetches and verifies catalog artifacts; wallet responses never fetch them. The service then prewarms every allowlisted native backend, validating local files and initializing Longfellow/Vega before the first presentation. If startup cannot obtain, verify, or initialize the exact allowed artifact, the service fails closed. Embedded library users may instead keep lazy backend loading by not calling `ZkpVerifier::prewarm`.
 
 `artifact_sha256` and `artifact_bytes` always describe the **decompressed** bytes. Use exactly one of `artifact_id` and `artifact_path` per entry. `artifact_path` is the explicit offline alternative and bypasses catalog access. Do not put Longfellow parameters on a Vega entry.

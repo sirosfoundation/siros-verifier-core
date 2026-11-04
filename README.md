@@ -75,9 +75,11 @@ verdicts. A typical OpenID4VP integration:
 
 For ZK verification, register the native backends and keep circuit artifacts
 behind an exact allowlist. Catalog artifacts are prefetched at startup and
-checked by decompressed size and SHA-256; wallet requests never trigger catalog
-network access. The catalog provides artifact integrity, not issuer or verifier
-trust.
+checked by decompressed size and SHA-256; the service also prewarms every native
+backend before serving a presentation. Wallet requests never trigger catalog
+network access or first-use native initialization. Embedded users can keep lazy
+loading by not calling `ZkpVerifier::prewarm`. The catalog provides artifact
+integrity, not issuer or verifier trust.
 
 Start with the public modules in [`src/lib.rs`](src/lib.rs) and
 [`zkp/src/lib.rs`](zkp/src/lib.rs), or follow the service composition in

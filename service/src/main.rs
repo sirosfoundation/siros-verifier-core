@@ -259,7 +259,7 @@ fn build_zkp_verifier(config: &ZkpDeploymentConfig) -> anyhow::Result<ZkpVerifie
             .map_err(|e| anyhow!(e))?;
     }
     let artifacts = CatalogArtifactSource::new(&config.circuits.sources)?.prefetch(&allowlist)?;
-    Ok(ZkpVerifier::new(
+    let verifier = ZkpVerifier::new(
         allowlist,
         Box::new(artifacts),
         FunctionRegistry::with_builtins(),
@@ -269,7 +269,11 @@ fn build_zkp_verifier(config: &ZkpDeploymentConfig) -> anyhow::Result<ZkpVerifie
             issuer_set: config.issuer_set,
             tolerance: config.tolerance,
         },
-    )?)
+    )?;
+    // Validate local paths/hashes and initialize every allowlisted native backend before serving a
+    // presentation. Embedded users keep lazy loading; the service pays this cost once at startup.
+    verifier.prewarm().map_err(|e| anyhow!(e))?;
+    Ok(verifier)
 }
 
 async fn build_openid4vp_backend(
@@ -596,6 +600,11 @@ mod tests {
             chain = dir.join("chain.pem").display()
         ))
         .unwrap();
+        let artifact =
+            zstd::decode_all(&include_bytes!("../../zkp/testdata/nymauth/mdoc-circuits.zst")[..])
+                .expect("decode the genuine Longfellow circuit used by the startup prewarm test");
+        assert_eq!(artifact.len(), 1_062_842);
+        std::fs::write(dir.join("nymauth.bin"), artifact).unwrap();
         build_proxy(cfg, dir.join("proxy.toml").to_str().unwrap())
             .await
             .unwrap();
