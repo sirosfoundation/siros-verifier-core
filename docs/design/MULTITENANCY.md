@@ -62,10 +62,13 @@ configuration requires the changes below.
 Separate registration, RP configuration, and presentation state:
 
 1. **`ClientRegistrationService`** validates enrollment and performs dynamic
-   registration. It uses the existing OIDC `ClientStore` abstraction where
-   practical rather than creating a second client repository.
+   registration. It is an external control-plane component, not an endpoint in
+   `siros-verifier-service`. It may share a Rust registration/library package
+   and the existing OIDC `ClientStore` abstraction rather than creating a
+   second client repository.
 2. **`RelyingPartyConfigProvider`** resolves an RP's immutable verifier
-   configuration snapshot. This is a new read-side abstraction.
+   configuration snapshot. This is a new read-side abstraction and is the only
+   RP-configuration interface required in the verifier runners.
 3. **The existing `FlowStore`** continues to own presentation state, replay
    protection, and one-time results. It is not a customer configuration store.
 
@@ -131,9 +134,13 @@ use customer-admin authentication and authorization in the control plane.
 Changes are validated, versioned, audited, and guarded by an expected revision
 for optimistic concurrency. Disable/revoke operations are also audited.
 
-Registration writes go through the control plane or shared registration
-service, not independently through every runner. This avoids split-brain
-creation and inconsistent token consumption.
+The public registration endpoint is deployed with the control plane or shared
+registration service, **outside the verifier cluster**. Verifier runners are
+read-only configuration consumers and do not expose `/register`. An optional
+embedded registration adapter is not required and, if ever introduced, must
+be a separate deployable profile rather than part of the sans-I/O core. This
+avoids split-brain creation, inconsistent token consumption, and an unnecessary
+public write surface on every verifier replica.
 
 ## Configuration API and cache
 
@@ -244,7 +251,8 @@ reviewed steps:
 1. Introduce snapshot/provider interfaces and static-TOML parity. Clarify the
    JS tenant documentation without changing presentation behavior.
 2. Add shared client storage, enrollment-token handling, and dynamic
-   registration with idempotency and strict client validation.
+   registration with idempotency and strict client validation in the external
+   registration/control-plane service, not in the verifier runners.
 3. Add flow RP/revision binding, sealing/storage/receipt namespacing, and
    migration for in-flight sessions.
 4. Add the remote configuration API, ETag caching, singleflight, and
@@ -259,8 +267,9 @@ registration may ship before steps 4–5 using static verifier profiles.
 ## Acceptance criteria
 
 - Existing static configurations behave unchanged and require no database.
-- Registration retries are idempotent and one customer cannot register or edit
-  another customer's RP.
+- Verifier runner route tables expose no registration endpoint; registration
+  retries through the external service are idempotent, and one customer cannot
+  register or edit another customer's RP.
 - Any replica can complete any flow without cross-RP session, replay, result,
   token, receipt, or pseudonym leakage.
 - Thousands of RPs have bounded memory use and no startup-wide configuration
