@@ -570,6 +570,65 @@ fn cnf_must_be_public() {
 }
 
 #[test]
+fn malformed_status_list_structures_are_not_treated_as_absent() {
+    let f = fx();
+    let r = resolver(&f);
+    // The Token Status List specification defines status as an object and a
+    // status_list reference as an object with an unsigned integer idx and a
+    // string uri. A malformed reference must not silently disable checking.
+    for status in [
+        json!(null),
+        json!("status"),
+        json!({}),
+        json!({ "status_list": null }),
+        json!({ "status_list": [] }),
+        json!({ "status_list": {} }),
+        json!({ "status_list": { "idx": 7 } }),
+        json!({ "status_list": { "uri": "https://status.example/1" } }),
+        json!({ "status_list": { "idx": -1, "uri": "https://status.example/1" } }),
+        json!({ "status_list": { "idx": "7", "uri": "https://status.example/1" } }),
+        json!({ "status_list": { "idx": 7, "uri": null } }),
+        json!({ "status_list": { "idx": 7, "uri": "" } }),
+        json!({ "status_list": { "idx": 7, "uri": "not a URI" } }),
+        json!({ "status_list": { "idx": 7, "uri": "https://status.example/a b" } }),
+        json!({ "status_list": { "idx": 7, "uri": "https://status.example/é" } }),
+        json!({ "status_list": { "idx": 7, "uri": "https://status.example/%ZZ" } }),
+        json!({ "status_list": { "idx": 7, "uri": "https://status.example/\\path" } }),
+        json!({ "status_list": { "idx": 7, "uri": "https://status.example/<path>" } }),
+        json!({ "status_list": { "idx": 7, "uri": "https://status.example/1#one#two" } }),
+        json!({ "status_list": { "idx": 7, "uri": "HTTPS:status.example" } }),
+        json!({ "status_list": { "idx": 7, "uri": "https://[v1]/status.jwt" } }),
+        json!({ "status_list": { "idx": 7, "uri": "status:/a:b" } }),
+        json!({ "status_list": { "idx": 7, "uri": "https://user[info]@status.example/1" } }),
+    ] {
+        let mut claims = base_claims();
+        claims["status"] = status.clone();
+        let error = verify(&plain(&f, claims), &r, &nokb())
+            .err()
+            .unwrap_or_else(|| panic!("accepted malformed status {status}"));
+        assert_eq!(error.code(), "malformed", "status {status}");
+    }
+}
+
+#[test]
+fn rfc3986_status_uris_are_accepted() {
+    let f = fx();
+    let r = resolver(&f);
+    for uri in [
+        "https://status.example/a%20b",
+        "https://status.example?x:y",
+        "file:///status.jwt",
+        "https://[v1.fe]/status.jwt",
+        "status://status.example:65536/list",
+        "status:/a/b:c",
+    ] {
+        let mut claims = base_claims();
+        claims["status"] = json!({ "status_list": { "idx": 7, "uri": uri } });
+        verify(&plain(&f, claims), &r, &nokb()).unwrap();
+    }
+}
+
+#[test]
 fn x5c_issuer_evidence_and_status() {
     let f = fx();
     let (cert, issuer_jwk) = self_signed_ec("issuer.example", "ES256");

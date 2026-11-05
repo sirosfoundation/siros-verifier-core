@@ -383,6 +383,244 @@ fn decode_header(jwt: &str) -> Result<JoseHeader> {
 }
 
 /// Verify an SD-JWT VC presentation.
+fn valid_scheme(scheme: &str) -> bool {
+    let Some(first) = scheme.chars().next() else {
+        return false;
+    };
+    first.is_ascii_alphabetic()
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
+fn valid_userinfo(userinfo: &str) -> bool {
+    userinfo.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'-' | b'.'
+                    | b'_'
+                    | b'~'
+                    | b':'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'='
+                    | b'%'
+            )
+    })
+}
+
+fn valid_reg_name(host: &str) -> bool {
+    !host.is_empty()
+        && host.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'-' | b'.'
+                        | b'_'
+                        | b'~'
+                        | b'!'
+                        | b'$'
+                        | b'&'
+                        | b'\''
+                        | b'('
+                        | b')'
+                        | b'*'
+                        | b'+'
+                        | b','
+                        | b';'
+                        | b'='
+                        | b'%'
+                )
+        })
+}
+
+fn valid_ipv_future(literal: &str) -> bool {
+    let Some((version, address)) = literal.split_once('.') else {
+        return false;
+    };
+    let Some(version) = version
+        .strip_prefix('v')
+        .or_else(|| version.strip_prefix('V'))
+    else {
+        return false;
+    };
+    !version.is_empty()
+        && version.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && !address.is_empty()
+        && address.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'-' | b'.'
+                        | b'_'
+                        | b'~'
+                        | b':'
+                        | b'!'
+                        | b'$'
+                        | b'&'
+                        | b'\''
+                        | b'('
+                        | b')'
+                        | b'*'
+                        | b'+'
+                        | b','
+                        | b';'
+                        | b'='
+                )
+        })
+}
+
+fn valid_authority(authority: &str) -> bool {
+    if authority.is_empty() || authority.matches('@').count() > 1 {
+        return false;
+    }
+    let (userinfo, host_port) = authority
+        .rsplit_once('@')
+        .map_or(("", authority), |(userinfo, host)| (userinfo, host));
+    if !valid_userinfo(userinfo) {
+        return false;
+    }
+    if let Some(literal) = host_port.strip_prefix('[') {
+        let Some((literal, suffix)) = literal.split_once(']') else {
+            return false;
+        };
+        if literal.parse::<std::net::Ipv6Addr>().is_err() && !valid_ipv_future(literal) {
+            return false;
+        }
+        return suffix.is_empty()
+            || suffix
+                .strip_prefix(':')
+                .is_some_and(|port| port.bytes().all(|byte| byte.is_ascii_digit()));
+    }
+    if host_port.matches(':').count() > 1 {
+        return false;
+    }
+    let (host, port) = host_port
+        .rsplit_once(':')
+        .map_or((host_port, ""), |(host, port)| (host, port));
+    valid_reg_name(host) && port.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn valid_status_uri(uri: &str) -> bool {
+    // Token Status List §6.2 uses an RFC 3986 URI, not an IRI or a WHATWG
+    // normalized URL. Reject raw whitespace/non-ASCII and malformed percent
+    // escapes before validating each URI component.
+    if uri.is_empty() || !uri.is_ascii() {
+        return false;
+    }
+    let bytes = uri.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return false;
+            }
+            index += 3;
+            continue;
+        }
+        let allowed = byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'-' | b'.'
+                    | b'_'
+                    | b'~'
+                    | b':'
+                    | b'/'
+                    | b'?'
+                    | b'#'
+                    | b'['
+                    | b']'
+                    | b'@'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'='
+            );
+        if !allowed {
+            return false;
+        }
+        index += 1;
+    }
+
+    let Some((scheme, remainder)) = uri.split_once(':') else {
+        return false;
+    };
+    if !valid_scheme(scheme) {
+        return false;
+    }
+    let parts: Vec<&str> = remainder.split('#').collect();
+    if parts.len() > 2 {
+        return false;
+    }
+    let (hierarchical, query) = parts[0]
+        .split_once('?')
+        .map_or((parts[0], None), |(hierarchical, query)| {
+            (hierarchical, Some(query))
+        });
+    let is_http = scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https");
+    let (authority, path) = if let Some(after_slashes) = hierarchical.strip_prefix("//") {
+        let end = after_slashes
+            .find('/')
+            .map_or(hierarchical.len(), |index| index + 2);
+        let authority = &hierarchical[2..end];
+        if (is_http || !authority.is_empty()) && !valid_authority(authority) {
+            return false;
+        }
+        (authority, &hierarchical[end..])
+    } else {
+        if is_http {
+            return false;
+        }
+        // RFC 3986 path-absolute uses segment-nz-nc for its first segment:
+        // without an authority, a colon is allowed only in later segments.
+        if hierarchical.starts_with('/')
+            && hierarchical[1..]
+                .split('/')
+                .next()
+                .is_some_and(|segment| segment.contains(':'))
+        {
+            return false;
+        }
+        ("", hierarchical)
+    };
+    if is_http && authority.is_empty() {
+        return false;
+    }
+    if path.contains('[') || path.contains(']') {
+        return false;
+    }
+    if query.is_some_and(|query| query.contains('[') || query.contains(']')) {
+        return false;
+    }
+    if parts
+        .get(1)
+        .is_some_and(|fragment| fragment.contains('[') || fragment.contains(']'))
+    {
+        return false;
+    }
+    true
+}
+
 pub fn verify(
     presentation: &str,
     resolver: &dyn IssuerKeyResolver,
@@ -527,16 +765,46 @@ pub fn verify(
         }
     }
 
-    // 5. Evidence and status.
-    let status = claims
-        .get("status")
-        .and_then(|s| s.get("status_list"))
-        .and_then(|sl| {
-            Some(StatusRef {
-                idx: sl.get("idx")?.as_u64()?,
-                uri: sl.get("uri")?.as_str()?.to_owned(),
-            })
-        });
+    // 5. Evidence and status. A malformed status_list reference is not the
+    // same as no reference: accepting it would silently skip status checking.
+    let status = match claims.get("status") {
+        None => None,
+        Some(status) => {
+            let status = status
+                .as_object()
+                .ok_or_else(|| malformed("status must be an object"))?;
+            if status.is_empty() {
+                return Err(malformed("status must not be empty"));
+            }
+            match status.get("status_list") {
+                None => None,
+                Some(status_list) => {
+                    let status_list = status_list
+                        .as_object()
+                        .ok_or_else(|| malformed("status.status_list must be an object"))?;
+                    let idx = status_list
+                        .get("idx")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| {
+                            malformed("status.status_list.idx must be an unsigned integer")
+                        })?;
+                    let uri = status_list
+                        .get("uri")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| malformed("status.status_list.uri must be a string"))?;
+                    // Token Status List §6.2 requires an RFC 3986 URI. The
+                    // transport applies its separate HTTPS and egress policy.
+                    if !valid_status_uri(uri) {
+                        return Err(malformed("status.status_list.uri must be a valid URI"));
+                    }
+                    Some(StatusRef {
+                        idx,
+                        uri: uri.to_owned(),
+                    })
+                }
+            }
+        }
+    };
     let exp_out = exp;
     Ok(CryptoVerified {
         vct,

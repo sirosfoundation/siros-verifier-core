@@ -596,6 +596,31 @@ async fn missing_response_parameter_fails_the_flow() {
     );
 }
 
+#[tokio::test]
+async fn duplicate_response_parameters_are_rejected() {
+    let f = fx();
+    let (state, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    let jwe = wallet(&f, &jar);
+    let mut request = req(&format!("vp/response/{id}"), "POST");
+    // RFC 6749 section 3.1 prohibits repeated request/response parameters.
+    // Keep the last value valid so accepting last-write-wins would succeed.
+    request.form = BTreeMap::from([("response".to_string(), jwe.clone())]);
+    request.form_pairs = vec![
+        ("response".into(), "a-different-response".into()),
+        ("response".into(), jwe),
+    ];
+    let mut ctx = Context::new(request, State::new());
+    let (status, body) = respond_body(f.b.handle_endpoint(&mut ctx, "response").await.unwrap());
+    assert_eq!(status, 400);
+    let error: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(error["error"], "duplicate_response");
+    assert_eq!(
+        complete(&f, &state).await.err().unwrap(),
+        "authentication error: duplicate_response"
+    );
+}
+
 #[test]
 fn routes_cover_the_flow_endpoints_and_nothing_else() {
     let f = fx();
