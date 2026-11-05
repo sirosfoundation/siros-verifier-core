@@ -70,8 +70,10 @@ Add both the XCFramework and generated Swift source to the Apple target.
 GitHub CI runs this packaging script on `macos-latest` for pushes to `main`
 and all pull requests, and uploads the XCFramework ZIP, SPM checksum, and Swift bindings as a
 test artifact. The release workflow attaches the same outputs to the GitHub
-release. A remote macOS host can run the identical script for additional
-validation without changing the CI contract.
+release. The ZIP retains the enclosing `SirosVerifierCore.xcframework`
+directory required by SwiftPM; CI and release both assert that its root
+`Info.plist` is present. A remote macOS host can run the identical script for
+additional validation without changing the CI contract.
 
 Both packaging scripts use `--locked`, `--release`, and `--no-default-features`;
 they never enable the test-only `vector-tests` feature. They use the crate's own

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write a deterministic ZIP containing all files below a directory."""
+"""Write a deterministic ZIP containing a directory and all files below it."""
 
 from pathlib import Path
 import sys
@@ -18,7 +18,7 @@ def main() -> None:
         raise SystemExit(f"refusing to package an empty directory: {source}")
     with zipfile.ZipFile(output, "w") as archive:
         for path in files:
-            info = zipfile.ZipInfo(path.relative_to(source).as_posix(), (1980, 1, 1, 0, 0, 0))
+            info = zipfile.ZipInfo(path.relative_to(source.parent).as_posix(), (1980, 1, 1, 0, 0, 0))
             info.compress_type = zipfile.ZIP_DEFLATED
             info.create_system = 3
             info.external_attr = 0o100644 << 16
