@@ -10,8 +10,17 @@ fn integrator_examples_load_through_the_real_config_parser() {
         );
         std::env::set_var("SIROS_VERIFIER_MONGODB_URI", "mongodb://127.0.0.1:27017");
         std::env::set_var("SIROS_PDP_BEARER_TOKEN", "test-only-token");
+        std::env::set_var("SIROS_VERIFIER_BASE_URL", "http://localhost:9001");
+        std::env::set_var("SIROS_VERIFIER_DNS_NAME", "localhost");
+        std::env::set_var("SIROS_PDP_ENDPOINT", "https://pdp.example/evaluation");
     }
-    for name in ["quickstart", "mdoc-only", "replicas", "production"] {
+    for name in [
+        "quickstart",
+        "mdoc-only",
+        "replicas",
+        "production",
+        "compose",
+    ] {
         let path = format!("{}/../examples/{name}.toml", env!("CARGO_MANIFEST_DIR"));
         ProxyConfig::load(&path).unwrap_or_else(|error| panic!("{name}.toml: {error}"));
     }
@@ -19,5 +28,8 @@ fn integrator_examples_load_through_the_real_config_parser() {
         std::env::remove_var("SIROS_VERIFIER_STATE_KEY");
         std::env::remove_var("SIROS_VERIFIER_MONGODB_URI");
         std::env::remove_var("SIROS_PDP_BEARER_TOKEN");
+        std::env::remove_var("SIROS_VERIFIER_BASE_URL");
+        std::env::remove_var("SIROS_VERIFIER_DNS_NAME");
+        std::env::remove_var("SIROS_PDP_ENDPOINT");
     }
 }

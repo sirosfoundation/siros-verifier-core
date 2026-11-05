@@ -8,3 +8,9 @@ ffi/kotlin-test/.kotlin
 .claude
 *.rs.bk
 lcov.info
+
+# Never send local deployment secrets to the Docker daemon or build cache.
+/.env
+/.env.*
+!/.env.example
+/secrets/

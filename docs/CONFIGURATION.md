@@ -6,6 +6,8 @@ Runnable local, replica, production, and mdoc-only examples are maintained in [`
 siros-verifier-service /etc/siros-verifier/proxy.toml
 ```
 
+For a single-replica container setup with MongoDB, see [Docker Compose](INTEGRATORS.md#docker-compose) and `examples/compose.toml`.
+
 Set `TUNNELBANA_BIND=0.0.0.0:9001` when the service is behind a public proxy. Keep request signing keys, the state-sealing master, MongoDB credentials, and any PDP bearer token in a secret manager, not in the TOML file. The configuration loader expands `${VARIABLE}` placeholders, so use `state_encryption_key = "${SIROS_VERIFIER_STATE_KEY}"`, `uri = "${SIROS_VERIFIER_MONGODB_URI}"`, and `pdp_bearer_token = "${SIROS_PDP_BEARER_TOKEN}"` and let the secret manager inject those environment variables at process start. Do not commit real values to the examples.
 
 ## Plugin roles: `frontend` and `backend`

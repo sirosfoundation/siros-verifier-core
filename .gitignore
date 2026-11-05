@@ -27,5 +27,11 @@ Thumbs.db
 .claude/
 scripts/__pycache__/
 
+# Local deployment secrets
+.env
+.env.*
+!.env.example
+/secrets/
+
 # Coverage
 lcov.info
