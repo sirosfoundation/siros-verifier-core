@@ -168,7 +168,7 @@ jobs:
       - name: Package and checksum the XCFramework
         run: |
           set -euo pipefail
-          python3 ffi/scripts/zip-directory.py target/native-ios/SirosVerifierCore.xcframework.zip target/native-ios/SirosVerifierCore.xcframework
+          python3 ffi/scripts/zip-directory.py target/native-ios/SirosVerifierCore.xcframework.zip target/native-ios/SirosVerifierCore.xcframework --include-root
           swift package compute-checksum target/native-ios/SirosVerifierCore.xcframework.zip \
             | tee target/native-ios/SirosVerifierCore.xcframework.zip.checksum
       - name: Check the XCFramework archive layout
