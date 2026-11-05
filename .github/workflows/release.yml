@@ -59,13 +59,6 @@ jobs:
       - run: npm pack --dry-run
         working-directory: tunnelbana-plugin/src/assets
 
-      - name: Check public package contents
-        run: |
-          set -euo pipefail
-          for crate in siros-verifier-core siros-verifier-zkp siros-verifier-core-ffi siros-verifier-core-tunnelbana; do
-            cargo package --locked -p "$crate" --list > /dev/null
-          done
-
   docker:
     name: Build and publish GHCR image
     needs: validate
@@ -194,104 +187,39 @@ jobs:
             target/native-ios/SirosVerifierCore.xcframework.zip.checksum
             target/native-ios/swift/siros_verifier_core_ffi.swift
 
-  crates:
-    name: Publish Rust libraries and release artifacts
-    needs: [validate, docker]
+  release-metadata:
+    name: Attach release metadata and checksums
+    needs: docker
     runs-on: ubuntu-latest
-    # This name is part of each crate's trusted-publisher configuration.
-    environment: crates-io
     permissions:
       contents: write
-      id-token: write
+      id-token: write # OIDC identity for release provenance, not a registry.
       attestations: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-
-      # Registry releases are a separate track from Docker and native artifacts.
-      # Only this job requires the external Rust dependencies to be published;
-      # the Docker image and SDK artifacts build from the locked source graph.
-      - name: Check that external registry dependencies are released
+      - name: Write the image digest and checksum
         run: |
           set -euo pipefail
-          for dependency in siros-dc-matcher-core/0.12.0 zk-cred-longfellow/0.1.2 zk-cred-vega/0.0.7 tunnelbana-core/0.6.0; do
-            curl -fsS -A 'siros-verifier-release (github-actions)' \
-              "https://crates.io/api/v1/crates/$dependency" \
-              | jq -e '.version.yanked == false' > /dev/null
-          done
-
-      # crates.io exchanges this workflow's OIDC identity for a short-lived
-      # token. No long-lived registry token is stored in the repository.
-      - id: auth
-        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
-
-      - name: Publish crates in dependency order
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        run: |
-          set -euo pipefail
-          publish_crate() {
-            local crate=$1
-            local version http
-            version=$(cargo metadata --locked --no-deps --format-version 1 \
-              | jq -r --arg crate "$crate" '.packages[] | select(.name == $crate) | .version')
-            http=$(curl -sS -o /dev/null -w '%{http_code}' \
-              -A 'siros-verifier-release (github-actions)' \
-              "https://crates.io/api/v1/crates/$crate/$version") || http=000
-            case "$http" in
-              200)
-                echo "$crate $version is already published; skipping"
-                ;;
-              404)
-                # cargo publish packages and verifies the crate against its
-                # registry dependencies before uploading it.
-                cargo publish --locked -p "$crate"
-                ;;
-              *)
-                echo "::error::crates.io returned HTTP $http for $crate $version; refusing to guess its publication state"
-                return 1
-                ;;
-            esac
-          }
-
-          # External registry dependencies must already be released. Internal
-          # path dependencies are published here before their dependents.
-          publish_crate siros-verifier-core
-          publish_crate siros-verifier-zkp
-          publish_crate siros-verifier-core-ffi
-          publish_crate siros-verifier-core-tunnelbana
-
-      - name: Package release artifacts and checksums
-        run: |
-          set -euo pipefail
-          for crate in siros-verifier-core siros-verifier-zkp siros-verifier-core-ffi siros-verifier-core-tunnelbana; do
-            cargo package --locked --no-verify -p "$crate"
-          done
-          (cd target/package && sha256sum ./*.crate > SHA256SUMS)
           printf 'ghcr.io/sirosfoundation/siros-verifier-core@%s\n' '${{ needs.docker.outputs.digest }}' > image-digest.txt
+          sha256sum image-digest.txt > SHA256SUMS
 
-      - name: Attest crate and checksum provenance
+      - name: Attest release metadata provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
-            target/package/*.crate
-            target/package/SHA256SUMS
             image-digest.txt
+            SHA256SUMS
 
       - uses: actions/upload-artifact@v7
         with:
-          name: siros-verifier-core-${{ github.ref_name }}-crates
+          name: siros-verifier-core-${{ github.ref_name }}-release-metadata
           path: |
-            target/package/*.crate
-            target/package/SHA256SUMS
             image-digest.txt
+            SHA256SUMS
           if-no-files-found: error
 
       - name: Attach artifacts to the GitHub release
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v2
         with:
           files: |
-            target/package/*.crate
-            target/package/SHA256SUMS
             image-digest.txt
+            SHA256SUMS

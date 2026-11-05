@@ -78,13 +78,13 @@ Use organization-wide workflows where they exist:
 - SBOM: `sirosfoundation/.github/.github/workflows/sbom.yml`.
 - Integration builds: `sirosfoundation/.github/.github/workflows/integration-build.yml`.
 
-Release artifacts include the GHCR image and digest, crates.io packages, SBOM, vulnerability results, checksums, and provenance. Never invent an SBOM workflow when the reusable one exists.
+Release artifacts include the GHCR image and digest, native Android/iOS packages, SBOM, vulnerability results, checksums, and provenance. Never invent an SBOM workflow when the reusable one exists.
 
-Crates.io requires registry versions for every non-dev dependency. Do not tag a library release until those dependencies are published and `cargo package` succeeds for every public crate. Git revisions remain pinned for reproducible development; Cargo replaces them with registry versions when packaging.
+Build every release track from reviewed source/Git dependencies and lockfiles. Do not add crates.io publication, trusted-publisher configuration, registry preflights, or external namespace negotiations as release prerequisites. Native SDK releases are independent of Maven Central publication as well.
 
 For native mobile packages, use `ffi/scripts/android-aar.sh` and `ffi/scripts/ios-xcframework.sh`. They generate Kotlin/Swift bindings from the same checkout, support caller-selected output directories, and must never enable `vector-tests` in release builds. See `ffi/README.md` for local toolchain requirements. The tag workflow publishes the AAR/POM to GitHub Packages and attaches the XCFramework, Swift bindings, and SPM checksum to the release; keep both native SDKs on the same core version.
 
-See `docs/RELEASING.md` for dependency prerequisites, trusted-publisher configuration, publication order, and post-release verification. Tag `v0.1.0` only after full CI, live Longfellow and Vega verification, packaging checks, and documentation pass. Do not run `git commit`, `git push`, `git rebase`, `git reset`, or create a tag unless the user explicitly approved that operation.
+See `docs/RELEASING.md` for source-based release artifacts and post-release verification. Tag `v0.1.0` only after full CI, live Longfellow and Vega verification, packaging checks, and documentation pass. Do not run `git commit`, `git push`, `git rebase`, `git reset`, or create a tag unless the user explicitly approved that operation.
 
 ## Common pitfalls
 
