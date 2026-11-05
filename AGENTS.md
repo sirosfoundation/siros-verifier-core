@@ -165,7 +165,10 @@ changes small and protocol-specific.
   Compose and native-reader examples. The `examples/` directory is only for
   users and integrators.
 - `docs/design/` for historical findings, design notes and developer-only Rust
-  tools. It is not integrator documentation or a compatibility contract.
+  tools. It is not integrator documentation or a compatibility contract. The
+  later-phase customer/RP and control-plane proposal is in
+  `docs/design/MULTITENANCY.md`; do not implement its customer admin UI in the
+  verifier runner.
 - `src/oid4vp.rs` for request/response policy, handovers and bounded ECDH-ES
   decryption.
 - `src/mdoc_request.rs` for ordered DeviceRequest construction and ReaderAuth;
