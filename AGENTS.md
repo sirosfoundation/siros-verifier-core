@@ -2,35 +2,143 @@
 
 ## Scope and invariants
 
-This workspace contains a sans-I/O verification core, UniFFI and tunnelbana adapters, the HTTP service, and native Longfellow/Vega nym_auth backends. Keep changes small and protocol-specific.
+This workspace contains the sans-I/O verification core, UniFFI and tunnelbana
+adapters, the HTTP service, and native Longfellow/Vega nym_auth backends. Keep
+changes small and protocol-specific.
 
-- **go-trust makes every issuer and verifier trust decision, including status-list signer trust.** Never create a parallel trust decision in Rust, the circuit catalog, the UI, or deployment fixtures.
-- The circuit catalog supplies artifacts only. Enforce exact allowlist parameters and decompressed hash/size; startup prefetch must not become request-time network I/O.
-- Keep SD-JWT and mdoc dispatch intact when adding formats. A flow selects its verifier from its own validated DCQL and sealed session.
-- Do not take the verifier's statement from wallet input. Transcript, nonce, verifier identity, age bounds, and acceptable issuer keys are verifier-owned; the pseudonym is an output.
-- Use dedicated verifier signing keys, not an issuer key. `zkp_req` normally uses `x509_san_dns`; other formats retain `x509_hash`.
-- Preserve strict JSON/CBOR parsing, bounded bodies/artifacts/responses, replay protection, and sealed session state.
-
-## Read first
-
-- `docs/CONFIGURATION.md` for the complete service schema and the canonical TOML files under `fixtures/siros-verifier/`.
-- `src/oid4vp.rs` for request/response policy, handovers, and bounded ECDH-ES decryption.
-- `src/mdoc_request.rs` for ordered DeviceRequest construction and ReaderAuth; `src/mdoc_session.rs` for QR/NFC handover and transport-independent session messages.
-- `src/status_list.rs` for sans-I/O JWT status-list verification; the tunnelbana adapter owns bounded fetching and go-trust signer evaluation.
-- `zkp/src/verify.rs` for the two-phase response/trust/proof flow.
-- `zkp/src/circuits.rs` and `zkp/src/catalog.rs` for artifact integrity and startup prefetch.
-- `tunnelbana-plugin/src/lib.rs` for per-flow dispatch and independently validated ZK profiles.
-- `service/src/config.rs` and `service/src/main.rs` for deployment-only schema and backend factories.
+- **The core owns protocol and verification logic.** Request construction,
+  matching, transcript binding, disclosure checks, proof verification and
+  response construction have one implementation. UI, tunnelbana, native mobile
+  adapters and deployment fixtures must not keep a second copy.
+- **The verification boundaries are sans-I/O.** Effects and verified results
+  cross explicit interfaces. Transport, storage, time and trust verdicts belong
+  to the host; production network and database work belongs in the service or
+  adapter. Do not hide I/O in parsers or verification code.
+- **go-trust makes every trust decision**, for issuers, verifiers and
+  status-list signers. The core constructs AuthZEN evidence and consumes a
+  permit; it never creates a local trust fallback. The circuit catalog supplies
+  integrity-checked artifacts, not trust.
+- **Claims are disclosed only after request/policy checks, cryptographic
+  verification and an explicit per-document permit.** Logged-out sample
+  verification does not relax this rule.
+- **The verifier owns the statement.** Transcripts, nonce, handover, verifier
+  identity, age bounds and acceptable issuer keys come from validated
+  configuration and sealed session state, never from wallet assertions.
+  Pseudonyms are outputs, not verifier-selected inputs.
+- **`zkp_req` is protocol; nym_auth is one profile.** Add profiles and proof
+  systems through the existing registries and `ProofBackend` implementations.
+  Do not fork the protocol for a credential capability or create parallel
+  profile-specific dispatch. Unsupported functions, systems, BBS and
+  predicate-only requests fail closed.
+- **Keep format dispatch and strict parsing intact.** SD-JWT and mdoc selection
+  starts from validated DCQL and sealed session state. Preserve strict
+  JSON/CBOR/container rules, unique identifiers, bounded bodies, artifacts,
+  responses and lists, replay protection and sealed one-time results.
+- **Use dedicated verifier signing keys.** `zkp_req` normally uses
+  `x509_san_dns`; other formats retain `x509_hash`. ReaderAuth uses the host's
+  long-term P-256 key through `kryptering::Signer`, never the ephemeral session
+  key. Sign exact tag-24 values and preserve their bytes.
+- **Transport stays outside verification.** BLE/NFC transport and NDEF parsing
+  belong to the native application. The FFI exports transport-independent
+  session messages and never holds its session lock during a foreign signing
+  callback.
+- **Caches are limited to validated public artifacts and initialized backends
+  per immutable verifier.** Do not add a global backend, witness, pseudonym or
+  proof-result cache.
 
 ## Configuration rules
 
-- Prefer `[[backend.config.zkp.profiles]]` for multiple nym_auth presets. The legacy single `query` form remains supported. Duplicate byte-equivalent queries are a startup error; sharing a query ID with different function lists is valid.
-- UI and backend queries must match exactly, including result handles, age bounds, and attribute mapping. `subject_handle` must name a pseudonym function.
-- Use exactly one of `artifact_path` and `artifact_id`. Hash/size always mean decompressed bytes. Vega entries reject Longfellow parameters.
-- `request_uri_method = "post"` must echo the wallet's posted `wallet_nonce` in a re-signed request object and require exactly one valid form field at retrieval. GET remains the default and is always available alongside POST.
-- Use `api.circuits.siros.org` for the API. `circuits.siros.org` is only the human site.
-- Registry presets merge by format and type. A default claim subset must be answerable by the intended wallet; the first claim becomes the subject when no pointer is configured.
-- Only the QR display is modal. Do not reintroduce appended QR sections or result modals. Completion navigates to the complete page, which shows a neutral spinner while pending and then the decoded response or an error.
+- Prefer `[[backend.config.zkp.profiles]]` for multiple nym_auth presets. The
+  legacy single `query` form remains supported. Duplicate byte-equivalent
+  queries are a startup error; sharing a query ID with different function lists
+  is valid.
+- UI and backend profiles must agree exactly on query IDs, result handles, age
+  bounds and attribute mapping. `subject_handle` names a pseudonym function.
+  Reject unknown systems and unsupported functions during construction.
+- Register native backends through `BackendRegistry` and `ProofBackend`; do not
+  bypass `check_claimed`, issuer-set policy or go-trust.
+- Keep catalog and file sources behind `ArtifactSource`. Production prefetches
+  at startup and calls `ZkpVerifier::prewarm`; embedded users may keep lazy
+  loading. Wallet responses never trigger catalog access or first-use native
+  initialization.
+- Use exactly one of `artifact_path` and `artifact_id`. Hash and size always
+  describe decompressed bytes. Vega entries reject Longfellow parameters. Use
+  `api.circuits.siros.org` for the API; `circuits.siros.org` is the human site.
+- `request_uri_method = "post"` echoes the wallet's `wallet_nonce` in a
+  re-signed request object and requires exactly one valid form field. GET
+  remains the default and is always available alongside POST.
+- Registry presets merge by format and type. A default claim subset must be
+  answerable by the intended wallet; the first claim becomes the subject when
+  no pointer is configured.
+- Only the QR display is modal. Completion navigates to the complete page,
+  which shows a neutral spinner while pending and then the verified response or
+  an error. Do not reintroduce appended QR sections or result modals.
+
+## Tests
+
+- Prefer public-API integration tests in each crate's `tests/` directory. Do
+  not widen visibility for a test. Small unit tests for pure helpers may remain
+  next to the helper when that is clearer.
+- Every test needs an independent source of truth: a specification, published
+  vector, independent implementation or property that must hold. Do not copy
+  snapshots, digests, counts or expected values from the code under test.
+- Do not retest dependency guarantees or invariants the type system already
+  proves. Use one test per guarantee and one fixture per refusal rule, with
+  known answers in one table.
+- Include positive and negative cases, public-input mutations and stable
+  refusal codes. A refactor must not delete a mutant or weaken its test.
+- `scripts/mutate.py` disables each security check and requires a test to fail.
+  Update an anchor only when the checked expression intentionally moves.
+- Native tests use genuine Longfellow and Vega proof vectors and negative
+  mutations. Model backends are only for dispatch and error paths, never
+  substitutes for real proof verification.
+- Physical evidence must use stock consumer devices with locked bootloaders,
+  production defaults and ordinary installation. Do not require a wipe,
+  bootloader unlock or developer-only mode. Record device, build, page size and
+  verifier endpoint separately, and do not claim 16 KB runtime evidence from a
+  4 KB run.
+
+## Types
+
+- **Parse, don't validate.** Construct meaningful types at the trust boundary
+  so invalid protocol states cannot be represented. Do not add a parallel
+  `validate()` that lets malformed values circulate.
+- Use newtypes for constrained identifiers, handles, paths, keys, catalog IDs
+  and protocol values; a wrong role or format should fail to compile.
+- Keep effects in and results out explicit. Runtime trust, time and selection
+  checks belong to witness types between protocol steps, not hidden global
+  state.
+- Errors and refusals have stable machine-readable codes. Do not leak witness
+  data, pseudonyms, decrypted responses or proof results into logs.
+
+## Wording
+
+- The core owns no end-user prose. UI adapters supply display text; core errors
+  stay typed and suitable for logs and protocol error responses.
+- Preserve public protocol/catalog IDs, native ABI names, public compatibility,
+  engagement/handover/transcript behavior and dedicated P-256 ReaderAuth
+  behavior. Rename only with an explicit compatibility plan.
+
+## Read first
+
+- `README.md` for integration boundaries and supported flows.
+- `docs/CONFIGURATION.md` for the complete service schema and canonical TOML
+  examples.
+- `src/oid4vp.rs` for request/response policy, handovers and bounded ECDH-ES
+  decryption.
+- `src/mdoc_request.rs` for ordered DeviceRequest construction and ReaderAuth;
+  `src/mdoc_session.rs` for QR/NFC handover and session messages.
+- `src/status_list.rs` for sans-I/O JWT status-list verification; the
+  tunnelbana adapter owns bounded fetching and go-trust signer evaluation.
+- `zkp/src/verify.rs` for the two-phase response/trust/proof flow;
+  `zkp/src/circuits.rs` and `zkp/src/catalog.rs` for artifact integrity and
+  startup prefetch.
+- `tunnelbana-plugin/src/lib.rs` for per-flow dispatch and independently
+  validated ZK profiles.
+- `service/src/config.rs` and `service/src/main.rs` for deployment-only schema
+  and backend factories. Deployment settings do not leak into the core.
+- `ffi/README.md` for native Android/iOS packaging and host responsibilities.
+- `docs/RELEASING.md` for source-based release artifacts and verification.
 
 ## Build and test
 
@@ -38,10 +146,11 @@ Run all checks before committing:
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo test --locked --workspace --all-features
 scripts/audit.sh
 python3 scripts/mutate.py
+npm test --prefix tunnelbana-plugin/src/assets
 ```
 
 Also run format-specific checks after relevant changes:
@@ -54,21 +163,7 @@ cargo test -p siros-verifier-core --test mdoc_request
 cargo test -p siros-verifier-core-ffi --all-features
 ffi/scripts/kotlin-test.sh
 cargo test -p siros-verifier-zkp --test catalog the_live_siros_nymauth_circuit_matches_the_native_test_vector -- --ignored
-npm test --prefix tunnelbana-plugin/src/assets
 ```
-
-`scripts/mutate.py` disables each security check and requires a test to fail. If you refactor a checked expression, update its anchor rather than deleting the mutant or weakening the test. CI fails on missing anchors and surviving mutants.
-
-Native tests use genuine proof vectors and negative mutations. Do not replace them with a model circuit. Model backends are only for dispatch and error-path tests.
-
-## Integration recipe
-
-1. Put deployment-only settings in `service/src/config.rs`; do not leak them into the sans-I/O core.
-2. Register native backends through `BackendRegistry` and the existing `ProofBackend` trait. Do not bypass `check_claimed`, issuer-set policy, or go-trust.
-3. Keep catalog and file sources behind `ArtifactSource`; production uses startup `prefetch` followed by `ZkpVerifier::prewarm`, while embedded users may keep lazy backend loading.
-4. Add UI/backend profiles together and validate each plan at construction. Reject unknown systems and unsupported functions at startup.
-5. Keep proximity transport and NDEF parsing in the application. Use `kryptering::Signer` for the reader's long-term ReaderAuth key, never the ephemeral session key; sign exact tag-24 values and preserve their bytes. Do not hold the FFI session lock during a foreign signing callback.
-6. Add positive and negative tests, including public-input mutations and refusal codes. Update `docs/CONFIGURATION.md` for any schema change and this file for changed workflows.
 
 ## Releases
 
@@ -78,18 +173,51 @@ Use organization-wide workflows where they exist:
 - SBOM: `sirosfoundation/.github/.github/workflows/sbom.yml`.
 - Integration builds: `sirosfoundation/.github/.github/workflows/integration-build.yml`.
 
-Release artifacts include the GHCR image and digest, native Android/iOS packages, SBOM, vulnerability results, checksums, and provenance. Never invent an SBOM workflow when the reusable one exists.
+Release artifacts include the GHCR image and digest, native Android/iOS
+packages, SBOM, vulnerability results, checksums and provenance. Never invent
+an SBOM workflow when the reusable one exists.
 
-Build every release track from reviewed source/Git dependencies and lockfiles. Do not add crates.io publication, trusted-publisher configuration, registry preflights, or external namespace negotiations as release prerequisites. Native SDK releases are independent of Maven Central publication as well.
+Build every release track from reviewed source/Git dependencies and lockfiles.
+Do not add crates.io publication, trusted-publisher configuration, registry
+preflights or external namespace negotiations as release prerequisites. Native
+SDK releases are independent of Maven Central publication as well.
 
-For native mobile packages, use `ffi/scripts/android-aar.sh` and `ffi/scripts/ios-xcframework.sh`. They generate Kotlin/Swift bindings from the same checkout, support caller-selected output directories, and must never enable `vector-tests` in release builds. See `ffi/README.md` for local toolchain requirements. The tag workflow publishes the AAR/POM to GitHub Packages and attaches the XCFramework, Swift bindings, and SPM checksum to the release; ordinary GitHub CI also builds and uploads the iOS test package on `macos-latest`. Keep both native SDKs on the same core version.
+For native mobile packages, use `ffi/scripts/android-aar.sh` and
+`ffi/scripts/ios-xcframework.sh`. They generate bindings from the same
+checkout, support caller-selected output directories and never enable
+`vector-tests` in release builds. The tag workflow publishes the AAR/POM and
+attaches the XCFramework, Swift bindings and SPM checksum; ordinary GitHub CI
+also builds and validates the iOS test package on `macos-latest`. Preserve flat
+Android JAR/AAR entries; use `--include-root` only for the SwiftPM XCFramework.
+Keep both native SDKs on the same core version.
 
-See `docs/RELEASING.md` for source-based release artifacts and post-release verification. Tag `v0.1.0` only after full CI, live Longfellow and Vega verification, packaging checks, and documentation pass. Do not run `git commit`, `git push`, `git rebase`, `git reset`, or create a tag unless the user explicitly approved that operation.
+See `docs/RELEASING.md` for release prerequisites and post-release verification.
+Do not tag `v0.1.0` until full CI, live Longfellow and Vega verification,
+packaging checks and documentation pass, and the user explicitly approves it.
+
+## Working rules
+
+- Cite the specification for non-obvious behavior (`OpenID4VP`, ISO/IEC
+  18013-5, RFC 9901 or the nym_auth rulebook). Do not use another
+  implementation as an unstated specification.
+- Add UI/backend profiles together and validate each plan at construction.
+  Update `docs/CONFIGURATION.md` for schema changes and this file for changed
+  boundaries, workflows or release rules.
+- Fix every review finding and every instance of the same bug class. Merge only
+  reviewed, green PRs with a successful GitHub Copilot review.
+- Do not run `git commit`, `git push`, `git rebase`, `git reset`, or create a
+  tag unless the user explicitly approved that operation.
+- Report pull requests and issues with full URLs.
 
 ## Common pitfalls
 
-- `presentation_not_base64url` can mean an input exceeded the matcher's response budget, not malformed encoding. Check the actual token size before changing protocol code.
-- Actix's body limit and jose-rs's compact-token default are different limits. Test both with genuine large responses.
-- URI SAN identifies an mdoc issuer for go-trust; a leaf hash is only the fallback when no SAN identity exists.
-- A valid credential can fail to match if the query requests claims it does not contain or uses the wrong result handle. Inspect the actual query and wallet claims.
-- A new image is not a new trust decision. Keep go-trust configuration and verifier signing identity aligned when a leaf is reissued.
+- `presentation_not_base64url` can mean an input exceeded the matcher's response
+  budget, not malformed encoding. Check the actual token size first.
+- Actix's body limit and jose-rs's compact-token default are different limits.
+  Test both with genuine large responses.
+- URI SAN identifies an mdoc issuer for go-trust; a leaf hash is only the
+  fallback when no SAN identity exists.
+- A valid credential can fail to match if the query requests claims it does not
+  contain or uses the wrong result handle. Inspect the query and wallet claims.
+- A new image is not a new trust decision. Keep go-trust configuration and
+  verifier signing identity aligned when a leaf is reissued.
