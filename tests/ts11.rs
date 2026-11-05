@@ -60,3 +60,72 @@ fn source_urls_drop_only_the_sri_fragment() {
     );
     assert!(source_uri("https://user@registry.example/pid.json").is_err());
 }
+
+fn registry_schema(id: &str, format: &str) -> SchemaMeta {
+    SchemaMeta {
+        id: id.into(),
+        version: "1".into(),
+        rulebook_uri: "https://registry.example/rulebook".into(),
+        attestation_los: "iso_18045_high".into(),
+        binding_type: "key".into(),
+        supported_formats: vec![format.into()],
+        schema_uris: vec![SchemaUri {
+            format_identifier: format.into(),
+            uri: format!("https://registry.example/{id}.json"),
+        }],
+    }
+}
+
+fn registry_document(id: &str, format: &str, body: serde_json::Value) -> RegistryDocument {
+    let schema = registry_schema(id, format);
+    let uri = schema.schema_uris[0].uri.clone();
+    RegistryDocument {
+        schema,
+        format: format.into(),
+        uri,
+        body: serde_json::to_vec(&body).unwrap(),
+    }
+}
+
+#[test]
+fn catalog_indexes_follow_the_sorted_credentials() {
+    let catalog = Catalog::from_documents(vec![
+        registry_document(
+            "sd-z",
+            "dc+sd-jwt",
+            serde_json::json!({"vct": "urn:a:1", "name": "Zulu"}),
+        ),
+        registry_document(
+            "sd-y",
+            "dc+sd-jwt",
+            serde_json::json!({"vct": "urn:b:1", "name": "Yankee"}),
+        ),
+        registry_document(
+            "mdoc-z",
+            "mso_mdoc",
+            serde_json::json!({"doctype": "org.example.z", "name": "Alpha"}),
+        ),
+        registry_document(
+            "mdoc-y",
+            "mso_mdoc",
+            serde_json::json!({"doctype": "org.example.a", "name": "Beta"}),
+        ),
+    ])
+    .unwrap();
+
+    let labels: Vec<&str> = catalog
+        .credentials
+        .iter()
+        .map(|credential| credential.label.as_str())
+        .collect();
+    assert_eq!(labels, ["Alpha", "Beta", "Yankee", "Zulu"]);
+    for vct in ["urn:a:1", "urn:b:1"] {
+        assert_eq!(catalog.resolve_vct(vct).unwrap().identifier, vct);
+    }
+    for doctype in ["org.example.z", "org.example.a"] {
+        assert_eq!(
+            catalog.resolve_doctype(doctype).unwrap().identifier,
+            doctype
+        );
+    }
+}
