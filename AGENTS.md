@@ -184,7 +184,7 @@ changes small and protocol-specific.
   and backend factories. Deployment settings do not leak into the core.
 - `ffi/README.md` for native Android/iOS packaging and host responsibilities.
 - `docs/RELEASING.md` for source-based release artifacts and verification, and
-  `RELEASES.md` for the post-release publication record.
+  `CHANGELOG.md` for the post-release publication record.
 
 ## Build and test
 
@@ -283,7 +283,7 @@ Keep both native SDKs on the same core version.
 See `docs/RELEASING.md` for release prerequisites and post-release verification.
 After every testing or production release, immediately add its source/artifact
 identities, validation evidence, deployment/rollback instructions, known
-limitations and documentation updates to `RELEASES.md`.
+limitations and documentation updates to `CHANGELOG.md`.
 Do not tag `v0.1.0` until full CI, live Longfellow and Vega verification,
 packaging checks and documentation pass, and the user explicitly approves it.
 
