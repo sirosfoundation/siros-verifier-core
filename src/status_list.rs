@@ -94,6 +94,14 @@ fn bits(value: &Value) -> Result<usize> {
     Ok(bits as usize)
 }
 
+/// Compute a status index without truncating it to the target's native word size.
+pub fn index_parts(idx: u64, bits: u64) -> Result<(u64, u32)> {
+    let bit = idx
+        .checked_mul(bits)
+        .ok_or_else(|| policy("status_list_index_overflow"))?;
+    Ok((bit, (bit % 8) as u32))
+}
+
 /// Return the integer status at `reference.idx` in the list.
 pub fn status_at(token: &StatusListToken, reference: &StatusRef) -> Result<u8> {
     if token.claims["sub"] != Value::String(reference.uri.clone()) {
@@ -113,12 +121,8 @@ pub fn status_at(token: &StatusListToken, reference: &StatusRef) -> Result<u8> {
     if bytes.len() > MAX_DECOMPRESSED_BYTES {
         return Err(policy("status_list_too_large"));
     }
-    let offset = reference.idx as usize;
-    let bit = offset
-        .checked_mul(bits)
-        .ok_or_else(|| policy("status_list_index_overflow"))?;
-    let byte = bit / 8;
-    let shift = bit % 8;
+    let (bit, shift) = index_parts(reference.idx, bits as u64)?;
+    let byte = usize::try_from(bit / 8).map_err(|_| policy("status_list_index_out_of_range"))?;
     let Some(value) = bytes.get(byte) else {
         return Err(policy("status_list_index_out_of_range"));
     };

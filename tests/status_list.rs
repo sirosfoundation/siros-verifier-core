@@ -1,5 +1,5 @@
 use siros_verifier_core::sdjwt::{StatusRef, X5cLeaf};
-use siros_verifier_core::status_list::{status_at, verify_token};
+use siros_verifier_core::status_list::{index_parts, status_at, verify_token};
 use siros_verifier_core::trust::TrustQuery;
 
 const NOW: i64 = 1_793_656_800;
@@ -33,4 +33,16 @@ fn signature_time_subject_and_index_are_checked() {
     let mut tampered = TOKEN.to_owned();
     tampered.push('x');
     assert!(verify_token(&tampered, &X5cLeaf, NOW).is_err());
+}
+
+#[test]
+fn an_index_beyond_the_native_usize_range_is_rejected_not_truncated() {
+    let token = verify_token(TOKEN, &X5cLeaf, NOW).unwrap();
+    // 2^32 truncates to zero on 32-bit targets. The production arithmetic must
+    // retain the exact bit offset on every target, and status lookup must stay
+    // out of range rather than selecting the first status entry.
+    assert_eq!(index_parts(1_u64 << 32, 1).unwrap(), (1_u64 << 32, 0));
+    let error = status_at(&token, &reference(1_u64 << 32)).unwrap_err();
+    assert_eq!(error.code(), "policy");
+    assert!(error.to_string().contains("status_list_index_out_of_range"));
 }

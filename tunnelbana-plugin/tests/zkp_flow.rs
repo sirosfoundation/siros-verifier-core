@@ -4,7 +4,7 @@
 //! (a digest over exactly the public inputs, not cryptography), so every binding is observable.
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use jose_rs::algorithm::{JweAlgorithm, JweEncryption};
@@ -46,6 +46,72 @@ struct Fx {
     issuer_cert: Vec<u8>,
     loads: Arc<AtomicUsize>,
     _artifact: zk::ArtifactFile,
+}
+
+#[derive(Default)]
+struct CorruptStore {
+    inner: MemoryFlowStore,
+    corruption: Mutex<Option<(String, Option<String>)>>,
+}
+
+impl CorruptStore {
+    fn set_origin(&self, id: &str, origin: Option<String>) {
+        *self.corruption.lock().unwrap() = Some((id.to_owned(), origin));
+    }
+
+    fn altered(&self, flow: Flow) -> Flow {
+        let Some((id, origin)) = &*self.corruption.lock().unwrap() else {
+            return flow;
+        };
+        if flow.id != *id {
+            return flow;
+        }
+        let mut altered = flow;
+        let sealer =
+            siros_verifier_core::session_seal::SessionSealer::from_master(&[41u8; 32], "vp")
+                .unwrap();
+        let mut session = sealer
+            .unseal(&altered.sealed_session, altered.id.as_bytes())
+            .unwrap();
+        session.dc_api_origin = origin.clone();
+        altered.sealed_session = sealer.seal(&session, altered.id.as_bytes()).unwrap();
+        altered
+    }
+}
+
+#[async_trait]
+impl FlowStore for CorruptStore {
+    async fn insert(&self, flow: Flow, now: i64) -> StoreResult<()> {
+        self.inner.insert(flow, now).await
+    }
+
+    async fn get(&self, id: &str, now: i64) -> StoreResult<Option<Flow>> {
+        self.inner
+            .get(id, now)
+            .await
+            .map(|flow| flow.map(|flow| self.altered(flow)))
+    }
+
+    async fn claim(&self, id: &str, now: i64, claim_id: &str) -> StoreResult<ClaimResult> {
+        Ok(match self.inner.claim(id, now, claim_id).await? {
+            ClaimResult::Claimed(flow) => ClaimResult::Claimed(self.altered(flow)),
+            other => other,
+        })
+    }
+
+    async fn finish(
+        &self,
+        id: &str,
+        now: i64,
+        claim_id: &str,
+        outcome: TerminalOutcome,
+    ) -> StoreResult<FinishResult> {
+        self.inner.finish(id, now, claim_id, outcome).await
+    }
+
+    async fn collect(&self, id: &str, now: i64) -> StoreResult<CollectResult> {
+        self.inner.collect(id, now).await
+    }
 }
 
 fn zcfg() -> Value {
@@ -96,6 +162,14 @@ fn multi_zcfg() -> Value {
 }
 
 fn build(zcfg: Value, verifier_id: Option<&str>) -> Result<Fx, String> {
+    build_with_store(zcfg, verifier_id, None)
+}
+
+fn build_with_store(
+    zcfg: Value,
+    verifier_id: Option<&str>,
+    store: Option<Arc<dyn FlowStore>>,
+) -> Result<Fx, String> {
     let (v_cert, v_key) = self_signed_ec("verifier.example", "ES256");
     let (artifact, circuit) = zk::artifact(b"a model circuit artifact");
     let allow = Allowlist::new(&CircuitsConfig {
@@ -146,7 +220,7 @@ fn build(zcfg: Value, verifier_id: Option<&str>) -> Result<Fx, String> {
         request_uri_method: "get".into(),
         auth_class_ref: cfg.auth_class_ref.clone(),
     };
-    let b = VpBackend::new(
+    let mut backend = VpBackend::new(
         "vp",
         "https://proxy.example/vp",
         base,
@@ -155,8 +229,14 @@ fn build(zcfg: Value, verifier_id: Option<&str>) -> Result<Fx, String> {
         vec![v_cert],
         Arc::new(move || c2.load(Ordering::SeqCst)),
     )
-    .and_then(|backend| backend.with_zkp(cfg, verifier))
     .map_err(|e| e.to_string())?;
+    if let Some(store) = store {
+        backend = backend.with_flow_store(store).with_session_sealer(
+            siros_verifier_core::session_seal::SessionSealer::from_master(&[41u8; 32], "vp")
+                .unwrap(),
+        );
+    }
+    let b = backend.with_zkp(cfg, verifier).map_err(|e| e.to_string())?;
     Ok(Fx {
         b,
         pdp,
@@ -193,6 +273,20 @@ async fn start_query(f: &Fx, query: &Value) -> (State, String) {
     assert!(String::from_utf8(page.body)
         .unwrap()
         .contains("openid4vp://cb"));
+    let id = ctx.state.get_str(NS, FLOW_KEY).unwrap();
+    (ctx.state, id)
+}
+
+async fn start_dc_api(f: &Fx) -> (State, String) {
+    let mut ctx = Context::new(req("vp/start", "GET"), State::new());
+    let mut request = InternalData::request(ui::DC_API_REQUESTER);
+    request.set_attr(
+        ui::DCQL_ATTRIBUTE,
+        json!({"credentials": [zcfg()["query"].clone()]}).to_string(),
+    );
+    let launch = f.b.start_auth(&mut ctx, request).await.unwrap();
+    let launch: Value = serde_json::from_slice(&launch.body).unwrap();
+    assert!(launch["request"].is_string());
     let id = ctx.state.get_str(NS, FLOW_KEY).unwrap();
     (ctx.state, id)
 }
@@ -245,12 +339,19 @@ fn wallet_body_with_options(
         jose_rs::base64url::decode(&jose_rs::jwk::thumbprint::thumbprint_sha256(&enc).unwrap())
             .unwrap();
     let verifier_id = prove_for.unwrap_or("x509_san_dns:verifier.example");
-    let st = zk::Statement {
-        channel: Channel::Redirect {
+    let channel = match payload["response_mode"].as_str().unwrap() {
+        "direct_post.jwt" => Channel::Redirect {
             client_id,
             response_uri,
             encrypted: true,
         },
+        "dc_api.jwt" => Channel::DcApi {
+            origin: "https://proxy.example".into(),
+        },
+        mode => panic!("unexpected response mode {mode}"),
+    };
+    let st = zk::Statement {
+        channel,
         nonce,
         thumbprint: Some(thumb),
         verifier_id: verifier_id.to_owned(),
@@ -360,6 +461,48 @@ async fn a_pseudonym_login_reaches_the_frontend_as_a_pairwise_subject() {
         "one issuer certificate, one trust question"
     );
     assert_eq!(f.loads.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_pseudonym_login_over_dc_api_uses_the_dc_api_handover() {
+    let f = fx();
+    let (state, id) = start_dc_api(&f).await;
+    let payload = jar(&f, &id).await;
+    assert_eq!(payload["response_mode"], "dc_api.jwt");
+    // nym-auth-circuits SPEC section 3 binds a DC API proof to the calling
+    // origin, nonce and encryption-key thumbprint, not response_uri/client_id.
+    let (jwe, pseudonym) = wallet_body(&payload, T0, &f.issuer_cert, &key_of(&f.issuer_cert), None);
+    let (status, body) = post(&f, &id, &jwe).await;
+    assert_eq!(status, 200, "{body}");
+    let BackendAction::AuthResponse(data) = complete(&f, &state).await.unwrap() else {
+        panic!("expected auth response")
+    };
+    use base64::Engine;
+    let expected = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(pseudonym);
+    assert_eq!(data.subject_id.as_deref(), Some(expected.as_str()));
+}
+
+#[tokio::test]
+async fn inconsistent_sealed_channels_are_refused_before_verification() {
+    for (dc_api, origin) in [
+        (false, Some("https://proxy.example".to_owned())),
+        (true, None),
+    ] {
+        let store = Arc::new(CorruptStore::default());
+        let f = build_with_store(zcfg(), None, Some(store.clone())).unwrap();
+        let (state, id) = if dc_api {
+            start_dc_api(&f).await
+        } else {
+            start(&f).await
+        };
+        store.set_origin(&id, origin);
+        let payload = jar(&f, &id).await;
+        let (jwe, _) = wallet_body(&payload, T0, &f.issuer_cert, &key_of(&f.issuer_cert), None);
+        let (status, body) = post(&f, &id, &jwe).await;
+        assert_eq!(status, 500, "{body}");
+        assert!(body.contains("verifier_error"), "{body}");
+        assert!(complete(&f, &state).await.is_err());
+    }
 }
 
 #[tokio::test]

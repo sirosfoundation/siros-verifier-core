@@ -928,6 +928,26 @@ impl VpBackend {
                     .await;
             }
         };
+        // RFC 6749 section 3.1 prohibits repeated request/response parameters.
+        // The HTTP adapter preserves form pairs so this boundary must not
+        // silently accept a last-write-wins interpretation.
+        if ctx
+            .request
+            .form_pairs
+            .iter()
+            .filter(|(name, _)| name == "response")
+            .count()
+            > 1
+        {
+            return self
+                .fail(
+                    &id,
+                    &claim_id,
+                    "duplicate_response",
+                    Response::text(400, "duplicate response"),
+                )
+                .await;
+        }
         let Some(jwe) = ctx.request.form.get("response").cloned() else {
             return self
                 .fail(
@@ -1127,10 +1147,28 @@ impl VpBackend {
                         .await;
                 }
             };
-        let channel = Channel::Redirect {
-            client_id: session.client_id.clone(),
-            response_uri: session.response_uri.clone(),
-            encrypted: true,
+        let channel = match (
+            session.response_mode.as_str(),
+            session.dc_api_origin.as_deref(),
+        ) {
+            ("direct_post.jwt", None) => Channel::Redirect {
+                client_id: session.client_id.clone(),
+                response_uri: session.response_uri.clone(),
+                encrypted: true,
+            },
+            ("dc_api.jwt", Some(origin)) => Channel::DcApi {
+                origin: origin.to_owned(),
+            },
+            _ => {
+                return self
+                    .fail(
+                        id,
+                        claim_id,
+                        "verifier_error",
+                        Response::text(500, "verifier error"),
+                    )
+                    .await;
+            }
         };
         let exchange = Exchange {
             plan: &profile.plan,
