@@ -23,7 +23,7 @@ func presentMdl(
     transport: ExampleTransport,
     pdp: ExamplePdp,
     leafReaderCertificateDer: Data,
-    now: Int64
+    clock: () -> Int64
 ) throws -> [VerifiedDocument] {
     let reader = try Reader.startWithRole(
         deviceEngagement: deviceEngagement,
@@ -47,9 +47,10 @@ func presentMdl(
 
     let establishment = try reader.establishmentMessageFromDocuments(documents: [document])
     let sessionData = try transport.exchange(establishment)
+    // Sample after holder consent/transport, immediately before validity verification.
     let verified = try reader.openResponse(
         sessionData: sessionData,
-        now: now,
+        now: clock(),
         acceptedDocTypes: ["org.iso.18013.5.1.mDL"]
     )
 

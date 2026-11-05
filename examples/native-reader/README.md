@@ -13,6 +13,8 @@ Use `Reader.startWithRole` for an explicit issuer role, or `Reader.start` for th
 
 The `ReaderAuthSigner` callback must use the verifier's long-term P-256 ReaderAuth key and return raw `r || s`, not a DER signature and never the ephemeral session key. Keep the callback and `ReaderAuth` object alive for the whole native call. The native session lock is released before that callback runs.
 
+The `clock` callback is sampled only after `transport.exchange` returns, immediately before `openResponse`. Do not capture a timestamp before holder consent or transport: an mdoc must be valid at the time its response is verified, not at the earlier request time.
+
 Files:
 
 - `ReaderExample.kt` — generated Kotlin/UniFFI API

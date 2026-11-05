@@ -28,7 +28,7 @@ fun presentMdl(
     transport: ExampleTransport,
     pdp: ExamplePdp,
     leafReaderCertificateDer: ByteArray,
-    nowEpochSeconds: Long,
+    clock: () -> Long,
 ): List<VerifiedDocument> {
     val reader = Reader.startWithRole(deviceEngagement, handover, "pid-provider")
     val auth = ReaderAuth(
@@ -53,7 +53,8 @@ fun presentMdl(
 
     val establishment = reader.establishmentMessageFromDocuments(listOf(document))
     val sessionData = transport.exchange(establishment)
-    val verified = reader.openResponse(sessionData, nowEpochSeconds, listOf("org.iso.18013.5.1.mDL"))
+    // Sample after holder consent/transport, immediately before validity verification.
+    val verified = reader.openResponse(sessionData, clock(), listOf("org.iso.18013.5.1.mDL"))
 
     // Cryptographic validity is not a trust decision. Withhold every element until each permit.
     val permitted = verified.filter { pdp.permit(it.authzenRequestJson) }
