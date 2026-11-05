@@ -1,5 +1,8 @@
 # Local, single-process SD-JWT + nym_auth quickstart.
-# Replace every /replace/me path and the state key before starting.
+# Inject SIROS_VERIFIER_STATE_KEY and replace every /replace/me path before starting.
+# Plugin roles: frontend "ui" is thin browser initiation; frontend "oidc" is
+# the relying-party protocol endpoint; backend "openid4vp" is the shared
+# wallet-verification engine used by either entry surface.
 base_url = "http://localhost:9001"
 state_encryption_key = "${SIROS_VERIFIER_STATE_KEY}"
 cookie_name = "SIROS_VERIFIER_STATE"

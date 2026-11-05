@@ -4,6 +4,8 @@ These files show common service configurations and small native integration snip
 
 ## Configuration examples
 
+“Frontend” and “backend” are plugin roles, not two separate applications. The `ui` frontend is the thin browser initiation surface; the `oidc` frontend is the relying-party protocol endpoint; the single `openid4vp` backend verifies the wallet presentation for either entry surface. See [Plugin roles](../docs/CONFIGURATION.md#plugin-roles-frontend-and-backend).
+
 | File | Intended setup | External dependencies |
 | --- | --- | --- |
 | `quickstart.toml` | One local process with SD-JWT and nym_auth, in-memory flow storage, and an offline Longfellow artifact. | Request signing key/certificate, a loopback go-trust fixture, and the exact circuit artifact at the path you configure. |

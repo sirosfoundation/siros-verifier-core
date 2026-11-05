@@ -1,5 +1,8 @@
 # Production HTTPS deployment with shared MongoDB and both native ZK backends.
-# Replace every /replace/me path, the state key, and the MongoDB credentials.
+# Inject the documented secrets and replace every /replace/me path before starting.
+# Plugin roles: frontend "ui" is thin browser initiation; frontend "oidc" is
+# the relying-party protocol endpoint; backend "openid4vp" is the shared
+# wallet-verification engine used by either entry surface.
 # Terminate TLS upstream and keep all secrets in a secret manager.
 base_url = "https://verifier.example"
 state_encryption_key = "${SIROS_VERIFIER_STATE_KEY}"

@@ -8,6 +8,23 @@ siros-verifier-service /etc/siros-verifier/proxy.toml
 
 Set `TUNNELBANA_BIND=0.0.0.0:9001` when the service is behind a public proxy. Keep request signing keys, the state-sealing master, MongoDB credentials, and any PDP bearer token in a secret manager, not in the TOML file. The configuration loader expands `${VARIABLE}` placeholders, so use `state_encryption_key = "${SIROS_VERIFIER_STATE_KEY}"`, `uri = "${SIROS_VERIFIER_MONGODB_URI}"`, and `pdp_bearer_token = "${SIROS_PDP_BEARER_TOKEN}"` and let the secret manager inject those environment variables at process start. Do not commit real values to the examples.
 
+## Plugin roles: `frontend` and `backend`
+
+These are tunnelbana plugin roles, not the usual browser-frontend/server-backend split. Each `[[frontend]]` is a different **entry surface** into the same verification service; frontends are alternatives, not stages that call one another.
+
+| TOML block | Meaning |
+| --- | --- |
+| `[[frontend]] type = "ui"` | The thin browser catalog and presentation-initiation surface. It offers QR, DC API, or link invocation and asynchronously reaches status/completion. It does not make trust decisions. |
+| `[[frontend]] type = "oidc"` | The relying-party-facing OpenID Connect provider endpoint. It handles RP clients, authorization, codes, and tokens; it is a protocol adapter, not a human user interface. |
+| `[[backend]] type = "openid4vp"` | The wallet-facing verification engine. It creates and signs OpenID4VP requests, verifies wallet responses, obtains per-document go-trust permits, and returns verified results. The service requires exactly one block of this type. |
+
+The examples configure both frontends so the same `openid4vp` backend can be used in two ways:
+
+- **Direct browser flow:** browser → `ui` frontend → `openid4vp` backend ↔ wallet, followed by the existing status/completion endpoints.
+- **OIDC relying-party flow:** RP → `oidc` frontend → `openid4vp` backend ↔ wallet, then the OIDC code/token flow returns the result to the RP.
+
+`name` identifies a plugin instance and its routes; `type` selects its behavior. The nested `[backend.config.storage]` setting only selects memory or MongoDB state storage, and Longfellow/Vega “proof backends” are cryptographic implementations inside the OpenID4VP backend—neither is another top-level `[[backend]]` plugin.
+
 ## Trust boundary
 
 **All issuer and verifier trust decisions belong to go-trust, including status-list signer trust.** Configure `pdp_endpoint`, `pdp_id`, and issuer/verifier policies there, including the `status-list-signer` action when credentials carry status references. The circuit catalog and the local circuit allowlist are integrity controls, not a trust registry. Do not add a second issuer/verifier trust path in this service.
