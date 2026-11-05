@@ -102,6 +102,8 @@ fn happy_path_end_to_end() {
         .get("d")
         .is_none());
     assert_eq!(payload["aud"], "https://self-issued.me/v2");
+    assert_eq!(payload["response_uri"], "https://verify.example/resp");
+    assert!(payload.get("expected_origins").is_none());
     for key in ["nonce", "state"] {
         assert_eq!(
             jose_rs::base64url::decode(payload[key].as_str().unwrap())
@@ -223,6 +225,8 @@ fn dc_api_uses_the_browser_origin_for_holder_binding() {
     )
     .unwrap();
     assert_eq!(payload["response_mode"], "dc_api.jwt");
+    assert_eq!(payload["expected_origins"], json!([origin]));
+    assert!(payload.get("response_uri").is_none());
     assert_eq!(session.dc_api_origin.as_deref(), Some(origin));
 
     let selected = [disclosure_idx(&w, "given_name")];
