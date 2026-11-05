@@ -39,9 +39,9 @@ Flow claims, replay protection, OIDC token consumption, and result collection mu
 
 The current hard limits are 2 MiB for an HTTP body and compact JWE, and 1 MiB for decrypted response plaintext. Genuine Longfellow and Vega responses fit these bounds.
 
-SD-JWT `status.status_list` references are fetched over HTTPS with a 5-second timeout, no redirects, a 64 KiB token limit, and a 1 MiB decompressed-list limit. Tokens must be `statuslist+jwt` with a valid ES256 signature and time window and a subject matching the reference. The signer is evaluated through go-trust with the `status-list-signer` action. Fetch/parse failures, untrusted signers, and nonzero status values fail closed.
+SD-JWT `status.status_list` references are fetched over HTTPS with a 5-second timeout, no redirects or ambient proxies, a streaming 64 KiB token limit, and a 1 MiB decompressed-list limit. Userinfo is refused. Only public IP addresses are allowed: literal private addresses are refused before dialing and DNS results are filtered at connection time, including IPv4-mapped IPv6 addresses. Tokens must be `statuslist+jwt` with a valid ES256 signature and time window and a subject matching the reference. The signer is evaluated through go-trust with the `status-list-signer` action. Fetch/parse failures, untrusted signers, and nonzero status values fail closed.
 
-`allow_invalid_status_list_certificates = true` disables TLS certificate validation for status-list fetches and exists only for local conformance fixtures with self-signed servers. Never enable it in a real deployment.
+`allow_invalid_status_list_certificates = true` disables TLS certificate validation and the public-address restriction for local conformance fixtures with self-signed servers. Never enable it in a real deployment. PDP responses have a streaming 1 MiB limit and also ignore ambient proxy settings.
 
 ## Request object retrieval
 

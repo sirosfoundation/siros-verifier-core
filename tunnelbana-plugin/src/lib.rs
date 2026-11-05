@@ -9,7 +9,12 @@
 //! a server-side [`FlowStore`]. The browser only holds an opaque flow id in the sealed state cookie.
 
 use std::collections::{BTreeMap, HashMap};
+#[cfg(feature = "http")]
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex};
+
+#[cfg(feature = "http")]
+use ipnet::{Ipv4Net, Ipv6Net};
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -38,6 +43,231 @@ use tunnelbana_core::{Error, Response, Result};
 
 pub const NS: &str = "VP_BACKEND";
 pub const FLOW_KEY: &str = "flow_id";
+
+#[cfg(feature = "http")]
+const STATUS_LIST_MAX_BYTES: usize = 64 * 1024;
+#[cfg(feature = "http")]
+const PDP_MAX_BYTES: usize = 1 << 20;
+
+#[cfg(feature = "http")]
+async fn read_response_bounded(
+    mut response: reqwest::Response,
+    limit: usize,
+    refusal: &str,
+) -> std::result::Result<Vec<u8>, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(refusal.into());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+        body.len()
+            .checked_add(chunk.len())
+            .filter(|length| *length <= limit)
+            .ok_or_else(|| refusal.to_owned())?;
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+#[cfg(feature = "http")]
+#[derive(Clone)]
+struct PublicInternetResolver;
+
+// IANA special-purpose registries, last updated 2025-10-09. A matching
+// globally reachable exception precedes its non-global parent. Everything not
+// listed is ordinary public address space for this egress policy.
+#[cfg(feature = "http")]
+const IPV4_SPECIAL: &[(Ipv4Net, bool)] = &[
+    (Ipv4Net::new_assert(Ipv4Addr::new(192, 0, 0, 9), 32), true),
+    (Ipv4Net::new_assert(Ipv4Addr::new(192, 0, 0, 10), 32), true),
+    (Ipv4Net::new_assert(Ipv4Addr::new(0, 0, 0, 0), 8), false),
+    (Ipv4Net::new_assert(Ipv4Addr::new(10, 0, 0, 0), 8), false),
+    (Ipv4Net::new_assert(Ipv4Addr::new(100, 64, 0, 0), 10), false),
+    (Ipv4Net::new_assert(Ipv4Addr::new(127, 0, 0, 0), 8), false),
+    (
+        Ipv4Net::new_assert(Ipv4Addr::new(169, 254, 0, 0), 16),
+        false,
+    ),
+    (Ipv4Net::new_assert(Ipv4Addr::new(172, 16, 0, 0), 12), false),
+    (Ipv4Net::new_assert(Ipv4Addr::new(192, 0, 0, 0), 24), false),
+    (Ipv4Net::new_assert(Ipv4Addr::new(192, 0, 2, 0), 24), false),
+    (
+        Ipv4Net::new_assert(Ipv4Addr::new(192, 88, 99, 0), 24),
+        false,
+    ),
+    (
+        Ipv4Net::new_assert(Ipv4Addr::new(192, 168, 0, 0), 16),
+        false,
+    ),
+    (Ipv4Net::new_assert(Ipv4Addr::new(198, 18, 0, 0), 15), false),
+    (
+        Ipv4Net::new_assert(Ipv4Addr::new(198, 51, 100, 0), 24),
+        false,
+    ),
+    (
+        Ipv4Net::new_assert(Ipv4Addr::new(203, 0, 113, 0), 24),
+        false,
+    ),
+    (Ipv4Net::new_assert(Ipv4Addr::new(224, 0, 0, 0), 4), false),
+    (Ipv4Net::new_assert(Ipv4Addr::new(240, 0, 0, 0), 4), false),
+    (
+        Ipv4Net::new_assert(Ipv4Addr::new(255, 255, 255, 255), 32),
+        false,
+    ),
+];
+
+#[cfg(feature = "http")]
+const IPV6_SPECIAL: &[(Ipv6Net, bool)] = &[
+    (
+        Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 1, 0, 0, 0, 0, 0, 1), 128),
+        true,
+    ),
+    (
+        Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 1, 0, 0, 0, 0, 0, 2), 128),
+        true,
+    ),
+    (
+        Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 1, 0, 0, 0, 0, 0, 3), 128),
+        true,
+    ),
+    (
+        Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 3, 0, 0, 0, 0, 0, 0), 32),
+        true,
+    ),
+    (
+        Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 4, 0x0112, 0, 0, 0, 0, 0), 48),
+        true,
+    ),
+    (
+        Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 0x20, 0, 0, 0, 0, 0, 0), 28),
+        true,
+    ),
+    (
+        Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 0x30, 0, 0, 0, 0, 0, 0), 28),
+        true,
+    ),
+    (
+        Ipv6Net::new_assert(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1), 128),
+        false,
+    ),
+    (
+        Ipv6Net::new_assert(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0), 128),
+        false,
+    ),
+    (
+        Ipv6Net::new_assert(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0, 0), 96),
+        false,
+    ),
+    (
+        Ipv6Net::new_assert(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0), 96),
+        false,
+    ),
+    (
+        Ipv6Net::new_assert(Ipv6Addr::new(0x64, 0xff9b, 1, 0, 0, 0, 0, 0), 48),
+        false,
+    ),
+    (
+        Ipv6Net::new_assert(Ipv6Addr::new(0x100, 0, 0, 0, 0, 0, 0, 0), 64),
+        false,
+    ),
+    (
+        Ipv6Net::new_assert(Ipv6Addr::new(0x100, 0, 0, 1, 0, 0, 0, 0), 64),
+        false,
+    ),
+    (
+        Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0), 23),
+        false,
+    ),
+    (
+        Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0), 32),
+        false,
+    ),
+    (
+        Ipv6Net::new_assert(Ipv6Addr::new(0x2002, 0, 0, 0, 0, 0, 0, 0), 16),
+        false,
+    ),
+    (
+        Ipv6Net::new_assert(Ipv6Addr::new(0x3fff, 0, 0, 0, 0, 0, 0, 0), 20),
+        false,
+    ),
+    (
+        Ipv6Net::new_assert(Ipv6Addr::new(0x5f00, 0, 0, 0, 0, 0, 0, 0), 16),
+        false,
+    ),
+    (
+        Ipv6Net::new_assert(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0), 7),
+        false,
+    ),
+    (
+        Ipv6Net::new_assert(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10),
+        false,
+    ),
+    (
+        Ipv6Net::new_assert(Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 0), 10),
+        false,
+    ),
+    (
+        Ipv6Net::new_assert(Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0), 8),
+        false,
+    ),
+];
+
+#[cfg(feature = "http")]
+fn is_public_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => IPV4_SPECIAL
+            .iter()
+            .find(|(network, _)| network.contains(&ip))
+            .is_none_or(|(_, globally_reachable)| *globally_reachable),
+        std::net::IpAddr::V6(ip) => {
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return is_public_ip(std::net::IpAddr::V4(mapped));
+            }
+            IPV6_SPECIAL
+                .iter()
+                .find(|(network, _)| network.contains(&ip))
+                .is_none_or(|(_, globally_reachable)| *globally_reachable)
+        }
+    }
+}
+
+#[cfg(feature = "http")]
+impl reqwest::dns::Resolve for PublicInternetResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async move {
+            let host = name.as_str().to_owned();
+            let resolved = tokio::task::spawn_blocking(move || {
+                use std::net::ToSocketAddrs;
+                (host.as_str(), 0).to_socket_addrs()
+            })
+            .await
+            .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) })?
+            .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) })?;
+            let addresses: Vec<std::net::SocketAddr> = resolved
+                .filter(|address| is_public_ip(address.ip()))
+                .collect();
+            if addresses.is_empty() {
+                return Err("status_list_no_public_address".into());
+            }
+            Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+#[cfg(feature = "http")]
+fn status_request_error(error: reqwest::Error) -> String {
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        if cause.to_string().contains("status_list_no_public_address") {
+            return "status_list_no_public_address".into();
+        }
+        source = cause.source();
+    }
+    error.to_string()
+}
 
 // ---- configuration -------------------------------------------------------------------------
 
@@ -148,7 +378,8 @@ impl ReqwestStatusListClient {
         Self::build(timeout, false)
     }
 
-    /// Local conformance testing only. Never use this for a real deployment.
+    /// Local conformance testing only. Disables certificate validation and the
+    /// public-address egress restriction. Never use this for a real deployment.
     pub fn new_allow_invalid_certificates_for_testing(
         timeout: std::time::Duration,
     ) -> std::result::Result<Self, String> {
@@ -159,12 +390,15 @@ impl ReqwestStatusListClient {
         timeout: std::time::Duration,
         allow_invalid_certificates: bool,
     ) -> std::result::Result<Self, String> {
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(timeout)
-            .danger_accept_invalid_certs(allow_invalid_certificates)
-            .build()
-            .map_err(|e| e.to_string())?;
+            .no_proxy()
+            .danger_accept_invalid_certs(allow_invalid_certificates);
+        if !allow_invalid_certificates {
+            builder = builder.dns_resolver(Arc::new(PublicInternetResolver));
+        }
+        let client = builder.build().map_err(|e| e.to_string())?;
         Ok(Self { client })
     }
 }
@@ -173,23 +407,37 @@ impl ReqwestStatusListClient {
 #[async_trait]
 impl StatusListClient for ReqwestStatusListClient {
     async fn fetch(&self, uri: &str) -> std::result::Result<String, String> {
-        if !uri.starts_with("https://") {
+        let url = reqwest::Url::parse(uri).map_err(|_| "status_list_invalid_uri")?;
+        if url.scheme() != "https" {
             return Err("status_list_uri_not_https".into());
+        }
+        if url.host_str().is_none() || !url.username().is_empty() || url.password().is_some() {
+            return Err("status_list_uri_not_allowed".into());
+        }
+        if let Some(host) = url.host_str() {
+            let host = host.trim_start_matches('[').trim_end_matches(']');
+            if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                if !is_public_ip(ip) {
+                    return Err("status_list_no_public_address".into());
+                }
+            }
         }
         let response = self
             .client
-            .get(uri)
+            .get(url)
             .send()
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(status_request_error)?;
         if !response.status().is_success() {
             return Err(format!("status_list_http_{}", response.status()));
         }
-        let bytes = response.bytes().await.map_err(|e| e.to_string())?;
-        if bytes.len() > 64 * 1024 {
-            return Err("status_list_response_too_large".into());
-        }
-        String::from_utf8(bytes.to_vec()).map_err(|_| "status_list_not_utf8".into())
+        let body = read_response_bounded(
+            response,
+            STATUS_LIST_MAX_BYTES,
+            "status_list_response_too_large",
+        )
+        .await?;
+        String::from_utf8(body).map_err(|_| "status_list_not_utf8".into())
     }
 }
 
@@ -251,6 +499,7 @@ impl HttpPdp {
         let client = reqwest::Client::builder()
             .timeout(timeout)
             .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
             .build()
             .map_err(|e| e.to_string())?;
         Ok(Self {
@@ -276,10 +525,7 @@ impl PdpClient for HttpPdp {
         if !resp.status().is_success() {
             return Err(format!("pdp status {}", resp.status().as_u16()));
         }
-        let body = resp.bytes().await.map_err(|e| e.to_string())?;
-        if body.len() > 1 << 20 {
-            return Err("pdp response too large".into());
-        }
+        let body = read_response_bounded(resp, PDP_MAX_BYTES, "pdp response too large").await?;
         siros_verifier_core::json_strict::from_slice(&body)
             .map_err(|_| "pdp response is not json".into())
     }

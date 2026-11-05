@@ -4951,6 +4951,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "getrandom 0.4.3",
+ "ipnet",
  "jose-rs 0.10.0",
  "kryptering 0.7.0",
  "p256 0.14.0",
