@@ -241,7 +241,12 @@ impl Catalog {
                 "mso_mdoc" => mdoc_credential(&document, raw)?,
                 _ => unreachable!(),
             };
-            let index = catalog.credentials.len();
+            catalog.credentials.push(credential);
+        }
+        catalog
+            .credentials
+            .sort_by(|a, b| a.label.cmp(&b.label).then(a.schema_id.cmp(&b.schema_id)));
+        for (index, credential) in catalog.credentials.iter().enumerate() {
             if credential.format == "dc+sd-jwt" {
                 catalog
                     .by_vct
@@ -255,11 +260,7 @@ impl Catalog {
                     .or_default()
                     .push(index);
             }
-            catalog.credentials.push(credential);
         }
-        catalog
-            .credentials
-            .sort_by(|a, b| a.label.cmp(&b.label).then(a.schema_id.cmp(&b.schema_id)));
         Ok(catalog)
     }
 
