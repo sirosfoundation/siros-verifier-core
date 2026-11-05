@@ -609,10 +609,14 @@ fn malformed_status_list_structures_are_not_treated_as_absent() {
 }
 
 #[test]
-fn rfc3986_percent_encoded_uri_is_accepted() {
+fn rfc3986_status_uris_are_accepted() {
     let f = fx();
     let r = resolver(&f);
-    for uri in ["https://status.example/a%20b", "https://status.example?x:y"] {
+    for uri in [
+        "https://status.example/a%20b",
+        "https://status.example?x:y",
+        "file:///status.jwt",
+    ] {
         let mut claims = base_claims();
         claims["status"] = json!({ "status_list": { "idx": 7, "uri": uri } });
         verify(&plain(&f, claims), &r, &nokb()).unwrap();

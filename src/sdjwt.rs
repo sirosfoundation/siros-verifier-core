@@ -531,7 +531,7 @@ fn valid_status_uri(uri: &str) -> bool {
             .find('/')
             .map_or(hierarchical.len(), |index| index + 2);
         let authority = &hierarchical[2..end];
-        if !valid_authority(authority) {
+        if (is_http || !authority.is_empty()) && !valid_authority(authority) {
             return false;
         }
         (authority, &hierarchical[end..])
