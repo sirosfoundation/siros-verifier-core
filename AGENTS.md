@@ -10,6 +10,33 @@ changes small and protocol-specific.
   matching, transcript binding, disclosure checks, proof verification and
   response construction have one implementation. UI, tunnelbana, native mobile
   adapters and deployment fixtures must not keep a second copy.
+- **Use one verification pipeline per format across every entry point.** OIDC
+  relying-party, standalone, UI and mobile flows never get a lighter
+  extraction-only path. SD-JWT holder proof and mdoc DeviceAuth/session
+  transcript verification complete before any claims are mapped.
+- **Return every verified document.** A multi-credential response must not be
+  fully verified and then collapsed to the first credential's identity or
+  evidence. Preserve per-document results and errors.
+- **Select the response channel from sealed session state.** Redirect versus
+  DC API and its origin are never inferred from credential format or supplied
+  again by the wallet.
+- **The browser surface is deliberately thin.** The JS library initiates a
+  presentation and asynchronously waits for its result. Backend code owns
+  validation, trust, verification and result handling; do not add a rich UI,
+  account flow or preset-management application. HA recovery uses the existing
+  initiation/status/completion endpoints, not a new UI.
+- **HA lifecycle preserves exactly-once completion.** Persist completion before
+  notification and recover interrupted processing with leases, never by
+  weakening replay protection or sealed one-time results.
+- **Operational concerns belong to the service and adapters.** Readiness,
+  metrics, concurrency budgets, processing leases, notifications, graceful
+  shutdown, dynamic client registration and key resolution stay outside the
+  sans-I/O core. Discovery and registration advertise only implemented,
+  authorized behavior.
+- **Treat remote URLs as hostile I/O targets.** Apply host/IP allow policy and
+  redirect rules, and enforce streaming byte limits before allocation. A
+  malformed status structure is a refusal, not an absent status; cache only
+  validated public status artifacts.
 - **The verification boundaries are sans-I/O.** Effects and verified results
   cross explicit interfaces. Transport, storage, time and trust verdicts belong
   to the host; production network and database work belongs in the service or
