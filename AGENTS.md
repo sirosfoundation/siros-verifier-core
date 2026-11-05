@@ -183,7 +183,8 @@ changes small and protocol-specific.
 - `service/src/config.rs` and `service/src/main.rs` for deployment-only schema
   and backend factories. Deployment settings do not leak into the core.
 - `ffi/README.md` for native Android/iOS packaging and host responsibilities.
-- `docs/RELEASING.md` for source-based release artifacts and verification.
+- `docs/RELEASING.md` for source-based release artifacts and verification, and
+  `RELEASES.md` for the post-release publication record.
 
 ## Build and test
 
@@ -280,6 +281,9 @@ Android JAR/AAR entries; use `--include-root` only for the SwiftPM XCFramework.
 Keep both native SDKs on the same core version.
 
 See `docs/RELEASING.md` for release prerequisites and post-release verification.
+After every testing or production release, immediately add its source/artifact
+identities, validation evidence, deployment/rollback instructions, known
+limitations and documentation updates to `RELEASES.md`.
 Do not tag `v0.1.0` until full CI, live Longfellow and Vega verification,
 packaging checks and documentation pass, and the user explicitly approves it.
 
@@ -293,6 +297,10 @@ packaging checks and documentation pass, and the user explicitly approves it.
   boundaries, workflows or release rules. Keep `docs/` and `examples/` limited
   to user/integrator material; put design history and developer-only examples
   in `docs/design/`.
+- After every major PR, review and update the relevant documentation: user and
+  integrator guides, examples, `AGENTS.md`, and design notes. Include those
+  updates in the major PR or land an immediate documentation follow-up before
+  starting dependent work.
 - Fix every review finding and every instance of the same bug class. Merge only
   reviewed, green PRs with a successful GitHub Copilot review.
 - Do not run `git commit`, `git push`, `git rebase`, `git reset`, or create a
