@@ -76,15 +76,24 @@ changes small and protocol-specific.
 
 ## Tests
 
-- Prefer public-API integration tests in each crate's `tests/` directory. Do
-  not widen visibility for a test. Small unit tests for pure helpers may remain
-  next to the helper when that is clearer.
-- Every test needs an independent source of truth: a specification, published
-  vector, independent implementation or property that must hold. Do not copy
-  snapshots, digests, counts or expected values from the code under test.
-- Do not retest dependency guarantees or invariants the type system already
-  proves. Use one test per guarantee and one fixture per refusal rule, with
-  known answers in one table.
+- New tests live outside the source files, in each crate's `tests/` directory,
+  and exercise the public API. Do not add `#[test]` or `#[cfg(test)]` under
+  `src/`, and do not widen visibility for a test. Migrate an inline unit test
+  when you touch it.
+- Every test enforces a source of truth outside the code it tests: a
+  specification, published vector, independent implementation or property that
+  must hold. Delete a test whose expected value comes from the implementation:
+  a snapshot, digest or count copied from a run, or a constant of the code under
+  test.
+- Trust the dependencies. Delete tests of guarantees owned by a dependency,
+  such as a JSON parser parsing or a hash crate hashing. A dependency may serve
+  as an independent oracle.
+- Leave invariants to the compiler. Delete tests of a type that cannot be built
+  invalid, an exhaustive match, a trait bound, visibility, or a compile-fail
+  check of any of them.
+- Use one test per guarantee and one fixture per refusal rule, with known
+  answers in one table. A test of wording is no test. Every regression test
+  must fail when its fix is reverted.
 - Include positive and negative cases, public-input mutations and stable
   refusal codes. A refactor must not delete a mutant or weaken its test.
 - `scripts/mutate.py` disables each security check and requires a test to fail.
