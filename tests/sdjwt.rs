@@ -597,6 +597,8 @@ fn malformed_status_list_structures_are_not_treated_as_absent() {
         json!({ "status_list": { "idx": 7, "uri": "https://status.example/<path>" } }),
         json!({ "status_list": { "idx": 7, "uri": "https://status.example/1#one#two" } }),
         json!({ "status_list": { "idx": 7, "uri": "HTTPS:status.example" } }),
+        json!({ "status_list": { "idx": 7, "uri": "https://[v1]/status.jwt" } }),
+        json!({ "status_list": { "idx": 7, "uri": "status:/a:b" } }),
         json!({ "status_list": { "idx": 7, "uri": "https://user[info]@status.example/1" } }),
     ] {
         let mut claims = base_claims();
@@ -616,6 +618,9 @@ fn rfc3986_status_uris_are_accepted() {
         "https://status.example/a%20b",
         "https://status.example?x:y",
         "file:///status.jwt",
+        "https://[v1.fe]/status.jwt",
+        "status://status.example:65536/list",
+        "status:/a/b:c",
     ] {
         let mut claims = base_claims();
         claims["status"] = json!({ "status_list": { "idx": 7, "uri": uri } });

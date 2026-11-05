@@ -418,6 +418,67 @@ fn valid_userinfo(userinfo: &str) -> bool {
     })
 }
 
+fn valid_reg_name(host: &str) -> bool {
+    !host.is_empty()
+        && host.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'-' | b'.'
+                        | b'_'
+                        | b'~'
+                        | b'!'
+                        | b'$'
+                        | b'&'
+                        | b'\''
+                        | b'('
+                        | b')'
+                        | b'*'
+                        | b'+'
+                        | b','
+                        | b';'
+                        | b'='
+                        | b'%'
+                )
+        })
+}
+
+fn valid_ipv_future(literal: &str) -> bool {
+    let Some((version, address)) = literal.split_once('.') else {
+        return false;
+    };
+    let Some(version) = version
+        .strip_prefix('v')
+        .or_else(|| version.strip_prefix('V'))
+    else {
+        return false;
+    };
+    !version.is_empty()
+        && version.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && !address.is_empty()
+        && address.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'-' | b'.'
+                        | b'_'
+                        | b'~'
+                        | b':'
+                        | b'!'
+                        | b'$'
+                        | b'&'
+                        | b'\''
+                        | b'('
+                        | b')'
+                        | b'*'
+                        | b'+'
+                        | b','
+                        | b';'
+                        | b'='
+                )
+        })
+}
+
 fn valid_authority(authority: &str) -> bool {
     if authority.is_empty() || authority.matches('@').count() > 1 {
         return false;
@@ -428,34 +489,25 @@ fn valid_authority(authority: &str) -> bool {
     if !valid_userinfo(userinfo) {
         return false;
     }
-    if host_port.starts_with('[') {
-        let Some(end) = host_port.find(']') else {
+    if let Some(literal) = host_port.strip_prefix('[') {
+        let Some((literal, suffix)) = literal.split_once(']') else {
             return false;
         };
-        let suffix = &host_port[end + 1..];
-        if suffix.is_empty() {
-            return true;
-        }
-        let Some(port) = suffix.strip_prefix(':') else {
-            return false;
-        };
-        port.is_empty()
-            || (port.chars().all(|c| c.is_ascii_digit())
-                && port.parse::<u32>().is_ok_and(|port| port <= 65_535))
-    } else {
-        if host_port.matches(':').count() > 1 {
+        if literal.parse::<std::net::Ipv6Addr>().is_err() && !valid_ipv_future(literal) {
             return false;
         }
-        let (host, port) = host_port
-            .rsplit_once(':')
-            .map_or((host_port, ""), |(host, port)| (host, port));
-        if host.is_empty() {
-            return false;
-        }
-        port.is_empty()
-            || (port.chars().all(|c| c.is_ascii_digit())
-                && port.parse::<u32>().is_ok_and(|port| port <= 65_535))
+        return suffix.is_empty()
+            || suffix
+                .strip_prefix(':')
+                .is_some_and(|port| port.bytes().all(|byte| byte.is_ascii_digit()));
     }
+    if host_port.matches(':').count() > 1 {
+        return false;
+    }
+    let (host, port) = host_port
+        .rsplit_once(':')
+        .map_or((host_port, ""), |(host, port)| (host, port));
+    valid_reg_name(host) && port.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn valid_status_uri(uri: &str) -> bool {
@@ -539,6 +591,16 @@ fn valid_status_uri(uri: &str) -> bool {
         if is_http {
             return false;
         }
+        // RFC 3986 path-absolute uses segment-nz-nc for its first segment:
+        // without an authority, a colon is allowed only in later segments.
+        if hierarchical.starts_with('/')
+            && hierarchical[1..]
+                .split('/')
+                .next()
+                .is_some_and(|segment| segment.contains(':'))
+        {
+            return false;
+        }
         ("", hierarchical)
     };
     if is_http && authority.is_empty() {
@@ -556,7 +618,7 @@ fn valid_status_uri(uri: &str) -> bool {
     {
         return false;
     }
-    url::Url::parse(uri).is_ok()
+    true
 }
 
 pub fn verify(
