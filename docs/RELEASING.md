@@ -4,7 +4,7 @@ The tag workflow is [`.github/workflows/release.yml`](../.github/workflows/relea
 
 Every release job builds from the tagged source and lockfiles. No release track publishes to crates.io or requires an external crates.io publication, trusted-publisher configuration, or namespace negotiation. Pinned Git dependencies, including tunnelbana and the native ZK backends, remain source dependencies for reproducible builds. Native SDK releases also remain independent of Maven Central publication.
 
-The native Reader jobs build from the same tag. `native-android` publishes the AAR and POM to this repository's GitHub Packages Maven repository and attaches them to the release. `native-ios` attaches `SirosVerifierCore.xcframework.zip`, the Swift Package Manager checksum, and the generated Swift bindings. The Kotlin and Swift SDKs must select these artifacts from one shared version rather than generating bindings from different core revisions. Local build inputs and outputs are documented in [`ffi/README.md`](../ffi/README.md).
+The native Reader jobs build from the same tag. `native-android` publishes the AAR and POM to this repository's GitHub Packages Maven repository and attaches them to the release. `native-ios` attaches `SirosVerifierCore.xcframework.zip`, the Swift Package Manager checksum, and the generated Swift bindings. Ordinary GitHub CI also builds and uploads the iOS package on `macos-latest` for pushes to `main` and all pull requests, so packaging is exercised before a tag. The Kotlin and Swift SDKs must select these artifacts from one shared version rather than generating bindings from different core revisions. Local build inputs and outputs are documented in [`ffi/README.md`](../ffi/README.md).
 
 ## Shared prerequisites
 
