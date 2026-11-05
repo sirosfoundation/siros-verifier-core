@@ -18,10 +18,12 @@ These are tunnelbana plugin roles, not the usual browser-frontend/server-backend
 | `[[frontend]] type = "oidc"` | The relying-party-facing OpenID Connect provider endpoint. It handles RP clients, authorization, codes, and tokens; it is a protocol adapter, not a human user interface. |
 | `[[backend]] type = "openid4vp"` | The wallet-facing verification engine. It creates and signs OpenID4VP requests, verifies wallet responses, obtains per-document go-trust permits, and returns verified results. The service requires exactly one block of this type. |
 
-The examples configure both frontends so the same `openid4vp` backend can be used in two ways:
+The quickstart, replica, and production examples configure both frontends so the same `openid4vp` backend can be used in two ways:
 
 - **Direct browser flow:** browser → `ui` frontend → `openid4vp` backend ↔ wallet, followed by the existing status/completion endpoints.
 - **OIDC relying-party flow:** RP → `oidc` frontend → `openid4vp` backend ↔ wallet, then the OIDC code/token flow returns the result to the RP.
+
+The mdoc-only example configures only the `ui` frontend: its name disclosures are not unique, never-reassigned OIDC subject identifiers. For an SD-JWT or mdoc OIDC deployment, configure `subject_pointer` to a suitable identifier rather than a holder's name. For `zkp_req`, `subject_handle` selects the profile's pseudonym result handle; that verifier-scoped pseudonym becomes the OIDC subject instead of `subject_pointer`.
 
 `name` identifies a plugin instance and its routes; `type` selects its behavior. The nested `[backend.config.storage]` setting only selects memory or MongoDB state storage, and Longfellow/Vega “proof backends” are cryptographic implementations inside the OpenID4VP backend—neither is another top-level `[[backend]]` plugin.
 

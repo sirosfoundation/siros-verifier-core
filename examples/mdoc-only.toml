@@ -1,8 +1,8 @@
-# Single-process mdoc-over-OpenID4VP setup (no zkp_req backend).
+# UI-only, single-process mdoc-over-OpenID4VP setup (no zkp_req backend).
+# This name-disclosure example omits the OIDC frontend: names are not unique RP subject IDs.
 # Inject SIROS_VERIFIER_STATE_KEY and replace every /replace/me path before starting.
-# Plugin roles: frontend "ui" is thin browser initiation; frontend "oidc" is
-# the relying-party protocol endpoint; backend "openid4vp" is the shared
-# wallet-verification engine used by either entry surface.
+# Plugin roles: frontend "ui" is thin browser initiation; backend "openid4vp"
+# is the wallet-verification engine used by that entry surface.
 base_url = "http://localhost:9001"
 state_encryption_key = "${SIROS_VERIFIER_STATE_KEY}"
 cookie_name = "SIROS_VERIFIER_STATE"
@@ -33,21 +33,6 @@ name = "ui"
     ]
   }] }
 
-[[frontend]]
-type = "oidc"
-name = "OIDC"
-  [frontend.config]
-  signing_key_path = "/replace/me/verifier_ec_private.pem"
-  signing_algorithm = "ES256"
-  signing_key_id = "dev-op"
-
-  [[frontend.config.clients]]
-  client_id = "local-rp"
-  redirect_uris = ["http://127.0.0.1:9006/callback"]
-  response_types = ["code"]
-  grant_types = ["authorization_code", "refresh_token"]
-  token_endpoint_auth_method = "none"
-
 [[backend]]
 type = "openid4vp"
 name = "vp"
@@ -63,6 +48,7 @@ name = "vp"
   max_receipt_ttl_secs = 300
   role = "pid-provider"
   request_ttl_secs = 300
+  # Result/display subject only; this example exposes no OIDC relying-party identity.
   subject_pointer = "/org.iso.18013.5.1/given_name"
   dcql = { credentials = [{
     id = "example_mdl", format = "mso_mdoc",

@@ -9,7 +9,7 @@ These files show common service configurations and small native integration snip
 | File | Intended setup | External dependencies |
 | --- | --- | --- |
 | `quickstart.toml` | One local process with SD-JWT and nym_auth, in-memory flow storage, and an offline Longfellow artifact. | Request signing key/certificate, a loopback go-trust fixture, and the exact circuit artifact at the path you configure. |
-| `mdoc-only.toml` | One local mdoc-over-OpenID4VP process with no `zkp_req` backend. | Request signing key/certificate and a loopback go-trust fixture. |
+| `mdoc-only.toml` | One local UI-only mdoc-over-OpenID4VP process with no OIDC frontend or `zkp_req` backend. | Request signing key/certificate and a loopback go-trust fixture. |
 | `replicas.toml` | Multiple processes sharing replay and result state, with catalog-backed Longfellow. | MongoDB, HTTPS go-trust, and the circuit catalog. Use a replica set or managed HA MongoDB for database failover. |
 | `production.toml` | HTTPS deployment with shared MongoDB and both Longfellow and Vega. | MongoDB HA, HTTPS go-trust, the circuit catalog, and TLS termination upstream. |
 
