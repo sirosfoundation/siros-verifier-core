@@ -332,7 +332,6 @@ fn wallet_body_with_options(
 ) -> (String, Vec<u8>) {
     let client_id = payload["client_id"].as_str().unwrap().to_owned();
     let nonce = payload["nonce"].as_str().unwrap().to_owned();
-    let response_uri = payload["response_uri"].as_str().unwrap().to_owned();
     let enc: jose_rs::jwk::Jwk =
         serde_json::from_value(payload["client_metadata"]["jwks"]["keys"][0].clone()).unwrap();
     let thumb =
@@ -342,7 +341,7 @@ fn wallet_body_with_options(
     let channel = match payload["response_mode"].as_str().unwrap() {
         "direct_post.jwt" => Channel::Redirect {
             client_id,
-            response_uri,
+            response_uri: payload["response_uri"].as_str().unwrap().to_owned(),
             encrypted: true,
         },
         "dc_api.jwt" => Channel::DcApi {
@@ -469,6 +468,11 @@ async fn a_pseudonym_login_over_dc_api_uses_the_dc_api_handover() {
     let (state, id) = start_dc_api(&f).await;
     let payload = jar(&f, &id).await;
     assert_eq!(payload["response_mode"], "dc_api.jwt");
+    assert_eq!(
+        payload["expected_origins"],
+        json!(["https://proxy.example"])
+    );
+    assert!(payload.get("response_uri").is_none());
     // nym-auth-circuits SPEC section 3 binds a DC API proof to the calling
     // origin, nonce and encryption-key thumbprint, not response_uri/client_id.
     let (jwe, pseudonym) = wallet_body(&payload, T0, &f.issuer_cert, &key_of(&f.issuer_cert), None);

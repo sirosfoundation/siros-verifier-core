@@ -321,7 +321,7 @@ pub fn create_request(
 
 /// Create a request for the W3C Digital Credentials API's encrypted-response
 /// profile. Verification and response processing are identical to QR/direct
-/// post; only the response mode advertised to the wallet changes.
+/// post; the signed request carries `expected_origins` instead of `response_uri`.
 pub fn create_dc_api_request(
     cfg: &RequestConfig,
     signer: &dyn kryptering::Signer,
@@ -406,14 +406,13 @@ fn create_request_with_response_mode(
             })
         }
     });
-    let payload = json!({
+    let mut payload = json!({
         "iat": now,
         "exp": session.expires_at,
         "aud": REQUEST_AUD,
         "client_id": client_id,
         "response_type": "vp_token",
         "response_mode": response_mode,
-        "response_uri": cfg.response_uri,
         "nonce": session.nonce,
         "state": session.state,
         "dcql_query": cfg.dcql_query,
@@ -423,6 +422,11 @@ fn create_request_with_response_mode(
             "vp_formats_supported": vp_formats_supported,
         },
     });
+    if let Some(origin) = dc_api_origin {
+        payload["expected_origins"] = json!([origin]);
+    } else {
+        payload["response_uri"] = json!(cfg.response_uri);
+    }
     let mut header = JoseHeader::new(alg);
     header.typ = Some("oauth-authz-req+jwt".into());
     header.x5c = Some(chain_der.iter().map(|d| B64.encode(d)).collect());
