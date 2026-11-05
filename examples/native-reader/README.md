@@ -7,7 +7,7 @@ These snippets show how to embed the proximity-reader FFI without turning them i
 - The go-trust/AuthZEN PDP call and its explicit permit decision
 - Consent UI, credential storage, and time
 
-`deviceEngagement` is the raw CBOR DeviceEngagement value, not an NDEF message. For QR handover, `handover` is CBOR `null`—the single byte `0xf6`, not an empty array. For NFC, use `nfcHandoverCbor(select, request)` with the raw CBOR Handover Select and optional Handover Request to produce the required handover bytes; do not pass an NDEF record.
+`deviceEngagement` is the raw CBOR DeviceEngagement value, not an NDEF message. For QR handover, `handover` is CBOR `null`—the single byte `0xf6`, not an empty array. For NFC, call `nfcHandoverCbor(select, request)` with the complete, unmodified Handover Select NDEF message and optional Handover Request NDEF message. Use the helper's CBOR output as `Reader.startWithRole`'s `handover`; do not pass either NDEF message directly as that `handover` value.
 
 Use `Reader.startWithRole` for an explicit issuer role, or `Reader.start` for the compatibility-default `pid-provider` role. `establishmentMessageFromDocuments` builds and encrypts the request and retains its response policy. `openResponse` verifies the response but **does not authorize disclosure**: submit each document's `authzenRequestJson` to the PDP and return elements only when that document is permitted.
 
