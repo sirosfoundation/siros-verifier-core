@@ -99,3 +99,28 @@ jobs:
       - run: scripts/fuzz-smoke.sh
         env:
           FUZZ_RUNS: 1000
+
+  native-ios:
+    name: Build native iOS Reader
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: ffi/scripts/ios-xcframework.sh target/native-ios
+      - name: Package and checksum the XCFramework
+        run: |
+          set -euo pipefail
+          python3 ffi/scripts/zip-directory.py target/native-ios/SirosVerifierCore.xcframework.zip target/native-ios/SirosVerifierCore.xcframework
+          swift package compute-checksum target/native-ios/SirosVerifierCore.xcframework.zip \
+            | tee target/native-ios/SirosVerifierCore.xcframework.zip.checksum
+      - uses: actions/upload-artifact@v7
+        with:
+          name: siros-verifier-core-${{ github.sha }}-ios
+          path: |
+            target/native-ios/SirosVerifierCore.xcframework.zip
+            target/native-ios/SirosVerifierCore.xcframework.zip.checksum
+            target/native-ios/swift/siros_verifier_core_ffi.swift
+          if-no-files-found: error
