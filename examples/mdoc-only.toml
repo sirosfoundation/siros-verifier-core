@@ -1,0 +1,67 @@
+# UI-only, single-process mdoc-over-OpenID4VP setup (no zkp_req backend).
+# This name-disclosure example omits the OIDC frontend: names are not unique RP subject IDs.
+# Inject SIROS_VERIFIER_STATE_KEY and replace every /replace/me path before starting.
+# Plugin roles: frontend "ui" is thin browser initiation; backend "openid4vp"
+# is the wallet-verification engine used by that entry surface.
+base_url = "http://localhost:9001"
+state_encryption_key = "${SIROS_VERIFIER_STATE_KEY}"
+cookie_name = "SIROS_VERIFIER_STATE"
+cookie_secure = false
+cookie_same_site = "Lax"
+state_cookie_max_age = 900
+
+[logging]
+level = "info"
+format = "pretty"
+
+[[frontend]]
+type = "ui"
+name = "ui"
+  [frontend.config]
+  invocations = ["qr", "dc-api", "link"]
+  schemes = ["mdoc-openid4vp"]
+
+  [[frontend.config.presets]]
+  id = "example_mdl"
+  label = "Example mDL"
+  dcql = { credentials = [{
+    id = "example_mdl", format = "mso_mdoc",
+    meta = { doctype_value = "org.iso.18013.5.1.mDL" },
+    claims = [
+      { path = ["org.iso.18013.5.1", "given_name"] },
+      { path = ["org.iso.18013.5.1", "family_name"] },
+    ]
+  }] }
+
+[[backend]]
+type = "openid4vp"
+name = "vp"
+  [backend.config]
+  request_signing_key_path = "/replace/me/verifier_ec_private.pem"
+  request_certificate_chain_path = "/replace/me/verifier_ec_chain.pem"
+  pdp_endpoint = "http://127.0.0.1:9095/evaluation"
+  pdp_id = "local-go-trust"
+  allow_insecure_http = false
+  receipt_key_id = "dev-receipt"
+  receipt_issuer = "siros-verifier-core"
+  receipt_audience = "vp"
+  max_receipt_ttl_secs = 300
+  role = "pid-provider"
+  request_ttl_secs = 300
+  # Result/display subject only; this example exposes no OIDC relying-party identity.
+  subject_pointer = "/org.iso.18013.5.1/given_name"
+  dcql = { credentials = [{
+    id = "example_mdl", format = "mso_mdoc",
+    meta = { doctype_value = "org.iso.18013.5.1.mDL" },
+    claims = [
+      { path = ["org.iso.18013.5.1", "given_name"] },
+      { path = ["org.iso.18013.5.1", "family_name"] },
+    ]
+  }] }
+  attribute_map = {
+    givenname = "/org.iso.18013.5.1/given_name",
+    surname = "/org.iso.18013.5.1/family_name",
+  }
+
+  [backend.config.storage]
+  backend = "memory"

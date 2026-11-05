@@ -158,8 +158,14 @@ changes small and protocol-specific.
 ## Read first
 
 - `README.md` for integration boundaries and supported flows.
-- `docs/CONFIGURATION.md` for the complete service schema and canonical TOML
-  examples.
+- `docs/README.md` for the integrator documentation index, including
+  `docs/INTEGRATORS.md` and `docs/USERS.md`.
+- `docs/CONFIGURATION.md` for the complete service schema and
+  `examples/README.md` for runnable local, replica, production, mdoc-only,
+  Compose and native-reader examples. The `examples/` directory is only for
+  users and integrators.
+- `docs/design/` for historical findings, design notes and developer-only Rust
+  tools. It is not integrator documentation or a compatibility contract.
 - `src/oid4vp.rs` for request/response policy, handovers and bounded ECDH-ES
   decryption.
 - `src/mdoc_request.rs` for ordered DeviceRequest construction and ReaderAuth;
@@ -201,6 +207,49 @@ ffi/scripts/kotlin-test.sh
 cargo test -p siros-verifier-zkp --test catalog the_live_siros_nymauth_circuit_matches_the_native_test_vector -- --ignored
 ```
 
+## Deployment
+
+- `docker-compose.yml`, `.env.example` and `examples/compose.toml` provide a
+  single-replica loopback-HTTP development setup: a source-built verifier, persistent
+  MongoDB with a least-privilege application user, mounted verifier keys and
+  the image's offline Longfellow artifact. MongoDB is not published to the
+  host and the verifier binds to loopback by default.
+- The Compose setup is not database HA or a production TLS profile. Production
+  uses `examples/production.toml`, secure cookies, TLS termination, HA MongoDB
+  and an immutable GHCR image digest. Use `--no-build` with a release digest;
+  do not deploy `latest`.
+- go-trust is external to this Compose file and must use an HTTPS evaluation
+  endpoint reachable from the verifier container. It must explicitly permit
+  each issuer, verifier and status-list signer. Never substitute an
+  always-trusted registry or a local allow-all path. The circuit catalog is
+  only an integrity source.
+- To deploy locally, copy `.env.example` to `.env`, replace all placeholders
+  with independent secrets from `openssl rand -hex 32`, provide a dedicated
+  P-256 PKCS#8 PEM key (`PRIVATE KEY`) and chain whose DNS SAN matches
+  `SIROS_VERIFIER_DNS_NAME`, then run
+  the commands below. `MONGODB_APP_PASSWORD` must use only URI-unreserved
+  characters `[A-Za-z0-9._~-]` because Compose inserts it into the Mongo URI;
+  do not percent-encode the raw value. This profile is loopback HTTP only, not
+  HTTPS staging.
+
+  ```sh
+  docker compose config --quiet
+  docker compose up --build -d
+  docker compose ps
+  curl --fail http://localhost:9001/health
+  ```
+
+- Use `docker compose logs verifier mongodb` for diagnostics and
+  `docker compose down` to stop. Never use `down --volumes` unless deletion of
+  flow state and replay history is intentional. Keep `.env` and `/secrets/`
+  excluded from both Git and the Docker build context; never commit generated
+  credentials or send them to a remote builder.
+- After changing the Compose model or templates, run
+  `docker compose config --quiet` (never print the secret-bearing rendered
+  configuration) and the `config_examples` service test. `examples/docker/mongo-init.js` runs
+  only on a fresh MongoDB volume and creates the application's `readWrite`
+  user for `siros_verifier`.
+
 ## Releases
 
 Use organization-wide workflows where they exist:
@@ -238,7 +287,9 @@ packaging checks and documentation pass, and the user explicitly approves it.
   implementation as an unstated specification.
 - Add UI/backend profiles together and validate each plan at construction.
   Update `docs/CONFIGURATION.md` for schema changes and this file for changed
-  boundaries, workflows or release rules.
+  boundaries, workflows or release rules. Keep `docs/` and `examples/` limited
+  to user/integrator material; put design history and developer-only examples
+  in `docs/design/`.
 - Fix every review finding and every instance of the same bug class. Merge only
   reviewed, green PRs with a successful GitHub Copilot review.
 - Do not run `git commit`, `git push`, `git rebase`, `git reset`, or create a

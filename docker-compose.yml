@@ -1,0 +1,62 @@
+name: siros-verifier
+
+services:
+  mongodb:
+    image: mongo:8.0@sha256:b9924c330a8bbc5800fe9c69f04a84e221eca7b28fd049a0354147d9908fa142
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: mongo-admin
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGODB_ROOT_PASSWORD:?set MONGODB_ROOT_PASSWORD in .env}
+      MONGO_INITDB_DATABASE: siros_verifier
+      MONGODB_APP_PASSWORD: ${MONGODB_APP_PASSWORD:?set MONGODB_APP_PASSWORD in .env}
+    volumes:
+      - mongodb_data:/data/db
+      - ./examples/docker/mongo-init.js:/docker-entrypoint-initdb.d/mongo-init.js:ro
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  verifier:
+    build:
+      context: .
+    image: ${SIROS_VERIFIER_IMAGE:-siros-verifier-core:local}
+    restart: unless-stopped
+    init: true
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    environment:
+      TUNNELBANA_BIND: 0.0.0.0:9001
+      SIROS_VERIFIER_BASE_URL: ${SIROS_VERIFIER_BASE_URL:-http://localhost:9001}
+      SIROS_VERIFIER_STATE_KEY: ${SIROS_VERIFIER_STATE_KEY:?set SIROS_VERIFIER_STATE_KEY in .env}
+      SIROS_VERIFIER_DNS_NAME: ${SIROS_VERIFIER_DNS_NAME:-localhost}
+      SIROS_PDP_ENDPOINT: ${SIROS_PDP_ENDPOINT:?set SIROS_PDP_ENDPOINT in .env}
+      SIROS_PDP_BEARER_TOKEN: ${SIROS_PDP_BEARER_TOKEN:-}
+      SIROS_VERIFIER_MONGODB_URI: mongodb://verifier-user:${MONGODB_APP_PASSWORD:?set MONGODB_APP_PASSWORD in .env}@mongodb:27017/siros_verifier?authSource=siros_verifier
+    ports:
+      - "${SIROS_VERIFIER_BIND_ADDRESS:-127.0.0.1}:${SIROS_VERIFIER_PORT:-9001}:9001"
+    volumes:
+      - ./examples/compose.toml:/etc/siros-verifier/compose.toml:ro
+    secrets:
+      - verifier_ec_private.pem
+      - verifier_ec_chain.pem
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:9001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    command: ["/etc/siros-verifier/compose.toml"]
+    stop_grace_period: 30s
+
+secrets:
+  verifier_ec_private.pem:
+    file: ${VERIFIER_PRIVATE_KEY_PATH:?set VERIFIER_PRIVATE_KEY_PATH in .env}
+  verifier_ec_chain.pem:
+    file: ${VERIFIER_CHAIN_PATH:?set VERIFIER_CHAIN_PATH in .env}
+
+volumes:
+  mongodb_data: {}

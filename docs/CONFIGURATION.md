@@ -1,12 +1,33 @@
 # Verifier configuration
 
-Runnable local and Fly examples are maintained in `sirosid-dev` under [`fixtures/siros-verifier/`](https://github.com/sirosfoundation/sirosid-dev/tree/main/fixtures/siros-verifier). Run the service with:
+Runnable local, replica, production, and mdoc-only examples are maintained in [`examples/`](../examples/README.md). Run the service with:
 
 ```sh
 siros-verifier-service /etc/siros-verifier/proxy.toml
 ```
 
-Set `TUNNELBANA_BIND=0.0.0.0:9001` when the service is behind a public proxy. Keep request signing keys, the state-sealing master, MongoDB credentials, and any PDP bearer token in a secret manager, not in the TOML file.
+For a single-replica container setup with MongoDB, see [Docker Compose](INTEGRATORS.md#docker-compose) and `examples/compose.toml`.
+
+Set `TUNNELBANA_BIND=0.0.0.0:9001` when the service is behind a public proxy. Keep request signing keys, the state-sealing master, MongoDB credentials, and any PDP bearer token in a secret manager, not in the TOML file. The configuration loader expands `${VARIABLE}` placeholders, so use `state_encryption_key = "${SIROS_VERIFIER_STATE_KEY}"`, `uri = "${SIROS_VERIFIER_MONGODB_URI}"`, and `pdp_bearer_token = "${SIROS_PDP_BEARER_TOKEN}"` and let the secret manager inject those environment variables at process start. Do not commit real values to the examples.
+
+## Plugin roles: `frontend` and `backend`
+
+These are tunnelbana plugin roles, not the usual browser-frontend/server-backend split. Each `[[frontend]]` is a different **entry surface** into the same verification service; frontends are alternatives, not stages that call one another.
+
+| TOML block | Meaning |
+| --- | --- |
+| `[[frontend]] type = "ui"` | The thin browser catalog and presentation-initiation surface. It offers QR, DC API, or link invocation and asynchronously reaches status/completion. It does not make trust decisions. |
+| `[[frontend]] type = "oidc"` | The relying-party-facing OpenID Connect provider endpoint. It handles RP clients, authorization, codes, and tokens; it is a protocol adapter, not a human user interface. |
+| `[[backend]] type = "openid4vp"` | The wallet-facing verification engine. It creates and signs OpenID4VP requests, verifies wallet responses, obtains per-document go-trust permits, and returns verified results. The service requires exactly one block of this type. |
+
+The quickstart, replica, and production examples configure both frontends so the same `openid4vp` backend can be used in two ways:
+
+- **Direct browser flow:** browser → `ui` frontend → `openid4vp` backend ↔ wallet, followed by the existing status/completion endpoints.
+- **OIDC relying-party flow:** RP → `oidc` frontend → `openid4vp` backend ↔ wallet, then the OIDC code/token flow returns the result to the RP.
+
+The mdoc-only example configures only the `ui` frontend: its name disclosures are not unique, never-reassigned OIDC subject identifiers. For an SD-JWT or mdoc OIDC deployment, configure `subject_pointer` to a suitable identifier rather than a holder's name. For `zkp_req`, `subject_handle` selects the profile's pseudonym result handle; that verifier-scoped pseudonym becomes the OIDC subject instead of `subject_pointer`.
+
+`name` identifies a plugin instance and its routes; `type` selects its behavior. The nested `[backend.config.storage]` setting only selects memory or MongoDB state storage, and Longfellow/Vega “proof backends” are cryptographic implementations inside the OpenID4VP backend—neither is another top-level `[[backend]]` plugin.
 
 ## Trust boundary
 
