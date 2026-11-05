@@ -158,8 +158,14 @@ changes small and protocol-specific.
 ## Read first
 
 - `README.md` for integration boundaries and supported flows.
-- `docs/CONFIGURATION.md` for the complete service schema and canonical TOML
-  examples.
+- `docs/README.md` for the integrator documentation index, including
+  `docs/INTEGRATORS.md` and `docs/USERS.md`.
+- `docs/CONFIGURATION.md` for the complete service schema and
+  `examples/README.md` for runnable local, replica, production, mdoc-only and
+  native-reader examples. The `examples/` directory is only for users and
+  integrators.
+- `docs/design/` for historical findings, design notes and developer-only Rust
+  tools. It is not integrator documentation or a compatibility contract.
 - `src/oid4vp.rs` for request/response policy, handovers and bounded ECDH-ES
   decryption.
 - `src/mdoc_request.rs` for ordered DeviceRequest construction and ReaderAuth;
@@ -238,7 +244,9 @@ packaging checks and documentation pass, and the user explicitly approves it.
   implementation as an unstated specification.
 - Add UI/backend profiles together and validate each plan at construction.
   Update `docs/CONFIGURATION.md` for schema changes and this file for changed
-  boundaries, workflows or release rules.
+  boundaries, workflows or release rules. Keep `docs/` and `examples/` limited
+  to user/integrator material; put design history and developer-only examples
+  in `docs/design/`.
 - Fix every review finding and every instance of the same bug class. Merge only
   reviewed, green PRs with a successful GitHub Copilot review.
 - Do not run `git commit`, `git push`, `git rebase`, `git reset`, or create a

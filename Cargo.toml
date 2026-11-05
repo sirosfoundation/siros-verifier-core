@@ -48,14 +48,17 @@ testutil = ["dep:rcgen"]
 
 [[example]]
 name = "bench"
+path = "docs/design/examples/bench.rs"
 required-features = ["testutil"]
 
 [[example]]
 name = "emit_vectors"
+path = "docs/design/examples/emit_vectors.rs"
 required-features = ["testutil"]
 
 [[example]]
 name = "live_pdp_fixture"
+path = "docs/design/examples/live_pdp_fixture.rs"
 required-features = ["testutil"]
 
 # On wasm32-unknown-unknown, getrandom 0.4 uses the wasm_js backend selected in .cargo/config.toml.

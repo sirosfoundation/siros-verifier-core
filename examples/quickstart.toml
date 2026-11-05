@@ -1,0 +1,113 @@
+# Local, single-process SD-JWT + nym_auth quickstart.
+# Replace every /replace/me path and the state key before starting.
+base_url = "http://localhost:9001"
+state_encryption_key = "${SIROS_VERIFIER_STATE_KEY}"
+cookie_name = "SIROS_VERIFIER_STATE"
+cookie_secure = false
+cookie_same_site = "Lax"
+state_cookie_max_age = 900
+
+[logging]
+level = "info"
+format = "pretty"
+
+[[frontend]]
+type = "ui"
+name = "ui"
+  [frontend.config]
+  invocations = ["qr", "dc-api", "link"]
+  schemes = ["openid4vp", "haip", "haip-vp", "mdoc-openid4vp"]
+
+  [[frontend.config.presets]]
+  id = "nym_auth_pseudonym"
+  label = "Nym authentication (zkp_req)"
+  dcql = { credentials = [{
+    id = "nym_attestation", format = "zkp_req",
+    meta = { source_format = "mso_mdoc", doctype_value = "eu.europa.ec.eudi.nym_auth.1" },
+    _req = [
+      { fn_id = "pseudonym", return = "nym-1", params = {
+        config = "known-offender-matching-ssc", ver = 1, prf = "sha-256" } },
+    ]
+  }] }
+
+[[frontend]]
+type = "oidc"
+name = "OIDC"
+  [frontend.config]
+  signing_key_path = "/replace/me/verifier_ec_private.pem"
+  signing_algorithm = "ES256"
+  signing_key_id = "dev-op"
+
+  [[frontend.config.clients]]
+  client_id = "local-rp"
+  redirect_uris = ["http://127.0.0.1:9006/callback"]
+  response_types = ["code"]
+  grant_types = ["authorization_code", "refresh_token"]
+  token_endpoint_auth_method = "none"
+
+[[backend]]
+type = "openid4vp"
+name = "vp"
+  [backend.config]
+  request_signing_key_path = "/replace/me/verifier_ec_private.pem"
+  request_certificate_chain_path = "/replace/me/verifier_ec_chain.pem"
+  pdp_endpoint = "http://127.0.0.1:9095/evaluation"
+  pdp_id = "local-go-trust"
+  # Loopback development only. Never enable this for a remote PDP.
+  allow_insecure_http = false
+  receipt_key_id = "dev-receipt"
+  receipt_issuer = "siros-verifier-core"
+  receipt_audience = "vp"
+  max_receipt_ttl_secs = 300
+  role = "pid-provider"
+  request_ttl_secs = 300
+  subject_pointer = "/personal_administrative_number"
+  dcql = { credentials = [{
+    id = "eudi_pid", format = "dc+sd-jwt",
+    meta = { vct_values = ["urn:eudi:pid:arf-1.8:1"] },
+    claims = [
+      { path = ["given_name"] },
+      { path = ["family_name"] },
+      { path = ["birthdate"] },
+      { path = ["nationalities"] },
+      { path = ["personal_administrative_number"] },
+    ]
+  }] }
+  attribute_map = {
+    givenname = "/given_name",
+    surname = "/family_name",
+    birthdate = "/birthdate",
+    nationalities = "/nationalities",
+  }
+
+  [backend.config.storage]
+  backend = "memory"
+
+  [backend.config.zkp]
+  query = { id = "nym_attestation", format = "zkp_req",
+    meta = { source_format = "mso_mdoc", doctype_value = "eu.europa.ec.eudi.nym_auth.1" },
+    _req = [
+      { fn_id = "pseudonym", return = "nym-1", params = {
+        config = "known-offender-matching-ssc", ver = 1, prf = "sha-256" } },
+    ] }
+  system_id_values = ["urn:circuits:longfellow:nym_auth:v1"]
+  proof_system_values = ["longfellow-libzk-v1"]
+  role = "mdoc-issuer"
+  verifier_id = "x509_san_dns:localhost"
+  subject_handle = "nym-1"
+  attribute_map = { pseudonym = "nym-1" }
+  auth_class_ref = "urn:eudi:loa:high"
+
+  [backend.config.zkp.circuits]
+  sources = ["https://api.circuits.siros.org"]
+
+  [[backend.config.zkp.circuits.allow]]
+  system_id = "urn:circuits:longfellow:nym_auth:v1"
+  config = "known-offender-matching-ssc"
+  hash_circuit_id = "5f8c75ae5c3893ef6ab6a079628cb385ba85e95a85437d58570c455289d75729"
+  sig_circuit_id = "00513797c75b2eab1a9db75004977c15317d4e40c0db1d00674523431baa75cb"
+  block_enc_hash = 6983
+  block_enc_sig = 4679
+  artifact_path = "/replace/me/nymauth-mdoc.bin"
+  artifact_sha256 = "92dd42fdf99673249eec33c7d07850bd9da66fbdab01ef26391e04c8341c1b7f"
+  artifact_bytes = 1062842

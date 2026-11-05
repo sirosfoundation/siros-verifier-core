@@ -2,7 +2,7 @@
 
 Scope: verify SD-JWT VC presentations, build a signed OpenID4VP request object, and handle an encrypted
 `direct_post.jwt` response, using jose-rs and kryptering. Format layer only: trust is delegated (see
-`src/trust.rs` and `docs/go-trust-issue.md`).
+`src/trust.rs` and `docs/design/go-trust-issue.md`).
 
 ## Result
 

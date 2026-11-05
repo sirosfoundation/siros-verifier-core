@@ -1,12 +1,12 @@
 # Verifier configuration
 
-Runnable local and Fly examples are maintained in `sirosid-dev` under [`fixtures/siros-verifier/`](https://github.com/sirosfoundation/sirosid-dev/tree/main/fixtures/siros-verifier). Run the service with:
+Runnable local, replica, production, and mdoc-only examples are maintained in [`examples/`](../examples/README.md). Run the service with:
 
 ```sh
 siros-verifier-service /etc/siros-verifier/proxy.toml
 ```
 
-Set `TUNNELBANA_BIND=0.0.0.0:9001` when the service is behind a public proxy. Keep request signing keys, the state-sealing master, MongoDB credentials, and any PDP bearer token in a secret manager, not in the TOML file.
+Set `TUNNELBANA_BIND=0.0.0.0:9001` when the service is behind a public proxy. Keep request signing keys, the state-sealing master, MongoDB credentials, and any PDP bearer token in a secret manager, not in the TOML file. The configuration loader expands `${VARIABLE}` placeholders, so use `state_encryption_key = "${SIROS_VERIFIER_STATE_KEY}"`, `uri = "${SIROS_VERIFIER_MONGODB_URI}"`, and `pdp_bearer_token = "${SIROS_PDP_BEARER_TOKEN}"` and let the secret manager inject those environment variables at process start. Do not commit real values to the examples.
 
 ## Trust boundary
 

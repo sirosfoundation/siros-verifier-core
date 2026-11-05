@@ -176,6 +176,10 @@ SIROS_VERIFIER_TEST_MONGODB_URI=mongodb://127.0.0.1:27017 \
 Additional parser fuzz and Kotlin interoperability checks are documented in
 [`fuzz/README.md`](fuzz/README.md) and [`AGENTS.md`](AGENTS.md).
 
+## Documentation
+
+Start at [`docs/README.md`](docs/README.md) for integration and user guides, [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) for the full service schema, and [`examples/README.md`](examples/README.md) for explained TOML configurations and native-reader snippets. Historical findings and developer-only tools are kept separately in [`docs/design/`](docs/design/README.md).
+
 ## License
 
 BSD-2-Clause. See [LICENSE](LICENSE).
