@@ -1152,6 +1152,28 @@ async fn http_pdp_enforces_limits_before_end_of_body() {
 
 #[cfg(feature = "http")]
 #[tokio::test]
+async fn status_list_rejects_userinfo_before_dialing() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let client = ReqwestStatusListClient::new_allow_invalid_certificates_for_testing(
+        std::time::Duration::from_secs(2),
+    )
+    .unwrap();
+    for userinfo in ["user", "user:pass", ":pass"] {
+        let uri = format!("https://{userinfo}@127.0.0.1:{port}/status.jwt");
+        let error = client.fetch(&uri).await.unwrap_err();
+        assert_eq!(error, "status_list_uri_not_allowed", "{uri}");
+    }
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+            .await
+            .is_err(),
+        "credential-bearing status URLs must not reach the network"
+    );
+}
+
+#[cfg(feature = "http")]
+#[tokio::test]
 async fn status_list_enforces_body_limits_over_https() {
     let exact = "x".repeat(64 * 1024);
     let raw: &'static str = Box::leak(
