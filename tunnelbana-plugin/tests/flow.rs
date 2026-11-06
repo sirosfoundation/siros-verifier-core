@@ -167,6 +167,22 @@ fn fx_with_method(next_update_in: i64, subject_pointer: &str, request_uri_method
         "auth_class_ref": "urn:eudi:loa:high",
         "request_uri_method": request_uri_method,
     })).unwrap();
+    assemble(cfg, next_update_in, v_cert, &v_key, holder, issued)
+}
+fn fx() -> Fx {
+    fx_with(100_000)
+}
+
+/// The backend assembly every fixture shares: the mock PDP with the given
+/// freshness window, the clock, the trust gate, and the service signer.
+fn assemble(
+    cfg: VpBackendConfig,
+    next_update_in: i64,
+    v_cert: Vec<u8>,
+    v_key: &jose_rs::jwk::Jwk,
+    holder: jose_rs::jwk::Jwk,
+    issued: Issued,
+) -> Fx {
     let pdp = Arc::new(MockPdp {
         permit: AtomicBool::new(true),
         down: AtomicBool::new(false),
@@ -190,7 +206,7 @@ fn fx_with_method(next_update_in: i64, subject_pointer: &str, request_uri_method
         "https://proxy.example/vp",
         cfg,
         gate,
-        siros_verifier_core::oid4vp::software_signer(&v_key).unwrap(),
+        siros_verifier_core::oid4vp::software_signer(v_key).unwrap(),
         vec![v_cert],
         Arc::new(move || c2.load(Ordering::SeqCst)),
     )
@@ -202,9 +218,6 @@ fn fx_with_method(next_update_in: i64, subject_pointer: &str, request_uri_method
         holder,
         issued,
     }
-}
-fn fx() -> Fx {
-    fx_with(100_000)
 }
 
 /// A backend that requests two SD-JWT credentials from different issuers: a PID
@@ -249,42 +262,8 @@ fn fx_multi_at(loyalty_level: Value, subject_pointer: &str) -> (Fx, Issued) {
         "auth_class_ref": "urn:eudi:loa:high",
     }))
     .unwrap();
-    let pdp = Arc::new(MockPdp {
-        permit: AtomicBool::new(true),
-        down: AtomicBool::new(false),
-        calls: AtomicUsize::new(0),
-        next_update_in: 100_000,
-        go_trust_today: AtomicBool::new(false),
-    });
-    let gate = TrustGate::new(
-        pdp.clone(),
-        p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap(),
-        "k1",
-        "core-1",
-        "tenant-a",
-        "https://pdp.example",
-        3600,
-    );
-    let clock = Arc::new(AtomicI64::new(T0));
-    let c2 = clock.clone();
-    let b = VpBackend::new(
-        "vp",
-        "https://proxy.example/vp",
-        cfg,
-        gate,
-        siros_verifier_core::oid4vp::software_signer(&v_key).unwrap(),
-        vec![v_cert],
-        Arc::new(move || c2.load(Ordering::SeqCst)),
-    )
-    .unwrap();
     (
-        Fx {
-            b,
-            pdp,
-            clock,
-            holder,
-            issued: issued_pid,
-        },
+        assemble(cfg, 100_000, v_cert, &v_key, holder, issued_pid),
         issued_loyalty,
     )
 }
@@ -483,8 +462,10 @@ async fn every_verified_credential_s_claims_reach_the_result() {
         "the second credential's claims must reach the result"
     );
     assert_eq!(
-        d.attr_first("kind"),
-        Some("urn:eudi:pid:1"),
+        d.attributes
+            .get("kind")
+            .map(|values| values.iter().map(String::as_str).collect::<Vec<_>>()),
+        Some(vec!["urn:eudi:pid:1", "urn:example:loyalty:1"]),
         "a pointer both credentials carry accumulates in query order"
     );
 }
