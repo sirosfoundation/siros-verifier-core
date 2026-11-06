@@ -1181,3 +1181,26 @@ async fn status_list_rejects_non_public_addresses_before_dialing() {
         "the resolver must not dial a private address returned for localhost"
     );
 }
+
+#[cfg(feature = "http")]
+#[tokio::test]
+async fn local_conformance_client_dials_private_literal_addresses() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let uri = format!(
+        "https://127.0.0.1:{}/status.jwt",
+        listener.local_addr().unwrap().port()
+    );
+    let client = ReqwestStatusListClient::new_allow_invalid_certificates_for_testing(
+        std::time::Duration::from_secs(2),
+    )
+    .unwrap();
+    let request = tokio::spawn(async move { client.fetch(&uri).await });
+
+    let (socket, _) = tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept())
+        .await
+        .expect("the local-conformance client must reach its private fixture")
+        .unwrap();
+    drop(socket);
+    let error = request.await.unwrap().unwrap_err();
+    assert_ne!(error, "status_list_no_public_address");
+}

@@ -80,139 +80,71 @@ struct PublicInternetResolver;
 // globally reachable exception precedes its non-global parent. Everything not
 // listed is ordinary public address space for this egress policy.
 #[cfg(feature = "http")]
+const fn v4(ip: [u8; 4], prefix: u8, global: bool) -> (Ipv4Net, bool) {
+    (
+        Ipv4Net::new_assert(Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]), prefix),
+        global,
+    )
+}
+
+#[cfg(feature = "http")]
+const fn v6(ip: [u16; 8], prefix: u8, global: bool) -> (Ipv6Net, bool) {
+    (
+        Ipv6Net::new_assert(
+            Ipv6Addr::new(ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], ip[6], ip[7]),
+            prefix,
+        ),
+        global,
+    )
+}
+
+#[cfg(feature = "http")]
 const IPV4_SPECIAL: &[(Ipv4Net, bool)] = &[
-    (Ipv4Net::new_assert(Ipv4Addr::new(192, 0, 0, 9), 32), true),
-    (Ipv4Net::new_assert(Ipv4Addr::new(192, 0, 0, 10), 32), true),
-    (Ipv4Net::new_assert(Ipv4Addr::new(0, 0, 0, 0), 8), false),
-    (Ipv4Net::new_assert(Ipv4Addr::new(10, 0, 0, 0), 8), false),
-    (Ipv4Net::new_assert(Ipv4Addr::new(100, 64, 0, 0), 10), false),
-    (Ipv4Net::new_assert(Ipv4Addr::new(127, 0, 0, 0), 8), false),
-    (
-        Ipv4Net::new_assert(Ipv4Addr::new(169, 254, 0, 0), 16),
-        false,
-    ),
-    (Ipv4Net::new_assert(Ipv4Addr::new(172, 16, 0, 0), 12), false),
-    (Ipv4Net::new_assert(Ipv4Addr::new(192, 0, 0, 0), 24), false),
-    (Ipv4Net::new_assert(Ipv4Addr::new(192, 0, 2, 0), 24), false),
-    (
-        Ipv4Net::new_assert(Ipv4Addr::new(192, 88, 99, 0), 24),
-        false,
-    ),
-    (
-        Ipv4Net::new_assert(Ipv4Addr::new(192, 168, 0, 0), 16),
-        false,
-    ),
-    (Ipv4Net::new_assert(Ipv4Addr::new(198, 18, 0, 0), 15), false),
-    (
-        Ipv4Net::new_assert(Ipv4Addr::new(198, 51, 100, 0), 24),
-        false,
-    ),
-    (
-        Ipv4Net::new_assert(Ipv4Addr::new(203, 0, 113, 0), 24),
-        false,
-    ),
-    (Ipv4Net::new_assert(Ipv4Addr::new(224, 0, 0, 0), 4), false),
-    (Ipv4Net::new_assert(Ipv4Addr::new(240, 0, 0, 0), 4), false),
-    (
-        Ipv4Net::new_assert(Ipv4Addr::new(255, 255, 255, 255), 32),
-        false,
-    ),
+    v4([192, 0, 0, 9], 32, true),
+    v4([192, 0, 0, 10], 32, true),
+    v4([0, 0, 0, 0], 8, false),
+    v4([10, 0, 0, 0], 8, false),
+    v4([100, 64, 0, 0], 10, false),
+    v4([127, 0, 0, 0], 8, false),
+    v4([169, 254, 0, 0], 16, false),
+    v4([172, 16, 0, 0], 12, false),
+    v4([192, 0, 0, 0], 24, false),
+    v4([192, 0, 2, 0], 24, false),
+    v4([192, 88, 99, 0], 24, false),
+    v4([192, 168, 0, 0], 16, false),
+    v4([198, 18, 0, 0], 15, false),
+    v4([198, 51, 100, 0], 24, false),
+    v4([203, 0, 113, 0], 24, false),
+    v4([224, 0, 0, 0], 4, false),
+    v4([240, 0, 0, 0], 4, false),
+    v4([255, 255, 255, 255], 32, false),
 ];
 
 #[cfg(feature = "http")]
 const IPV6_SPECIAL: &[(Ipv6Net, bool)] = &[
-    (
-        Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 1, 0, 0, 0, 0, 0, 1), 128),
-        true,
-    ),
-    (
-        Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 1, 0, 0, 0, 0, 0, 2), 128),
-        true,
-    ),
-    (
-        Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 1, 0, 0, 0, 0, 0, 3), 128),
-        true,
-    ),
-    (
-        Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 3, 0, 0, 0, 0, 0, 0), 32),
-        true,
-    ),
-    (
-        Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 4, 0x0112, 0, 0, 0, 0, 0), 48),
-        true,
-    ),
-    (
-        Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 0x20, 0, 0, 0, 0, 0, 0), 28),
-        true,
-    ),
-    (
-        Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 0x30, 0, 0, 0, 0, 0, 0), 28),
-        true,
-    ),
-    (
-        Ipv6Net::new_assert(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1), 128),
-        false,
-    ),
-    (
-        Ipv6Net::new_assert(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0), 128),
-        false,
-    ),
-    (
-        Ipv6Net::new_assert(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0, 0), 96),
-        false,
-    ),
-    (
-        Ipv6Net::new_assert(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0), 96),
-        false,
-    ),
-    (
-        Ipv6Net::new_assert(Ipv6Addr::new(0x64, 0xff9b, 1, 0, 0, 0, 0, 0), 48),
-        false,
-    ),
-    (
-        Ipv6Net::new_assert(Ipv6Addr::new(0x100, 0, 0, 0, 0, 0, 0, 0), 64),
-        false,
-    ),
-    (
-        Ipv6Net::new_assert(Ipv6Addr::new(0x100, 0, 0, 1, 0, 0, 0, 0), 64),
-        false,
-    ),
-    (
-        Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0), 23),
-        false,
-    ),
-    (
-        Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0), 32),
-        false,
-    ),
-    (
-        Ipv6Net::new_assert(Ipv6Addr::new(0x2002, 0, 0, 0, 0, 0, 0, 0), 16),
-        false,
-    ),
-    (
-        Ipv6Net::new_assert(Ipv6Addr::new(0x3fff, 0, 0, 0, 0, 0, 0, 0), 20),
-        false,
-    ),
-    (
-        Ipv6Net::new_assert(Ipv6Addr::new(0x5f00, 0, 0, 0, 0, 0, 0, 0), 16),
-        false,
-    ),
-    (
-        Ipv6Net::new_assert(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0), 7),
-        false,
-    ),
-    (
-        Ipv6Net::new_assert(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10),
-        false,
-    ),
-    (
-        Ipv6Net::new_assert(Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 0), 10),
-        false,
-    ),
-    (
-        Ipv6Net::new_assert(Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0), 8),
-        false,
-    ),
+    v6([0x2001, 1, 0, 0, 0, 0, 0, 1], 128, true),
+    v6([0x2001, 1, 0, 0, 0, 0, 0, 2], 128, true),
+    v6([0x2001, 1, 0, 0, 0, 0, 0, 3], 128, true),
+    v6([0x2001, 3, 0, 0, 0, 0, 0, 0], 32, true),
+    v6([0x2001, 4, 0x0112, 0, 0, 0, 0, 0], 48, true),
+    v6([0x2001, 0x20, 0, 0, 0, 0, 0, 0], 28, true),
+    v6([0x2001, 0x30, 0, 0, 0, 0, 0, 0], 28, true),
+    v6([0, 0, 0, 0, 0, 0, 0, 1], 128, false),
+    v6([0, 0, 0, 0, 0, 0, 0, 0], 128, false),
+    v6([0, 0, 0, 0, 0, 0xffff, 0, 0], 96, false),
+    v6([0, 0, 0, 0, 0, 0, 0, 0], 96, false),
+    v6([0x64, 0xff9b, 1, 0, 0, 0, 0, 0], 48, false),
+    v6([0x100, 0, 0, 0, 0, 0, 0, 0], 64, false),
+    v6([0x100, 0, 0, 1, 0, 0, 0, 0], 64, false),
+    v6([0x2001, 0, 0, 0, 0, 0, 0, 0], 23, false),
+    v6([0x2001, 0x0db8, 0, 0, 0, 0, 0, 0], 32, false),
+    v6([0x2002, 0, 0, 0, 0, 0, 0, 0], 16, false),
+    v6([0x3fff, 0, 0, 0, 0, 0, 0, 0], 20, false),
+    v6([0x5f00, 0, 0, 0, 0, 0, 0, 0], 16, false),
+    v6([0xfc00, 0, 0, 0, 0, 0, 0, 0], 7, false),
+    v6([0xfe80, 0, 0, 0, 0, 0, 0, 0], 10, false),
+    v6([0xfec0, 0, 0, 0, 0, 0, 0, 0], 10, false),
+    v6([0xff00, 0, 0, 0, 0, 0, 0, 0], 8, false),
 ];
 
 #[cfg(feature = "http")]
@@ -370,6 +302,7 @@ pub trait StatusListClient: Send + Sync {
 #[cfg(feature = "http")]
 pub struct ReqwestStatusListClient {
     client: reqwest::Client,
+    public_addresses_only: bool,
 }
 
 #[cfg(feature = "http")]
@@ -399,7 +332,10 @@ impl ReqwestStatusListClient {
             builder = builder.dns_resolver(Arc::new(PublicInternetResolver));
         }
         let client = builder.build().map_err(|e| e.to_string())?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            public_addresses_only: !allow_invalid_certificates,
+        })
     }
 }
 
@@ -414,11 +350,13 @@ impl StatusListClient for ReqwestStatusListClient {
         if url.host_str().is_none() || !url.username().is_empty() || url.password().is_some() {
             return Err("status_list_uri_not_allowed".into());
         }
-        if let Some(host) = url.host_str() {
-            let host = host.trim_start_matches('[').trim_end_matches(']');
-            if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-                if !is_public_ip(ip) {
-                    return Err("status_list_no_public_address".into());
+        if self.public_addresses_only {
+            if let Some(host) = url.host_str() {
+                let host = host.trim_start_matches('[').trim_end_matches(']');
+                if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                    if !is_public_ip(ip) {
+                        return Err("status_list_no_public_address".into());
+                    }
                 }
             }
         }
