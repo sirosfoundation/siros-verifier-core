@@ -147,6 +147,11 @@ const IPV6_SPECIAL: &[(Ipv6Net, bool)] = &[
     v6([0xff00, 0, 0, 0, 0, 0, 0, 0], 8, false),
 ];
 
+// RFC 6052 §2.1: the Well-Known Prefix carries the destination IPv4
+// address in the final 32 bits, so it needs the same egress policy.
+#[cfg(feature = "http")]
+const NAT64_WKP: Ipv6Net = Ipv6Net::new_assert(Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0, 0), 96);
+
 #[cfg(feature = "http")]
 fn is_public_ip(ip: std::net::IpAddr) -> bool {
     match ip {
@@ -157,6 +162,12 @@ fn is_public_ip(ip: std::net::IpAddr) -> bool {
         std::net::IpAddr::V6(ip) => {
             if let Some(mapped) = ip.to_ipv4_mapped() {
                 return is_public_ip(std::net::IpAddr::V4(mapped));
+            }
+            if NAT64_WKP.contains(&ip) {
+                let octets = ip.octets();
+                return is_public_ip(std::net::IpAddr::V4(Ipv4Addr::new(
+                    octets[12], octets[13], octets[14], octets[15],
+                )));
             }
             IPV6_SPECIAL
                 .iter()
