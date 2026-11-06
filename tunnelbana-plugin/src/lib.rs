@@ -217,7 +217,7 @@ fn status_request_error(error: reqwest::Error) -> String {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VpBackendConfig {
-    /// DCQL query sent to the wallet.
+    /// Fallback DCQL query sent to the wallet, validated during construction.
     pub dcql: Value,
     /// Internal attribute name -> JSON pointer into the verified claims (for example `/family_name`).
     pub attribute_map: BTreeMap<String, String>,
@@ -862,6 +862,38 @@ impl VpBackend {
         chain_der: Vec<Vec<u8>>,
         clock: Clock,
     ) -> Result<Self> {
+        Self::new_inner(
+            name,
+            module_base,
+            cfg,
+            gate,
+            signer,
+            chain_der,
+            clock,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_inner(
+        name: &str,
+        module_base: &str,
+        cfg: VpBackendConfig,
+        gate: TrustGate,
+        signer: kryptering::SoftwareSigner,
+        chain_der: Vec<Vec<u8>>,
+        clock: Clock,
+        zkp_validated: bool,
+    ) -> Result<Self> {
+        if is_zkp_query(&cfg.dcql) && !zkp_validated {
+            return Err(Error::Config(
+                "zkp_req fallback requires specialized validation".into(),
+            ));
+        }
+        if !is_zkp_query(&cfg.dcql) {
+            oid4vp::validate_dcql_query(&cfg.dcql)
+                .map_err(|e| Error::Config(format!("dcql: {e}")))?;
+        }
         if cfg.request_ttl_secs <= 0 || cfg.request_ttl_secs > 900 {
             return Err(Error::Config("request_ttl_secs must be 1..=900".into()));
         }
@@ -921,15 +953,51 @@ impl VpBackend {
             request_uri_method: default_request_uri_method(),
             auth_class_ref: mode.cfg.auth_class_ref.clone(),
         };
-        let mut backend = Self::new(name, module_base, cfg, gate, signer, chain_der, clock)?;
+        let mut backend =
+            Self::new_inner(name, module_base, cfg, gate, signer, chain_der, clock, true)?;
         backend.zkp = Some(mode);
         Ok(backend)
+    }
+
+    /// Construct a backend with ZKP support and a fallback validated against
+    /// the configured profiles. Non-ZKP fallbacks remain valid alongside ZKP.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_zkp(
+        name: &str,
+        module_base: &str,
+        cfg: VpBackendConfig,
+        zcfg: ZkpBackendConfig,
+        gate: TrustGate,
+        signer: kryptering::SoftwareSigner,
+        chain_der: Vec<Vec<u8>>,
+        verifier: ZkpVerifier,
+        clock: Clock,
+    ) -> Result<Self> {
+        let mode = ZkpMode::new(zcfg, verifier)?;
+        Self::validate_zkp_fallback(&mode, &cfg.dcql)?;
+        let mut backend =
+            Self::new_inner(name, module_base, cfg, gate, signer, chain_der, clock, true)?;
+        backend.zkp = Some(mode);
+        Ok(backend)
+    }
+
+    fn validate_zkp_fallback(mode: &ZkpMode, dcql: &Value) -> Result<()> {
+        // A ZKP fallback must be exactly one of the queries just validated.
+        // Non-ZKP fallbacks remain valid alongside ZKP and are checked in `new`.
+        if is_zkp_query(dcql) && mode.profile_for_query(dcql).is_none() {
+            return Err(Error::Config(
+                "fallback DCQL must match a configured zkp_req profile".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Add `zkp_req` alongside the backend's existing SD-JWT/mdoc profiles.
     /// The configured query is the only ZK query accepted from the UI.
     pub fn with_zkp(mut self, zcfg: ZkpBackendConfig, verifier: ZkpVerifier) -> Result<Self> {
-        self.zkp = Some(ZkpMode::new(zcfg, verifier)?);
+        let mode = ZkpMode::new(zcfg, verifier)?;
+        Self::validate_zkp_fallback(&mode, &self.cfg.dcql)?;
+        self.zkp = Some(mode);
         Ok(self)
     }
 

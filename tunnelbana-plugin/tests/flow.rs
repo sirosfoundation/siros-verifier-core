@@ -790,33 +790,41 @@ fn routes_cover_the_flow_endpoints_and_nothing_else() {
     assert_eq!(m("vp/complete/extra"), None);
 }
 
+fn backend_with_config(cfg: VpBackendConfig) -> Result<VpBackend, tunnelbana_core::Error> {
+    let (v_cert, v_key) = self_signed_ec("v.example", "ES256");
+    let gate = TrustGate::new(
+        Arc::new(NoPdp),
+        p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap(),
+        "k",
+        "i",
+        "a",
+        "p",
+        60,
+    );
+    VpBackend::new(
+        "vp",
+        "https://p/vp",
+        cfg,
+        gate,
+        siros_verifier_core::oid4vp::software_signer(&v_key).unwrap(),
+        vec![v_cert],
+        system_clock(),
+    )
+}
+
 #[test]
 fn config_rejects_unknown_fields_and_bad_pointers() {
     assert!(serde_json::from_value::<VpBackendConfig>(
         json!({"dcql": {}, "attribute_map": {}, "subject_pointer": "/a", "role": "r", "typo": 1})
     )
     .is_err());
-    let (v_cert, v_key) = self_signed_ec("v.example", "ES256");
     let mk = |sp: &str, ttl: i64| {
-        let cfg: VpBackendConfig = serde_json::from_value(json!({"dcql": {}, "attribute_map": {}, "subject_pointer": sp, "role": "r", "request_ttl_secs": ttl})).unwrap();
-        let gate = TrustGate::new(
-            Arc::new(NoPdp),
-            p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap(),
-            "k",
-            "i",
-            "a",
-            "p",
-            60,
-        );
-        VpBackend::new(
-            "vp",
-            "https://p/vp",
-            cfg,
-            gate,
-            siros_verifier_core::oid4vp::software_signer(&v_key).unwrap(),
-            vec![v_cert.clone()],
-            system_clock(),
-        )
+        let cfg: VpBackendConfig = serde_json::from_value(json!({
+            "dcql": {"credentials": [{"id": "pid", "format": "dc+sd-jwt"}]},
+            "attribute_map": {}, "subject_pointer": sp, "role": "r", "request_ttl_secs": ttl
+        }))
+        .unwrap();
+        backend_with_config(cfg)
     };
     assert!(
         mk("family_name", 300).is_err(),
@@ -825,6 +833,38 @@ fn config_rejects_unknown_fields_and_bad_pointers() {
     assert!(mk("/family_name", 0).is_err());
     assert!(mk("/family_name", 901).is_err());
     assert!(mk("/family_name", 300).is_ok());
+}
+
+#[test]
+fn default_dcql_is_validated_at_construction() {
+    let cfg: VpBackendConfig = serde_json::from_value(json!({
+        "dcql": {"credentials": []},
+        "attribute_map": {}, "subject_pointer": "/family_name", "role": "r"
+    }))
+    .unwrap();
+    assert!(matches!(
+        backend_with_config(cfg),
+        Err(tunnelbana_core::Error::Config(_))
+    ));
+}
+
+#[test]
+fn zkp_fallback_requires_specialized_construction() {
+    let cfg: VpBackendConfig = serde_json::from_value(json!({
+        "dcql": {"credentials": [{
+            "id": "nym", "format": "zkp_req",
+            "meta": {"source_format": "mso_mdoc", "doctype_value": "eu.europa.ec.eudi.nym_auth.1"},
+            "_req": [{"fn_id": "pseudonym", "return": "nym-1", "params": {
+                "config": "known-offender-matching-ssc", "ver": 1, "prf": "sha-256"
+            }}]
+        }]},
+        "attribute_map": {}, "subject_pointer": "/family_name", "role": "r"
+    }))
+    .unwrap();
+    assert!(matches!(
+        backend_with_config(cfg),
+        Err(tunnelbana_core::Error::Config(_))
+    ));
 }
 
 #[tokio::test]

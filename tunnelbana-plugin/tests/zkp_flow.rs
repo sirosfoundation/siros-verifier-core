@@ -162,13 +162,14 @@ fn multi_zcfg() -> Value {
 }
 
 fn build(zcfg: Value, verifier_id: Option<&str>) -> Result<Fx, String> {
-    build_with_store(zcfg, verifier_id, None)
+    build_with_store(zcfg, verifier_id, None, None)
 }
 
 fn build_with_store(
     zcfg: Value,
     verifier_id: Option<&str>,
     store: Option<Arc<dyn FlowStore>>,
+    fallback: Option<Value>,
 ) -> Result<Fx, String> {
     let (v_cert, v_key) = self_signed_ec("verifier.example", "ES256");
     let (artifact, circuit) = zk::artifact(b"a model circuit artifact");
@@ -210,8 +211,12 @@ fn build_with_store(
         zcfg["verifier_id"] = serde_json::json!(verifier_id);
     }
     let cfg: ZkpBackendConfig = serde_json::from_value(zcfg).map_err(|e| e.to_string())?;
+    let default_query = cfg
+        .query
+        .clone()
+        .or_else(|| cfg.profiles.first().map(|profile| profile.query.clone()));
     let base = VpBackendConfig {
-        dcql: json!({"credentials": [cfg.query.clone()]}),
+        dcql: fallback.unwrap_or_else(|| json!({"credentials": [default_query]})),
         attribute_map: BTreeMap::new(),
         subject_pointer: String::new(),
         role: cfg.role.clone(),
@@ -220,13 +225,15 @@ fn build_with_store(
         request_uri_method: "get".into(),
         auth_class_ref: cfg.auth_class_ref.clone(),
     };
-    let mut backend = VpBackend::new(
+    let mut backend = VpBackend::new_with_zkp(
         "vp",
         "https://proxy.example/vp",
         base,
+        cfg,
         gate,
         siros_verifier_core::oid4vp::software_signer(&v_key).unwrap(),
         vec![v_cert],
+        verifier,
         Arc::new(move || c2.load(Ordering::SeqCst)),
     )
     .map_err(|e| e.to_string())?;
@@ -236,7 +243,7 @@ fn build_with_store(
                 .unwrap(),
         );
     }
-    let b = backend.with_zkp(cfg, verifier).map_err(|e| e.to_string())?;
+    let b = backend;
     Ok(Fx {
         b,
         pdp,
@@ -489,7 +496,7 @@ async fn inconsistent_sealed_channels_are_refused_before_verification() {
         (true, None),
     ] {
         let store = Arc::new(CorruptStore::default());
-        let f = build_with_store(zcfg(), None, Some(store.clone())).unwrap();
+        let f = build_with_store(zcfg(), None, Some(store.clone()), None).unwrap();
         let (state, id) = if dc_api {
             start_dc_api(&f).await
         } else {
@@ -670,6 +677,26 @@ async fn a_replay_and_a_response_for_another_flow_are_refused_as_for_any_format(
         400,
         "a response for another flow does not decrypt or bind"
     );
+}
+
+#[test]
+fn a_zkp_fallback_must_match_a_configured_profile() {
+    let mut different = zcfg();
+    different["query"]["id"] = json!("different");
+    let different = json!({"credentials": [different["query"].clone()]});
+    let mixed = json!({"credentials": [
+        zcfg()["query"].clone(),
+        {"id": "pid", "format": "dc+sd-jwt"}
+    ]});
+    let mut unsupported_root = json!({"credentials": [zcfg()["query"].clone()]});
+    unsupported_root["unsupported"] = json!(true);
+
+    for fallback in [different, mixed, unsupported_root] {
+        assert!(
+            build_with_store(zcfg(), None, None, Some(fallback.clone())).is_err(),
+            "fallback must not bypass profile validation: {fallback}"
+        );
+    }
 }
 
 #[test]

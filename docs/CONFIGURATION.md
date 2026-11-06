@@ -51,6 +51,8 @@ The default is `request_uri_method = "get"`. Set `request_uri_method = "post"` f
 
 `frontend.config.presets` is an array of tables with `id`, `label`, and `dcql`. Registry-derived presets are merged by credential format and type; the registry's full claim list remains available for editing. Configure the requested claim subset for your deployment and include a subject claim—the first claim becomes the subject when no custom pointer is configured.
 
+`backend.config.dcql` is the fallback when a request supplies no custom UI DCQL. Both this fallback and configured UI presets are validated during construction; an invalid configured default prevents startup. Browser-edited DCQL is still validated at flow initiation.
+
 Only the QR display is modal, and its contents are replaced on every request. The complete page shows a neutral spinner while pending and then renders the decoded verified response or an error.
 
 ## `zkp_req`
