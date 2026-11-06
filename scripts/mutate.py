@@ -131,6 +131,7 @@ M = [
  ("tb", "if !p.is_empty() && !p.starts_with('/') {", 'if false {', "plugin pointer validation"),
  ("tb", 'data.requester = requester.clone();', '', "plugin requester carried"),
  ("tb", 'if data.subject_id.is_none() {\n            return self', 'if false {\n            return self', "plugin subject required"),
+ ("tb", 'if data.subject_id.is_none() {\n            if let Some(v) = claims_root.pointer(subject_pointer) {', 'if true {\n            if let Some(v) = claims_root.pointer(subject_pointer) {', "plugin subject first wins"),
  ("tb", 'Self::merge_attributes(&claims_root, &mut data, &attribute_map, &subject_pointer)', 'Self::merge_attributes(&claims_root, &mut InternalData::default(), &attribute_map, &subject_pointer)', "plugin every credential mapped"),
  ("tb", 'let decision = v\n        .get("decision")\n        .and_then(Value::as_bool)\n        .ok_or("pdp_decision_missing")?;', 'let decision = v.get("decision").and_then(Value::as_bool).unwrap_or(true);', "plugin decision strictness"),
  ("tb", 'Some(Value::String(s)) if !s.is_empty() => s.clone(),', 'Some(Value::String(s)) => s.clone(),', "plugin empty decision id"),

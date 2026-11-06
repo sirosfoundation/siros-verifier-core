@@ -485,6 +485,20 @@ async fn the_subject_may_come_from_a_later_credential() {
 }
 
 #[tokio::test]
+async fn the_subject_comes_from_the_first_credential_that_carries_it() {
+    // both credentials carry /vct; the first one in query order must win
+    let (f, loyalty) = fx_multi_at(json!("gold"), "/vct");
+    let (state, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    let (st, body) = post(&f, &id, &wallet_multi(&f, &loyalty, &jar)).await;
+    assert_eq!(st, 200, "{body}");
+    let BackendAction::AuthResponse(d) = complete(&f, &state).await.unwrap() else {
+        panic!("expected auth response")
+    };
+    assert_eq!(d.subject_id.as_deref(), Some("urn:eudi:pid:1"));
+}
+
+#[tokio::test]
 async fn a_non_scalar_mapped_claim_in_any_credential_fails_the_flow() {
     let (f, loyalty) = fx_multi(json!({"level": "gold"}));
     let (state, id) = start(&f).await;
