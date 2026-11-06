@@ -140,6 +140,7 @@ M = [
  ("tb", '.is_some_and(|length| length > limit as u64)', '.is_some_and(|_| false)', "plugin pdp declared size limit"),
  ("tb", '.filter(|length| *length <= limit)', '.filter(|length| *length <= usize::MAX)', "plugin pdp size limit"),
  ("tb", 'if !is_public_ip(ip) {', 'if false {', "status public ipv4 policy"),
+ ("tb", 'if NAT64_WKP.contains(&ip) {', 'if false {', "status nat64 ipv4 policy"),
  ("tb", 'public_addresses_only: !allow_invalid_certificates,', 'public_addresses_only: true,', "status local conformance egress"),
  ("tb", '.filter(|address| is_public_ip(address.ip()))', '.filter(|_| true)', "status public dns policy"),
  ("tb", '.with_header("cache-control", "no-store")', '', "plugin request object no-store"),

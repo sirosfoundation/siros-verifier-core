@@ -1282,6 +1282,8 @@ async fn status_list_rejects_non_public_addresses_before_dialing() {
         "https://[fc00::1]/status.jwt",
         "https://[fe80::1]/status.jwt",
         "https://[64:ff9b:1::1]/status.jwt",
+        "https://[64:ff9b::a00:1]/status.jwt",
+        "https://[64:ff9b::a9fe:a9fe]/status.jwt",
         "https://[fec0::1]/status.jwt",
         "https://[5f00::1]/status.jwt",
         "https://[2001:db8::1]/status.jwt",
@@ -1300,7 +1302,7 @@ async fn status_list_rejects_non_public_addresses_before_dialing() {
     for uri in [
         "https://192.0.0.9/status.jwt",
         "https://192.0.0.10/status.jwt",
-        "https://[64:ff9b::1]/status.jwt",
+        "https://[64:ff9b::808:808]/status.jwt",
         "https://[2001:1::1]/status.jwt",
         "https://[2001:1::3]/status.jwt",
         "https://[2001:3::1]/status.jwt",
