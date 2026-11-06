@@ -37,3 +37,5 @@ siros-verifier-core = { path = "..", features = ["testutil"] }
 siros-verifier-zkp = { path = "../zkp", features = ["testutil"] }
 tokio = { version = "1", features = ["rt", "macros", "sync", "net", "io-util"] }
 jose-rs = { version = "0.10", default-features = false }
+rcgen = "0.14"
+tokio-rustls = "0.26"

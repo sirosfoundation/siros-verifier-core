@@ -1126,6 +1126,43 @@ async fn stalled_response(raw: &'static str) -> (String, tokio::task::JoinHandle
     (url, handle)
 }
 
+/// Local HTTPS response server for the status-list transport itself.
+#[cfg(feature = "http")]
+async fn https_response(raw: &'static str, stall: bool) -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_rustls::rustls::pki_types::PrivateKeyDer;
+
+    let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let config = tokio_rustls::rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.der().clone()],
+            PrivateKeyDer::Pkcs8(signing_key.serialize_der().into()),
+        )
+        .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "https://localhost:{}/status.jwt",
+        listener.local_addr().unwrap().port()
+    );
+    let handle = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = acceptor.accept(socket).await.unwrap();
+        let mut request = vec![0u8; 8192];
+        let _ = socket.read(&mut request).await.unwrap();
+        socket.write_all(raw.as_bytes()).await.unwrap();
+        if stall {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        } else {
+            let _ = socket.shutdown().await;
+        }
+    });
+    (url, handle)
+}
+
 #[cfg(feature = "http")]
 #[tokio::test]
 async fn http_pdp_status_body_redirect_and_bearer() {
@@ -1260,6 +1297,63 @@ async fn http_pdp_enforces_limits_before_end_of_body() {
         .await
         .unwrap_err();
     assert_eq!(error, "pdp response too large");
+}
+
+#[cfg(feature = "http")]
+#[tokio::test]
+async fn status_list_enforces_body_limits_over_https() {
+    let exact = "x".repeat(64 * 1024);
+    let raw: &'static str = Box::leak(
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{exact}",
+            exact.len()
+        )
+        .into_boxed_str(),
+    );
+    let (url, _handle) = https_response(raw, false).await;
+    let body = ReqwestStatusListClient::new_allow_invalid_certificates_for_testing(
+        std::time::Duration::from_secs(2),
+    )
+    .unwrap()
+    .fetch(&url)
+    .await
+    .unwrap();
+    assert_eq!(body.len(), 64 * 1024);
+
+    let declared: &'static str = Box::leak(
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            (64 * 1024) + 1
+        )
+        .into_boxed_str(),
+    );
+    let (url, _handle) = https_response(declared, true).await;
+    let error = ReqwestStatusListClient::new_allow_invalid_certificates_for_testing(
+        std::time::Duration::from_secs(2),
+    )
+    .unwrap()
+    .fetch(&url)
+    .await
+    .unwrap_err();
+    assert_eq!(error, "status_list_response_too_large");
+
+    let oversized_chunk = "x".repeat((64 * 1024) + 1);
+    let streamed: &'static str = Box::leak(
+        format!(
+            "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n{:x}\r\n{}\r\n",
+            oversized_chunk.len(), oversized_chunk
+        )
+        .into_boxed_str(),
+    );
+    let (url, _handle) = https_response(streamed, true).await;
+    let error = ReqwestStatusListClient::new_allow_invalid_certificates_for_testing(
+        std::time::Duration::from_secs(2),
+    )
+    .unwrap()
+    .fetch(&url)
+    .await
+    .unwrap_err();
+    assert_eq!(error, "status_list_response_too_large");
 }
 
 #[cfg(feature = "http")]
