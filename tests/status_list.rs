@@ -1,5 +1,7 @@
+use serde_json::{json, Value};
 use siros_verifier_core::sdjwt::{StatusRef, X5cLeaf};
 use siros_verifier_core::status_list::{index_parts, status_at, verify_token};
+use siros_verifier_core::testutil::{self_signed_ec, sign_raw};
 use siros_verifier_core::trust::TrustQuery;
 
 const NOW: i64 = 1_793_656_800;
@@ -45,4 +47,25 @@ fn an_index_beyond_the_native_usize_range_is_rejected_not_truncated() {
     let error = status_at(&token, &reference(1_u64 << 32)).unwrap_err();
     assert_eq!(error.code(), "policy");
     assert!(error.to_string().contains("status_list_index_out_of_range"));
+}
+
+fn valid_claims() -> Value {
+    serde_json::from_slice(&jose_rs::base64url::decode(TOKEN.split('.').nth(1).unwrap()).unwrap())
+        .unwrap()
+}
+
+#[test]
+fn non_integer_time_claims_are_rejected_even_with_valid_signatures() {
+    let (cert, key) = self_signed_ec("status.example", "ES256");
+    for (name, value) in [
+        ("exp", json!("0")),
+        ("iat", json!([])),
+        ("iat", json!("future")),
+    ] {
+        let mut claims = valid_claims();
+        claims[name] = value.clone();
+        let token = sign_raw(&key, "statuslist+jwt", &claims, std::slice::from_ref(&cert));
+        let error = verify_token(&token, &X5cLeaf, NOW).unwrap_err();
+        assert_eq!(error.code(), "malformed", "{name}={value}");
+    }
 }

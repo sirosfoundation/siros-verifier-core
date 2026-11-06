@@ -59,6 +59,11 @@ pub fn verify_token(
     if sub.is_empty() {
         return Err(malformed("status_list_missing_sub"));
     }
+    for name in ["iat", "exp"] {
+        if claims_object.get(name).is_some_and(|value| !value.is_i64()) {
+            return Err(malformed(format!("status_list_{name}_not_integer")));
+        }
+    }
     if let Some(exp) = claims_object.get("exp").and_then(Value::as_i64) {
         if now >= exp {
             return Err(policy("status_list_expired"));

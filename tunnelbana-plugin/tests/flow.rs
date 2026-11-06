@@ -36,8 +36,11 @@ impl PdpClient for MockPdp {
         if self.down.load(Ordering::SeqCst) {
             return Err("connect refused".into());
         }
-        assert_eq!(
-            req["action"]["name"], "pid-provider",
+        assert!(
+            matches!(
+                req["action"]["name"].as_str(),
+                Some("pid-provider" | "status-list-signer")
+            ),
             "role comes from config"
         );
         if self.go_trust_today.load(Ordering::SeqCst) {
@@ -48,6 +51,23 @@ impl PdpClient for MockPdp {
                   "context": {"id": format!("dec-{}", self.calls.load(Ordering::SeqCst)),
                               "trust_data": [{"registry": "etsi", "as_of": "2027-01-15T00:00:00Z",
                                               "next_update": next_update(self.next_update_in)}]}}))
+    }
+}
+
+#[derive(Default)]
+struct CountingStatusClient {
+    calls: AtomicUsize,
+    token: Option<String>,
+}
+
+#[async_trait]
+impl StatusListClient for CountingStatusClient {
+    async fn fetch(&self, _uri: &str) -> Result<String, String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(token) = &self.token {
+            return Ok(token.clone());
+        }
+        Err("unexpected status fetch".into())
     }
 }
 
@@ -348,6 +368,135 @@ async fn untrusted_issuer_fails_the_flow_and_no_attributes_leak() {
         complete(&f, &state).await.err().unwrap(),
         "authentication error: issuer_not_trusted"
     );
+}
+
+#[tokio::test]
+async fn an_untrusted_issuer_cannot_trigger_status_network_activity() {
+    let mut f = fx();
+    f.pdp.permit.store(false, Ordering::SeqCst);
+    let status = Arc::new(CountingStatusClient::default());
+    let status_calls = status.clone();
+    let (issuer_cert, issuer_key) = self_signed_ec("issuer.example", "ES256");
+    let mut spec = IssueSpec::new(json!({
+        "iss": "https://issuer.example", "vct": "urn:eudi:pid:1", "iat": T0 - 10,
+        "exp": T0 + 1_000_000, "given_name": "Ada", "family_name": "Lovelace",
+        "status": {"status_list": {"idx": 0, "uri": "https://status.example/list.jwt"}},
+    }));
+    spec.holder_pub = Some(public_of(&f.holder));
+    spec.x5c_der = vec![issuer_cert];
+    spec.conceal = vec![vec![Seg::Key("given_name")], vec![Seg::Key("family_name")]];
+    f.issued = issue(&issuer_key, &spec).unwrap();
+    f.b = f.b.with_status_list_client(status);
+
+    let (state, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    let (st, body) = post(&f, &id, &wallet(&f, &jar)).await;
+    assert_eq!(st, 403);
+    let error: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(error["error"], "issuer_not_trusted");
+    assert_eq!(status_calls.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        f.pdp.calls.load(Ordering::SeqCst),
+        1,
+        "only the issuer permit"
+    );
+    assert!(!body.contains("Lovelace"));
+    assert!(complete(&f, &state).await.is_err());
+}
+
+#[tokio::test]
+async fn malformed_status_structure_is_rejected_before_signer_evaluation() {
+    let mut f = fx();
+    let (status_cert, status_key) = self_signed_ec("status.example", "ES256");
+    let claims = json!({
+        "sub": "https://status.example/list.jwt", "iat": T0 - 10, "exp": T0 + 1_000,
+        "status_list": {"bits": 0, "lst": ""},
+    });
+    let token = sign_raw(
+        &status_key,
+        "statuslist+jwt",
+        &claims,
+        std::slice::from_ref(&status_cert),
+    );
+    let status = Arc::new(CountingStatusClient {
+        calls: AtomicUsize::new(0),
+        token: Some(token),
+    });
+    let status_calls = status.clone();
+    let (issuer_cert, issuer_key) = self_signed_ec("issuer.example", "ES256");
+    let mut spec = IssueSpec::new(json!({
+        "iss": "https://issuer.example", "vct": "urn:eudi:pid:1", "iat": T0 - 10,
+        "exp": T0 + 1_000_000, "given_name": "Ada", "family_name": "Lovelace",
+        "status": {"status_list": {"idx": 0, "uri": "https://status.example/list.jwt"}},
+    }));
+    spec.holder_pub = Some(public_of(&f.holder));
+    spec.x5c_der = vec![issuer_cert];
+    spec.conceal = vec![vec![Seg::Key("given_name")], vec![Seg::Key("family_name")]];
+    f.issued = issue(&issuer_key, &spec).unwrap();
+    f.b = f.b.with_status_list_client(status);
+
+    let (state, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    let (st, body) = post(&f, &id, &wallet(&f, &jar)).await;
+    assert_eq!(st, 400, "{body}");
+    let error: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(error["error"], "invalid_status_list");
+    assert_eq!(status_calls.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        f.pdp.calls.load(Ordering::SeqCst),
+        1,
+        "only the issuer permit"
+    );
+    assert!(!body.contains("Lovelace"));
+    assert!(complete(&f, &state).await.is_err());
+}
+
+#[tokio::test]
+async fn revoked_status_is_refused_after_the_signer_permit() {
+    let mut f = fx();
+    // RFC 1950: zlib-compressed single byte 0x01, independently produced.
+    let claims = json!({
+        "sub": "https://status.example/list.jwt", "iat": T0 - 10, "exp": T0 + 1_000,
+        "status_list": {"bits": 1, "lst": "eJxjBAAAAgAC"},
+    });
+    let (status_cert, status_key) = self_signed_ec("status.example", "ES256");
+    let token = sign_raw(
+        &status_key,
+        "statuslist+jwt",
+        &claims,
+        std::slice::from_ref(&status_cert),
+    );
+    let status = Arc::new(CountingStatusClient {
+        calls: AtomicUsize::new(0),
+        token: Some(token),
+    });
+    let status_calls = status.clone();
+    let (issuer_cert, issuer_key) = self_signed_ec("issuer.example", "ES256");
+    let mut spec = IssueSpec::new(json!({
+        "iss": "https://issuer.example", "vct": "urn:eudi:pid:1", "iat": T0 - 10,
+        "exp": T0 + 1_000_000, "given_name": "Ada", "family_name": "Lovelace",
+        "status": {"status_list": {"idx": 0, "uri": "https://status.example/list.jwt"}},
+    }));
+    spec.holder_pub = Some(public_of(&f.holder));
+    spec.x5c_der = vec![issuer_cert];
+    spec.conceal = vec![vec![Seg::Key("given_name")], vec![Seg::Key("family_name")]];
+    f.issued = issue(&issuer_key, &spec).unwrap();
+    f.b = f.b.with_status_list_client(status);
+
+    let (state, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    let (st, body) = post(&f, &id, &wallet(&f, &jar)).await;
+    assert_eq!(st, 403, "{body}");
+    let error: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(error["error"], "credential_revoked");
+    assert_eq!(status_calls.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        f.pdp.calls.load(Ordering::SeqCst),
+        2,
+        "issuer and signer permits"
+    );
+    assert!(!body.contains("Lovelace"));
+    assert!(complete(&f, &state).await.is_err());
 }
 
 #[tokio::test]
@@ -1180,4 +1329,27 @@ async fn status_list_rejects_non_public_addresses_before_dialing() {
             .is_err(),
         "the resolver must not dial a private address returned for localhost"
     );
+}
+
+#[cfg(feature = "http")]
+#[tokio::test]
+async fn local_conformance_client_dials_private_literal_addresses() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let uri = format!(
+        "https://127.0.0.1:{}/status.jwt",
+        listener.local_addr().unwrap().port()
+    );
+    let client = ReqwestStatusListClient::new_allow_invalid_certificates_for_testing(
+        std::time::Duration::from_secs(2),
+    )
+    .unwrap();
+    let request = tokio::spawn(async move { client.fetch(&uri).await });
+
+    let (socket, _) = tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept())
+        .await
+        .expect("the local-conformance client must reach its private fixture")
+        .unwrap();
+    drop(socket);
+    let error = request.await.unwrap().unwrap_err();
+    assert_ne!(error, "status_list_no_public_address");
 }
