@@ -960,6 +960,60 @@ async fn one_shot(raw: &'static str) -> (String, tokio::task::JoinHandle<String>
     (url, h)
 }
 
+/// Sends a response and then leaves the connection open, so a client that
+/// collects the whole body instead of enforcing the limit early will time out.
+#[cfg(feature = "http")]
+async fn stalled_response(raw: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/evaluation", listener.local_addr().unwrap());
+    let handle = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = vec![0u8; 8192];
+        let _ = socket.read(&mut request).await.unwrap();
+        socket.write_all(raw.as_bytes()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    });
+    (url, handle)
+}
+
+/// Local HTTPS response server for the status-list transport itself.
+#[cfg(feature = "http")]
+async fn https_response(raw: &'static str, stall: bool) -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_rustls::rustls::pki_types::PrivateKeyDer;
+
+    let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let config = tokio_rustls::rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.der().clone()],
+            PrivateKeyDer::Pkcs8(signing_key.serialize_der().into()),
+        )
+        .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "https://localhost:{}/status.jwt",
+        listener.local_addr().unwrap().port()
+    );
+    let handle = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = acceptor.accept(socket).await.unwrap();
+        let mut request = vec![0u8; 8192];
+        let _ = socket.read(&mut request).await.unwrap();
+        socket.write_all(raw.as_bytes()).await.unwrap();
+        if stall {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        } else {
+            let _ = socket.shutdown().await;
+        }
+    });
+    (url, handle)
+}
+
 #[cfg(feature = "http")]
 #[tokio::test]
 async fn http_pdp_status_body_redirect_and_bearer() {
@@ -1037,4 +1091,234 @@ async fn http_pdp_refuses_oversized_responses() {
         .await
         .unwrap_err();
     assert_eq!(e, "pdp response too large");
+}
+
+#[cfg(feature = "http")]
+#[tokio::test]
+async fn http_pdp_accepts_a_body_at_the_exact_limit() {
+    let mut body = json!({"decision": true}).to_string();
+    body.extend(std::iter::repeat_n(' ', (1 << 20) - body.len()));
+    let raw: &'static str = Box::leak(
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_boxed_str(),
+    );
+    let (url, _handle) = one_shot(raw).await;
+    let answer = HttpPdp::new(&url, None, std::time::Duration::from_secs(2))
+        .unwrap()
+        .evaluate(&json!({}))
+        .await
+        .unwrap();
+    assert_eq!(answer["decision"], true);
+}
+
+#[cfg(feature = "http")]
+#[tokio::test]
+async fn http_pdp_enforces_limits_before_end_of_body() {
+    let declared: &'static str = Box::leak(
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            (1 << 20) + 1
+        )
+        .into_boxed_str(),
+    );
+    let (url, _handle) = stalled_response(declared).await;
+    let error = HttpPdp::new(&url, None, std::time::Duration::from_millis(100))
+        .unwrap()
+        .evaluate(&json!({}))
+        .await
+        .unwrap_err();
+    assert_eq!(error, "pdp response too large");
+
+    let oversized_chunk = "x".repeat((1 << 20) + 1);
+    let streamed: &'static str = Box::leak(
+        format!(
+            "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n{:x}\r\n{}\r\n",
+            oversized_chunk.len(),
+            oversized_chunk
+        )
+        .into_boxed_str(),
+    );
+    let (url, _handle) = stalled_response(streamed).await;
+    let error = HttpPdp::new(&url, None, std::time::Duration::from_millis(100))
+        .unwrap()
+        .evaluate(&json!({}))
+        .await
+        .unwrap_err();
+    assert_eq!(error, "pdp response too large");
+}
+
+#[cfg(feature = "http")]
+#[tokio::test]
+async fn status_list_rejects_userinfo_before_dialing() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let client = ReqwestStatusListClient::new_allow_invalid_certificates_for_testing(
+        std::time::Duration::from_secs(2),
+    )
+    .unwrap();
+    for userinfo in ["user", "user:pass", ":pass"] {
+        let uri = format!("https://{userinfo}@127.0.0.1:{port}/status.jwt");
+        let error = client.fetch(&uri).await.unwrap_err();
+        assert_eq!(error, "status_list_uri_not_allowed", "{uri}");
+    }
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+            .await
+            .is_err(),
+        "credential-bearing status URLs must not reach the network"
+    );
+}
+
+#[cfg(feature = "http")]
+#[tokio::test]
+async fn status_list_enforces_body_limits_over_https() {
+    let exact = "x".repeat(64 * 1024);
+    let raw: &'static str = Box::leak(
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{exact}",
+            exact.len()
+        )
+        .into_boxed_str(),
+    );
+    let (url, _handle) = https_response(raw, false).await;
+    let body = ReqwestStatusListClient::new_allow_invalid_certificates_for_testing(
+        std::time::Duration::from_secs(2),
+    )
+    .unwrap()
+    .fetch(&url)
+    .await
+    .unwrap();
+    assert_eq!(body.len(), 64 * 1024);
+
+    let declared: &'static str = Box::leak(
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            (64 * 1024) + 1
+        )
+        .into_boxed_str(),
+    );
+    let (url, _handle) = https_response(declared, true).await;
+    let error = ReqwestStatusListClient::new_allow_invalid_certificates_for_testing(
+        std::time::Duration::from_secs(2),
+    )
+    .unwrap()
+    .fetch(&url)
+    .await
+    .unwrap_err();
+    assert_eq!(error, "status_list_response_too_large");
+
+    let oversized_chunk = "x".repeat((64 * 1024) + 1);
+    let streamed: &'static str = Box::leak(
+        format!(
+            "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n{:x}\r\n{}\r\n",
+            oversized_chunk.len(), oversized_chunk
+        )
+        .into_boxed_str(),
+    );
+    let (url, _handle) = https_response(streamed, true).await;
+    let error = ReqwestStatusListClient::new_allow_invalid_certificates_for_testing(
+        std::time::Duration::from_secs(2),
+    )
+    .unwrap()
+    .fetch(&url)
+    .await
+    .unwrap_err();
+    assert_eq!(error, "status_list_response_too_large");
+}
+
+#[cfg(feature = "http")]
+#[tokio::test]
+async fn status_list_rejects_non_public_addresses_before_dialing() {
+    let client = ReqwestStatusListClient::new(std::time::Duration::from_secs(2)).unwrap();
+    for uri in [
+        "https://127.0.0.1/status.jwt",
+        "https://10.0.0.1/status.jwt",
+        "https://172.16.0.1/status.jwt",
+        "https://192.168.0.1/status.jwt",
+        "https://169.254.0.1/status.jwt",
+        "https://100.64.0.1/status.jwt",
+        "https://192.0.2.1/status.jwt",
+        "https://192.88.99.1/status.jwt",
+        "https://224.0.0.1/status.jwt",
+        "https://[ff02::1]/status.jwt",
+        "https://[::ffff:224.0.0.1]/status.jwt",
+        "https://[::1]/status.jwt",
+        "https://[fc00::1]/status.jwt",
+        "https://[fe80::1]/status.jwt",
+        "https://[64:ff9b:1::1]/status.jwt",
+        "https://[64:ff9b::a00:1]/status.jwt",
+        "https://[64:ff9b::a9fe:a9fe]/status.jwt",
+        "https://[fec0::1]/status.jwt",
+        "https://[5f00::1]/status.jwt",
+        "https://[2001:db8::1]/status.jwt",
+        "https://[3fff::1]/status.jwt",
+        "https://[100:0:0:1::1]/status.jwt",
+        "https://[2002::1]/status.jwt",
+        "https://[::ffff:127.0.0.1]/status.jwt",
+        "https://[::ffff:10.0.0.1]/status.jwt",
+    ] {
+        let error = client.fetch(uri).await.unwrap_err();
+        assert_eq!(error, "status_list_no_public_address", "{uri}");
+    }
+
+    // IANA globally reachable exceptions are not rejected by the broad parent blocks.
+    let global_client = ReqwestStatusListClient::new(std::time::Duration::from_millis(1)).unwrap();
+    for uri in [
+        "https://192.0.0.9/status.jwt",
+        "https://192.0.0.10/status.jwt",
+        "https://[64:ff9b::808:808]/status.jwt",
+        "https://[2001:1::1]/status.jwt",
+        "https://[2001:1::3]/status.jwt",
+        "https://[2001:3::1]/status.jwt",
+        "https://[2001:4:112::1]/status.jwt",
+        "https://[2001:20::1]/status.jwt",
+        "https://[2001:30::1]/status.jwt",
+    ] {
+        let error = global_client.fetch(uri).await.unwrap_err();
+        assert_ne!(error, "status_list_no_public_address", "{uri}");
+    }
+
+    // A hostname is checked at resolution time, not merely by its spelling.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let uri = format!(
+        "https://localhost:{}/status.jwt",
+        listener.local_addr().unwrap().port()
+    );
+    let error = client.fetch(&uri).await.unwrap_err();
+    assert!(
+        error.contains("status_list_no_public_address"),
+        "unexpected resolution error: {error}"
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+            .await
+            .is_err(),
+        "the resolver must not dial a private address returned for localhost"
+    );
+}
+
+#[cfg(feature = "http")]
+#[tokio::test]
+async fn local_conformance_client_dials_private_literal_addresses() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let uri = format!(
+        "https://127.0.0.1:{}/status.jwt",
+        listener.local_addr().unwrap().port()
+    );
+    let client = ReqwestStatusListClient::new_allow_invalid_certificates_for_testing(
+        std::time::Duration::from_secs(2),
+    )
+    .unwrap();
+    let request = tokio::spawn(async move { client.fetch(&uri).await });
+
+    let (socket, _) = tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept())
+        .await
+        .expect("the local-conformance client must reach its private fixture")
+        .unwrap();
+    drop(socket);
+    let error = request.await.unwrap().unwrap_err();
+    assert_ne!(error, "status_list_no_public_address");
 }
