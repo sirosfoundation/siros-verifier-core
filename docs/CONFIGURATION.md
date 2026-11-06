@@ -58,7 +58,7 @@ collection = "presentation_flows"
 
 Flow claims, replay protection, OIDC token consumption, and result collection must share one database. Use a least-privilege user with `readWrite` only on `siros_verifier`. A standalone MongoDB is shared storage, not database-level HA; use a replica set or managed HA service when required. `memory` is for explicitly single-process tests only.
 
-The current hard limits are 2 MiB for an HTTP body and compact JWE, and 1 MiB for decrypted response plaintext. Genuine Longfellow and Vega responses fit these bounds.
+The current hard limits are 2 MiB for an HTTP body and compact JWE, and 1 MiB for decrypted response plaintext. Genuine Longfellow and Vega responses fit these bounds. The go-trust receipt cache holds at most 4096 receipts per verifier, evicting the oldest-inserted first; receipts that stop verifying are also evicted on their next lookup.
 
 SD-JWT `status.status_list` references are fetched over HTTPS with a 5-second timeout, no redirects or ambient proxies, a streaming 64 KiB token limit, and a 1 MiB decompressed-list limit. Userinfo is refused. Only public IP addresses are allowed: literal private addresses are refused before dialing and DNS results are filtered at connection time, including IPv4-mapped IPv6 addresses. The credential issuer must be permitted before any status-list fetch occurs. Tokens must be `statuslist+jwt` with a valid ES256 signature, integer `iat`/`exp` values when present, a valid time window, and a subject matching the reference. Subject, structure, decompression, and index checks run before go-trust evaluates the signer with the `status-list-signer` action. Fetch/parse failures, untrusted signers, and nonzero status values fail closed.
 

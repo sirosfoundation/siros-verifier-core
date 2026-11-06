@@ -5,7 +5,7 @@
 //! six rules from the design (pinned key, typ/iss/aud, request hash, time window, fail closed) and is
 //! re-run on every [`Cache`] hit, so the cache needs no integrity protection.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use p256::ecdsa::signature::{Signer, Verifier as _};
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
@@ -322,8 +322,18 @@ pub enum Lookup {
     Miss,
 }
 
+/// Receipts are attacker-influenceable in number (one per distinct trust
+/// request, and a wallet picks the issuers), so the cache needs a hard entry
+/// count on top of the per-receipt `MAX_JWS` size bound. Typical receipts are
+/// ~0.5-2 KiB, so 4096 entries is a few MiB.
+const DEFAULT_MAX_ENTRIES: usize = 4096;
+
 pub struct Cache {
     entries: HashMap<String, String>,
+    /// Insertion order of the keys in `entries`, oldest first, so the bound
+    /// evicts deterministically.
+    order: VecDeque<String>,
+    max_entries: usize,
     clock: Monotonic,
 }
 
@@ -331,12 +341,32 @@ impl Cache {
     pub fn new(skew: i64) -> Self {
         Self {
             entries: HashMap::new(),
+            order: VecDeque::new(),
+            max_entries: DEFAULT_MAX_ENTRIES,
             clock: Monotonic::new(skew),
         }
     }
 
+    /// Cap the cache at `max_entries` receipts, evicting the oldest-inserted
+    /// first. `0` disables caching entirely. The cap is enforced from the next
+    /// `put`; build the cache before filling it.
+    pub fn with_max_entries(mut self, max_entries: usize) -> Self {
+        self.max_entries = max_entries;
+        self
+    }
+
     pub fn put(&mut self, request: &Value, jws: String) -> Result<()> {
-        self.entries.insert(req_sha256(request)?, jws);
+        let k = req_sha256(request)?;
+        if !self.entries.contains_key(&k) {
+            self.order.push_back(k.clone());
+        }
+        self.entries.insert(k, jws);
+        while self.entries.len() > self.max_entries {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
         Ok(())
     }
 
@@ -351,9 +381,17 @@ impl Cache {
             Ok(r) if now >= r.refresh_after => Ok(Lookup::Stale(r)),
             Ok(r) => Ok(Lookup::Fresh(r)),
             Err(_) => {
-                self.entries.remove(&k);
+                self.remove_entry(&k);
                 Ok(Lookup::Miss)
             }
+        }
+    }
+
+    /// Remove a key and its place in the eviction order.
+    fn remove_entry(&mut self, k: &str) {
+        self.entries.remove(k);
+        if let Some(pos) = self.order.iter().position(|x| x == k) {
+            self.order.remove(pos);
         }
     }
 
