@@ -268,6 +268,77 @@ fn cache_fresh_stale_expired() {
     assert!(c.is_empty(), "expired entry evicted");
 }
 #[test]
+fn cache_is_bounded() {
+    let v = verifier();
+    let mut c = Cache::new(60).with_max_entries(4);
+    let mut requests = vec![];
+    for i in 0..10 {
+        let mut r = req();
+        r["subject"]["id"] = json!(format!("x5t#S256:abc{i}"));
+        let jws = issue(&key(1), &pol(), &r, &answer(), NOW).unwrap();
+        c.put(&r, jws).unwrap();
+        requests.push(r);
+    }
+    assert_eq!(c.len(), 4, "the cache is bounded by its capacity");
+    assert_eq!(
+        c.get(&v, &requests[0], NOW).unwrap(),
+        Lookup::Miss,
+        "the oldest entry was evicted"
+    );
+    assert!(
+        matches!(c.get(&v, &requests[9], NOW).unwrap(), Lookup::Fresh(_)),
+        "the newest entry is still usable"
+    );
+}
+#[test]
+fn cache_order_survives_get_eviction_and_re_put() {
+    let v = verifier();
+    let mut c = Cache::new(60).with_max_entries(3);
+    let named = |tag: &str| {
+        let mut r = req();
+        r["subject"]["id"] = json!(format!("x5t#S256:{tag}"));
+        r
+    };
+    let a = named("a");
+    let b = named("b");
+    let cc = named("c");
+    let d = named("d");
+    let e = named("e");
+    for r in [&a, &b, &cc] {
+        c.put(r, issue(&key(1), &pol(), r, &answer(), NOW).unwrap())
+            .unwrap();
+    }
+    // replace b with a receipt signed by an unpinned key: the failed verify
+    // evicts b from both the entries and the eviction order
+    c.put(&b, issue(&key(2), &pol(), &b, &answer(), NOW).unwrap())
+        .unwrap();
+    assert_eq!(c.get(&v, &b, NOW).unwrap(), Lookup::Miss);
+    assert_eq!(c.len(), 2);
+    // re-putting b replaces it without evicting and without leaving a stale
+    // order slot ahead of b's live position
+    c.put(&b, issue(&key(1), &pol(), &b, &answer(), NOW).unwrap())
+        .unwrap();
+    assert_eq!(c.len(), 3, "re-put at capacity replaces, it does not evict");
+    c.put(&d, issue(&key(1), &pol(), &d, &answer(), NOW).unwrap())
+        .unwrap();
+    c.put(&e, issue(&key(1), &pol(), &e, &answer(), NOW).unwrap())
+        .unwrap();
+    assert_eq!(c.len(), 3);
+    // a and c are the oldest live entries and are the eviction victims; the
+    // re-inserted b is newer than both and survives
+    assert_eq!(c.get(&v, &a, NOW).unwrap(), Lookup::Miss);
+    assert_eq!(c.get(&v, &cc, NOW).unwrap(), Lookup::Miss);
+    assert!(matches!(c.get(&v, &b, NOW).unwrap(), Lookup::Fresh(_)));
+}
+#[test]
+fn cache_capacity_zero_disables_caching() {
+    let v = verifier();
+    let mut c = Cache::new(60).with_max_entries(0);
+    c.put(&req(), issued()).unwrap();
+    assert!(c.is_empty());
+    assert_eq!(c.get(&v, &req(), NOW).unwrap(), Lookup::Miss);
+}
+#[test]
 fn cache_rejects_a_receipt_stored_under_the_wrong_request() {
     let v = verifier();
     let mut c = Cache::new(60);
