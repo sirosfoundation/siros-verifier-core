@@ -1038,48 +1038,46 @@ impl VpBackend {
         Ok(id.to_owned())
     }
 
-    fn map_attributes(
-        &self,
-        claims: &serde_json::Map<String, Value>,
-        issuer: String,
+    /// Append one verified credential's claims to the result. Each pointer is
+    /// resolved against this credential's own claims, and a matched value
+    /// becomes an additional value of the attribute. The subject is set by the
+    /// first credential that carries the subject pointer.
+    fn merge_attributes(
+        claims_root: &Value,
+        data: &mut InternalData,
         attribute_map: &BTreeMap<String, String>,
         subject_pointer: &str,
-    ) -> std::result::Result<InternalData, String> {
-        let root = Value::Object(claims.clone());
-        let scalar = |v: &Value| -> std::result::Result<Vec<String>, String> {
-            match v {
-                Value::String(s) => Ok(vec![s.clone()]),
-                Value::Bool(_) | Value::Number(_) => Ok(vec![v.to_string()]),
-                Value::Array(a) => a.iter().map(scalar_one).collect(),
-                _ => Err("attribute_not_scalar".into()),
-            }
-        };
-        fn scalar_one(v: &Value) -> std::result::Result<String, String> {
+    ) -> std::result::Result<(), String> {
+        let scalar_one = |v: &Value| -> std::result::Result<String, String> {
             match v {
                 Value::String(s) => Ok(s.clone()),
                 Value::Bool(_) | Value::Number(_) => Ok(v.to_string()),
                 _ => Err("attribute_not_scalar".into()),
             }
-        }
-        let mut data = InternalData {
-            auth_info: AuthenticationInformation {
-                auth_class_ref: self.cfg.auth_class_ref.clone(),
-                issuer: Some(issuer),
-                ..Default::default()
-            },
-            ..Default::default()
+        };
+        let scalar = |v: &Value| -> std::result::Result<Vec<String>, String> {
+            match v {
+                Value::String(s) => Ok(vec![s.clone()]),
+                Value::Bool(_) | Value::Number(_) => Ok(vec![v.to_string()]),
+                Value::Array(a) => a.iter().map(&scalar_one).collect(),
+                _ => Err("attribute_not_scalar".into()),
+            }
         };
         // Missing mapped claims are absent attributes, not errors; the DCQL query decides what is required.
         for (internal, ptr) in attribute_map {
-            if let Some(v) = root.pointer(ptr) {
-                data.attributes.insert(internal.clone(), scalar(v)?);
+            if let Some(v) = claims_root.pointer(ptr) {
+                data.attributes
+                    .entry(internal.clone())
+                    .or_default()
+                    .extend(scalar(v)?);
             }
         }
-        let subject = root
-            .pointer(subject_pointer)
-            .ok_or("subject_claim_missing")?;
-        data.subject_id = Some(scalar_one(subject)?);
-        Ok(data)
+        if data.subject_id.is_none() {
+            if let Some(v) = claims_root.pointer(subject_pointer) {
+                data.subject_id = Some(scalar_one(v)?);
+            }
+        }
+        Ok(())
     }
 
     async fn finish_response(
@@ -1249,7 +1247,27 @@ impl VpBackend {
             }
         };
         // Every presented credential's issuer must be trusted; a single denial fails the flow.
-        let mut result: Option<InternalData> = None;
+        if verified.is_empty() {
+            return self
+                .fail(
+                    &id,
+                    &claim_id,
+                    "no_presentation",
+                    Response::text(400, "no presentation"),
+                )
+                .await;
+        }
+        // One result carries every verified document: the first credential names the
+        // issuer, and each credential's mapped claims are appended in query order.
+        let mut data = InternalData {
+            auth_info: AuthenticationInformation {
+                auth_class_ref: self.cfg.auth_class_ref.clone(),
+                issuer: Some(verified[0].verified.issuer_id()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        data.requester = requester.clone();
         for p in &verified {
             let q = p
                 .verified
@@ -1286,53 +1304,43 @@ impl VpBackend {
                         .await;
                 }
             }
-            if result.is_none() {
-                let claims = match p.verified.claims() {
-                    Ok(claims) => claims,
-                    Err(_) => {
-                        return self
-                            .fail(
-                                &id,
-                                &claim_id,
-                                "claims_unavailable",
-                                Response::text(422, "cannot read claims"),
-                            )
-                            .await;
-                    }
-                };
-                match self.map_attributes(
-                    &claims,
-                    p.verified.issuer_id(),
-                    &attribute_map,
-                    &subject_pointer,
-                ) {
-                    Ok(mut d) => {
-                        d.requester = requester.clone();
-                        result = Some(d);
-                    }
-                    Err(code) => {
-                        return self
-                            .fail(
-                                &id,
-                                &claim_id,
-                                &code,
-                                Response::text(422, "cannot map attributes"),
-                            )
-                            .await;
-                    }
+            let claims = match p.verified.claims() {
+                Ok(claims) => claims,
+                Err(_) => {
+                    return self
+                        .fail(
+                            &id,
+                            &claim_id,
+                            "claims_unavailable",
+                            Response::text(422, "cannot read claims"),
+                        )
+                        .await;
                 }
+            };
+            let claims_root = Value::Object(claims);
+            if let Err(code) =
+                Self::merge_attributes(&claims_root, &mut data, &attribute_map, &subject_pointer)
+            {
+                return self
+                    .fail(
+                        &id,
+                        &claim_id,
+                        &code,
+                        Response::text(422, "cannot map attributes"),
+                    )
+                    .await;
             }
         }
-        let Some(data) = result else {
+        if data.subject_id.is_none() {
             return self
                 .fail(
                     &id,
                     &claim_id,
-                    "no_presentation",
-                    Response::text(400, "no presentation"),
+                    "subject_claim_missing",
+                    Response::text(422, "cannot map attributes"),
                 )
                 .await;
-        };
+        }
         let sealed_result = match self
             .sealer
             .seal_json(&data, format!("result:{id}").as_bytes())

@@ -207,6 +207,114 @@ fn fx() -> Fx {
     fx_with(100_000)
 }
 
+/// A backend that requests two SD-JWT credentials from different issuers: a PID
+/// (`urn:eudi:pid:1`) and a loyalty card (`urn:example:loyalty:1`) whose
+/// `membership_level` claim has the given value. Returns the backend fixture
+/// (holding the PID as `issued`) and the issued loyalty credential.
+fn fx_multi_at(loyalty_level: Value, subject_pointer: &str) -> (Fx, Issued) {
+    let (v_cert, v_key) = self_signed_ec("verifier.example", "ES256");
+    let (i_cert, i_key) = self_signed_ec("issuer.example", "ES256");
+    let (l_cert, l_key) = self_signed_ec("issuer2.example", "ES256");
+    let holder = ec_jwk("ES256", "holder");
+    let mut pid = IssueSpec::new(json!({
+        "iss": "https://issuer.example", "vct": "urn:eudi:pid:1", "iat": T0 - 10, "exp": T0 + 1_000_000,
+        "given_name": "Ada", "family_name": "Lovelace",
+    }));
+    pid.holder_pub = Some(public_of(&holder));
+    pid.x5c_der = vec![i_cert];
+    pid.conceal = vec![vec![Seg::Key("given_name")], vec![Seg::Key("family_name")]];
+    let issued_pid = issue(&i_key, &pid).unwrap();
+
+    let mut loyalty = IssueSpec::new(json!({
+        "iss": "https://issuer2.example", "vct": "urn:example:loyalty:1", "iat": T0 - 10, "exp": T0 + 1_000_000,
+        "membership_level": loyalty_level,
+    }));
+    loyalty.holder_pub = Some(public_of(&holder));
+    loyalty.x5c_der = vec![l_cert];
+    loyalty.conceal = vec![vec![Seg::Key("membership_level")]];
+    let issued_loyalty = issue(&l_key, &loyalty).unwrap();
+
+    let cfg: VpBackendConfig = serde_json::from_value(json!({
+        "dcql": {"credentials": [
+            {"id": "pid", "format": "dc+sd-jwt",
+             "meta": {"vct_values": ["urn:eudi:pid:1"]},
+             "claims": [{"path": ["family_name"]}]},
+            {"id": "loyalty", "format": "dc+sd-jwt",
+             "meta": {"vct_values": ["urn:example:loyalty:1"]},
+             "claims": [{"path": ["membership_level"]}]}
+        ]},
+        "attribute_map": {"sn": "/family_name", "tier": "/membership_level", "kind": "/vct"},
+        "subject_pointer": subject_pointer,
+        "role": "pid-provider",
+        "auth_class_ref": "urn:eudi:loa:high",
+    }))
+    .unwrap();
+    let pdp = Arc::new(MockPdp {
+        permit: AtomicBool::new(true),
+        down: AtomicBool::new(false),
+        calls: AtomicUsize::new(0),
+        next_update_in: 100_000,
+        go_trust_today: AtomicBool::new(false),
+    });
+    let gate = TrustGate::new(
+        pdp.clone(),
+        p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap(),
+        "k1",
+        "core-1",
+        "tenant-a",
+        "https://pdp.example",
+        3600,
+    );
+    let clock = Arc::new(AtomicI64::new(T0));
+    let c2 = clock.clone();
+    let b = VpBackend::new(
+        "vp",
+        "https://proxy.example/vp",
+        cfg,
+        gate,
+        siros_verifier_core::oid4vp::software_signer(&v_key).unwrap(),
+        vec![v_cert],
+        Arc::new(move || c2.load(Ordering::SeqCst)),
+    )
+    .unwrap();
+    (
+        Fx {
+            b,
+            pdp,
+            clock,
+            holder,
+            issued: issued_pid,
+        },
+        issued_loyalty,
+    )
+}
+
+fn fx_multi(loyalty_level: Value) -> (Fx, Issued) {
+    fx_multi_at(loyalty_level, "/family_name")
+}
+
+/// The wallet answers with both of the multi-credential fixture's documents.
+fn wallet_multi(f: &Fx, loyalty: &Issued, jar: &str) -> String {
+    wallet_respond(
+        jar,
+        &f.holder,
+        &[
+            WalletCredential {
+                id: "pid",
+                issued: &f.issued,
+                disclose: &[0, 1],
+            },
+            WalletCredential {
+                id: "loyalty",
+                issued: loyalty,
+                disclose: &[0],
+            },
+        ],
+        f.clock.load(Ordering::SeqCst),
+    )
+    .unwrap()
+}
+
 impl Fx {
     fn with_storage(self, store: Arc<dyn FlowStore>) -> Self {
         Self {
@@ -350,6 +458,62 @@ async fn happy_path_delivers_mapped_attributes_once() {
     );
     // second collection fails: one-time
     assert!(complete(&f, &state).await.is_err());
+}
+
+#[tokio::test]
+async fn every_verified_credential_s_claims_reach_the_result() {
+    let (f, loyalty) = fx_multi(json!("gold"));
+    let (state, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    let (st, body) = post(&f, &id, &wallet_multi(&f, &loyalty, &jar)).await;
+    assert_eq!(st, 200, "{body}");
+    let BackendAction::AuthResponse(d) = complete(&f, &state).await.unwrap() else {
+        panic!("expected auth response")
+    };
+    assert_eq!(d.requester.as_deref(), Some("https://rp.example"));
+    assert_eq!(d.subject_id.as_deref(), Some("Lovelace"));
+    assert_eq!(
+        d.auth_info.issuer.as_deref(),
+        Some("https://issuer.example")
+    );
+    assert_eq!(d.attr_first("sn"), Some("Lovelace"));
+    assert_eq!(
+        d.attr_first("tier"),
+        Some("gold"),
+        "the second credential's claims must reach the result"
+    );
+    assert_eq!(
+        d.attr_first("kind"),
+        Some("urn:eudi:pid:1"),
+        "a pointer both credentials carry accumulates in query order"
+    );
+}
+
+#[tokio::test]
+async fn the_subject_may_come_from_a_later_credential() {
+    // the first credential has no /membership_level; the second one does
+    let (f, loyalty) = fx_multi_at(json!("gold"), "/membership_level");
+    let (state, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    let (st, body) = post(&f, &id, &wallet_multi(&f, &loyalty, &jar)).await;
+    assert_eq!(st, 200, "{body}");
+    let BackendAction::AuthResponse(d) = complete(&f, &state).await.unwrap() else {
+        panic!("expected auth response")
+    };
+    assert_eq!(d.subject_id.as_deref(), Some("gold"));
+}
+
+#[tokio::test]
+async fn a_non_scalar_mapped_claim_in_any_credential_fails_the_flow() {
+    let (f, loyalty) = fx_multi(json!({"level": "gold"}));
+    let (state, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    let (st, _) = post(&f, &id, &wallet_multi(&f, &loyalty, &jar)).await;
+    assert_eq!(st, 422);
+    assert_eq!(
+        complete(&f, &state).await.err().unwrap(),
+        "authentication error: attribute_not_scalar"
+    );
 }
 
 #[tokio::test]
