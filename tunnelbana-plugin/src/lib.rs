@@ -1072,16 +1072,15 @@ impl VpBackend {
             .map_err(|_| ("status_list_unavailable".to_owned(), 503))?;
         let token = siros_verifier_core::status_list::verify_token(&token, &X5cLeaf, now)
             .map_err(|_| ("invalid_status_list".to_owned(), 400))?;
+        let status = siros_verifier_core::status_list::status_at(&token, reference)
+            .map_err(|_| ("invalid_status_list".to_owned(), 400))?;
         let query = TrustQuery::for_issuer(&token.issuer, "status-list-signer", "status-list");
         match self.gate.permits(&query.to_authzen(), now).await {
             Ok(true) => {}
             Ok(false) => return Err(("status_list_signer_not_trusted".into(), 403)),
             Err(_) => return Err(("trust_unavailable".into(), 503)),
         }
-        if siros_verifier_core::status_list::status_at(&token, reference)
-            .map_err(|_| ("invalid_status_list".to_owned(), 400))?
-            != 0
-        {
+        if status != 0 {
             return Err(("credential_revoked".into(), 403));
         }
         Ok(())
@@ -1184,13 +1183,6 @@ impl VpBackend {
         // Every presented credential's issuer must be trusted; a single denial fails the flow.
         let mut result: Option<InternalData> = None;
         for p in &verified {
-            if let oid4vp::VerifiedCredential::SdJwt(credential) = &p.verified {
-                if let Err((code, status)) = self.check_sd_jwt_status(credential, now).await {
-                    return self
-                        .fail(&id, &claim_id, &code, Response::text(status, &code))
-                        .await;
-                }
-            }
             let q = p
                 .verified
                 .trust_query(&self.cfg.role, &self.cfg.mdoc_role)
@@ -1216,6 +1208,13 @@ impl VpBackend {
                             "trust_unavailable",
                             Response::text(503, "trust evaluation unavailable"),
                         )
+                        .await;
+                }
+            }
+            if let oid4vp::VerifiedCredential::SdJwt(credential) = &p.verified {
+                if let Err((code, status)) = self.check_sd_jwt_status(credential, now).await {
+                    return self
+                        .fail(&id, &claim_id, &code, Response::text(status, &code))
                         .await;
                 }
             }

@@ -6,7 +6,7 @@ being removed. Usage: scripts/mutate.py  (run from the crate root)
 """
 import subprocess, sys, pathlib
 
-F = {"sd": "src/sdjwt.rs", "vp": "src/oid4vp.rs", "md": "src/mdoc.rs", "mr": "src/mdoc_request.rs", "ms": "src/mdoc_session.rs", "rc": "src/receipt.rs", "tb": "tunnelbana-plugin/src/lib.rs", "tf": "tunnelbana-plugin/src/flow.rs", "js": "src/json_strict.rs", "ss": "src/session_seal.rs", "fi": "ffi/src/lib.rs"}
+F = {"sd": "src/sdjwt.rs", "vp": "src/oid4vp.rs", "md": "src/mdoc.rs", "mr": "src/mdoc_request.rs", "ms": "src/mdoc_session.rs", "rc": "src/receipt.rs", "tb": "tunnelbana-plugin/src/lib.rs", "tf": "tunnelbana-plugin/src/flow.rs", "js": "src/json_strict.rs", "ss": "src/session_seal.rs", "fi": "ffi/src/lib.rs", "sl": "src/status_list.rs"}
 M = [
  ("sd", 'if kbc.get("sd_hash").and_then(Value::as_str) != Some(expected.as_str()) {', 'if false {', "KB sd_hash"),
  ("sd", 'if w.used.len() != count {', 'if false {', "unreferenced disclosure"),
@@ -119,6 +119,9 @@ M = [
  ("tf", 'matches!(self.outcome, Outcome::Pending) && now >= self.expires_at', 'false', "plugin pending expiry"),
  ("tb", "if id.len() < 16\n            || id.len() > 64\n            || !id\n                .bytes()\n                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')\n        {", 'if false {', "plugin flow id validation"),
  ("tb", 'if ctx.request.method != "POST" {', 'if false {', "plugin POST only"),
+ ("sl", 'if claims_object.get(name).is_some_and(|value| !value.is_i64()) {', 'if false {', "status time types"),
+ ("tb", 'if status != 0 {', 'if false {', "status revoked enforcement"),
+ ("tb", 'if let oid4vp::VerifiedCredential::SdJwt(credential) = &p.verified {', 'if let Some(credential) = None::<&Box<CryptoVerified>> {', "status issuer ordering"),
  ("tb", 'if !matches!(ctx.request.method.as_str(), "GET" | "POST") {', 'if false {', "request method allowed"),
  ("tb", 'if pair_count != 1 || nonce.is_none() {', 'if false {', "request wallet nonce validation"),
  ("tb", 'if cfg.request_ttl_secs <= 0 || cfg.request_ttl_secs > 900 {', 'if false {', "plugin ttl bounds"),
