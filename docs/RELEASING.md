@@ -26,3 +26,5 @@ The workflow does not create or upload `.crate` packages. GitHub's immutable sou
 For the initial full release the tag is `v0.1.0`; do not create it locally as part of feature development or create that full-release tag until every release track is ready.
 
 After the workflow succeeds, verify the GHCR digest, native artifacts, release checksums and attestations, SBOM artifacts, and vulnerability results. Deploy the image by digest and repeat the live Longfellow and Vega smoke tests before updating production provenance.
+
+Immediately after every testing or production release, add its publication and verification details to [`CHANGELOG.md`](../CHANGELOG.md), including source/artifact identities, deployment and rollback evidence, known limitations, and the corresponding documentation updates.

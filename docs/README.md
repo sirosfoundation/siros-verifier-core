@@ -9,6 +9,7 @@ This directory is for users and integrators.
 - [Configuration reference](CONFIGURATION.md): complete service configuration, trust, storage, retrieval, ZK, and circuit settings.
 - [Examples index](../examples/README.md): explained TOML configurations for common setups and native-reader snippets.
 - [Release guide](RELEASING.md): versioned Docker images, native artifacts, SBOM, provenance, and post-release verification.
+- [Release record](../CHANGELOG.md): published testing and production releases, validation evidence, deployment notes, and rollback history.
 
 Additional integration-specific guides:
 
