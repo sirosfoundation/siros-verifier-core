@@ -87,6 +87,7 @@ impl MongoFlowStore {
         &self,
         filter: Document,
         outcome: Outcome,
+        lease_until: i64,
         return_document: ReturnDocument,
     ) -> StoreResult<Option<Flow>> {
         let clear_secrets = !matches!(&outcome, Outcome::Processing(_));
@@ -101,7 +102,9 @@ impl MongoFlowStore {
                 }
             }
         } else {
-            doc! { "$set": { "outcome": outcome } }
+            // Only in-flight claims carry a processing lease deadline; the
+            // terminal transitions below never read it.
+            doc! { "$set": { "outcome": outcome, "lease_until": lease_until } }
         };
         bounded(
             "MongoDB flow transition failed",
@@ -130,30 +133,46 @@ impl FlowStore for MongoFlowStore {
         self.load(id, now).await
     }
 
-    async fn claim(&self, id: &str, now: i64, claim_id: &str) -> StoreResult<ClaimResult> {
+    async fn claim(
+        &self,
+        id: &str,
+        now: i64,
+        claim_id: &str,
+        lease_secs: i64,
+    ) -> StoreResult<ClaimResult> {
         let Some(current) = self.load(id, now).await? else {
             return Ok(ClaimResult::Unknown);
         };
         if current.expired(now) {
             return Ok(ClaimResult::Expired);
         }
-        if !matches!(current.outcome, Outcome::Pending) {
-            return Ok(ClaimResult::Replay);
+        match &current.outcome {
+            Outcome::Pending => {}
+            // An expired lease frees the slot for a retrying wallet while the
+            // request is still live, so a runner that died mid-processing
+            // cannot strand the flow. Past request expiry no re-drive could
+            // succeed, and the original holder may still finish and deliver.
+            Outcome::Processing(_) if current.lease_until <= now && now < current.expires_at => {}
+            _ => return Ok(ClaimResult::Replay),
         }
         let claimed = self
             .transition(
                 doc! {
                     "_id": id,
                     "retain_until": { "$gt": now },
-                    "expires_at": { "$gt": now },
-                    "outcome.state": "pending",
+                    "$or": [
+                        { "outcome.state": "pending", "expires_at": { "$gt": now } },
+                        { "outcome.state": "processing", "expires_at": { "$gt": now }, "lease_until": { "$lte": now } },
+                        { "outcome.state": "processing", "expires_at": { "$gt": now }, "lease_until": { "$exists": false } },
+                    ],
                 },
                 Outcome::Processing(claim_id.to_owned()),
+                now.saturating_add(lease_secs),
                 ReturnDocument::After,
             )
             .await?;
         if let Some(flow) = claimed {
-            return Ok(ClaimResult::Claimed(flow));
+            return Ok(ClaimResult::Claimed(Box::new(flow)));
         }
         // A competing replica won or the request crossed its expiry boundary.
         Ok(match self.load(id, now).await? {
@@ -179,6 +198,7 @@ impl FlowStore for MongoFlowStore {
                     "outcome.value": claim_id,
                 },
                 outcome.into(),
+                0,
                 ReturnDocument::Before,
             )
             .await?
@@ -203,6 +223,7 @@ impl FlowStore for MongoFlowStore {
                     ],
                 },
                 Outcome::Collected,
+                0,
                 ReturnDocument::Before,
             )
             .await?;
@@ -406,6 +427,7 @@ mod tests {
             sealed_session: "v1.sealed-private-key".into(),
             expires_at: now + 300,
             retain_until: now + 1200,
+            lease_until: 0,
             requester: None,
             attribute_map: BTreeMap::new(),
             subject_pointer: "/sub".into(),
@@ -422,6 +444,7 @@ mod tests {
             sealed_session: "v1.sealed-private-key".into(),
             expires_at: 1_800_000_300,
             retain_until: 1_800_001_200,
+            lease_until: 0,
             requester: Some("https://rp.example".into()),
             attribute_map: BTreeMap::new(),
             subject_pointer: "/sub".into(),
@@ -631,8 +654,8 @@ mod tests {
             .await
             .unwrap();
         let (a, b) = tokio::join!(
-            store.claim("flow-1", now, "claim-a"),
-            store.claim("flow-1", now, "claim-b")
+            store.claim("flow-1", now, "claim-a", 60),
+            store.claim("flow-1", now, "claim-b", 60)
         );
         let (claimed, winning_claim) = match (a.unwrap(), b.unwrap()) {
             (ClaimResult::Claimed(flow), ClaimResult::Replay) => (flow, "claim-a"),
@@ -668,7 +691,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             store
-                .claim("flow-2", now, "claim-before-expiry")
+                .claim("flow-2", now, "claim-before-expiry", 60)
                 .await
                 .unwrap(),
             ClaimResult::Claimed(_)
@@ -704,7 +727,10 @@ mod tests {
             CollectResult::Expired
         );
         assert_eq!(
-            store.claim("flow-3", now + 300, "too-late").await.unwrap(),
+            store
+                .claim("flow-3", now + 300, "too-late", 60)
+                .await
+                .unwrap(),
             ClaimResult::Replay
         );
 
@@ -724,6 +750,167 @@ mod tests {
                     .and_then(|options| options.expire_after)
                     == Some(Duration::ZERO)
         }));
+        client.database(&database).drop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn real_mongo_lease_recovery_mirrors_the_memory_contract() {
+        let Ok(uri) = std::env::var("SIROS_VERIFIER_TEST_MONGODB_URI") else {
+            return;
+        };
+        let database = format!("siros_verifier_lease_test_{}", std::process::id());
+        let store = MongoFlowStore::connect(&uri, &database, "flows")
+            .await
+            .unwrap();
+        let now = 1_800_000_000;
+        store
+            .insert(pending_flow("flow-1", now), now)
+            .await
+            .unwrap();
+        // A runner claimed the slot and died; its short lease expires.
+        assert!(matches!(
+            store.claim("flow-1", now, "dead-claim", 10).await.unwrap(),
+            ClaimResult::Claimed(_)
+        ));
+        assert_eq!(
+            store
+                .claim("flow-1", now + 9, "early-retry", 60)
+                .await
+                .unwrap(),
+            ClaimResult::Replay,
+            "a live lease is not stealable"
+        );
+        assert!(
+            matches!(
+                store
+                    .claim("flow-1", now + 10, "retry-claim", 60)
+                    .await
+                    .unwrap(),
+                ClaimResult::Claimed(_)
+            ),
+            "an expired lease is re-claimed by the wallet's retry"
+        );
+        assert_eq!(
+            store
+                .finish(
+                    "flow-1",
+                    now + 11,
+                    "dead-claim",
+                    TerminalOutcome::Done("late-result".into())
+                )
+                .await
+                .unwrap(),
+            FinishResult::Conflict,
+            "the dead claim can no longer finish after the re-claim"
+        );
+        assert_eq!(
+            store
+                .finish(
+                    "flow-1",
+                    now + 11,
+                    "retry-claim",
+                    TerminalOutcome::Done("v1.sealed-result".into())
+                )
+                .await
+                .unwrap(),
+            FinishResult::Finished
+        );
+        assert_eq!(
+            store.collect("flow-1", now + 12).await.unwrap(),
+            CollectResult::Done("v1.sealed-result".into())
+        );
+        assert_eq!(
+            store.collect("flow-1", now + 12).await.unwrap(),
+            CollectResult::Unknown,
+            "recovered processing still delivers exactly once"
+        );
+
+        // The recovery window closes at request expiry: a retry is a replay
+        // there, and the slow original holder may still finish and deliver.
+        store
+            .insert(pending_flow("flow-window", now), now)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .claim("flow-window", now, "dead-claim", 10)
+                .await
+                .unwrap(),
+            ClaimResult::Claimed(_)
+        ));
+        assert!(
+            matches!(
+                store
+                    .claim("flow-window", now + 299, "retry", 60)
+                    .await
+                    .unwrap(),
+                ClaimResult::Claimed(_)
+            ),
+            "a dead lease is re-claimed up to the request-expiry boundary"
+        );
+        store
+            .insert(pending_flow("flow-late", now), now)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.claim("flow-late", now, "claim-a", 10).await.unwrap(),
+            ClaimResult::Claimed(_)
+        ));
+        assert_eq!(
+            store
+                .claim("flow-late", now + 300, "retry", 60)
+                .await
+                .unwrap(),
+            ClaimResult::Replay,
+            "no re-drive can succeed once the request expired"
+        );
+        assert_eq!(
+            store
+                .finish(
+                    "flow-late",
+                    now + 300,
+                    "claim-a",
+                    TerminalOutcome::Done("late-result".into())
+                )
+                .await
+                .unwrap(),
+            FinishResult::Finished,
+            "the original holder may still complete an in-flight response"
+        );
+        assert_eq!(
+            store.collect("flow-late", now + 301).await.unwrap(),
+            CollectResult::Done("late-result".into())
+        );
+        assert_eq!(
+            store.collect("flow-late", now + 301).await.unwrap(),
+            CollectResult::Unknown
+        );
+
+        // Pre-lease records (no `lease_until` field) are recoverable too.
+        store
+            .insert(pending_flow("flow-legacy", now), now)
+            .await
+            .unwrap();
+        let client = Client::with_uri_str(&uri).await.unwrap();
+        client
+            .database(&database)
+            .collection::<Document>("flows")
+            .update_one(
+                doc! { "_id": "flow-legacy" },
+                doc! { "$set": { "outcome": { "state": "processing", "value": "old" } }, "$unset": { "lease_until": "" } },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                store
+                    .claim("flow-legacy", now + 1, "retry", 60)
+                    .await
+                    .unwrap(),
+                ClaimResult::Claimed(_)
+            ),
+            "a record written before the lease field exists is re-claimable"
+        );
         client.database(&database).drop().await.unwrap();
     }
 }

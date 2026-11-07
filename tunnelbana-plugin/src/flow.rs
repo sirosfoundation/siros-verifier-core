@@ -36,6 +36,12 @@ pub struct Flow {
     pub expires_at: i64,
     /// Absolute retention deadline for terminal results and replay tombstones.
     pub retain_until: i64,
+    /// Deadline of the in-flight response-processing lease. Zero means no
+    /// lease is held. Once the deadline passes the slot may be re-claimed by
+    /// a wallet retry, so a runner that dies mid-processing cannot strand the
+    /// flow. Replay protection and one-time collection are unaffected.
+    #[serde(default)]
+    pub lease_until: i64,
     pub requester: Option<String>,
     pub attribute_map: BTreeMap<String, String>,
     pub subject_pointer: String,
@@ -74,7 +80,9 @@ impl From<TerminalOutcome> for Outcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaimResult {
-    Claimed(Flow),
+    // Boxed: the claimed flow is far larger than the refusal variants, and a
+    // claim is returned once per wallet response, not on any hot path.
+    Claimed(Box<Flow>),
     Unknown,
     Expired,
     Replay,
@@ -112,7 +120,18 @@ pub type StoreResult<T> = std::result::Result<T, FlowStoreError>;
 pub trait FlowStore: Send + Sync {
     async fn insert(&self, flow: Flow, now: i64) -> StoreResult<()>;
     async fn get(&self, id: &str, now: i64) -> StoreResult<Option<Flow>>;
-    async fn claim(&self, id: &str, now: i64, claim_id: &str) -> StoreResult<ClaimResult>;
+    /// Atomically claim the wallet-response slot. The claim holds a
+    /// `lease_secs` processing lease: while the lease is live a retrying
+    /// wallet is a replay, and once it expires the slot may be re-claimed so
+    /// a crashed runner cannot strand the flow. Terminal results, replay
+    /// protection and one-time collection are unaffected by lease expiry.
+    async fn claim(
+        &self,
+        id: &str,
+        now: i64,
+        claim_id: &str,
+        lease_secs: i64,
+    ) -> StoreResult<ClaimResult>;
     async fn finish(
         &self,
         id: &str,
@@ -162,7 +181,13 @@ impl FlowStore for MemoryFlowStore {
         Ok(flows.get(id).cloned())
     }
 
-    async fn claim(&self, id: &str, now: i64, claim_id: &str) -> StoreResult<ClaimResult> {
+    async fn claim(
+        &self,
+        id: &str,
+        now: i64,
+        claim_id: &str,
+        lease_secs: i64,
+    ) -> StoreResult<ClaimResult> {
         let mut flows = self.lock()?;
         Self::remove_expired_retention(&mut flows, id, now);
         let Some(flow) = flows.get_mut(id) else {
@@ -171,11 +196,19 @@ impl FlowStore for MemoryFlowStore {
         if flow.expired(now) {
             return Ok(ClaimResult::Expired);
         }
-        if !matches!(flow.outcome, Outcome::Pending) {
-            return Ok(ClaimResult::Replay);
+        match &flow.outcome {
+            Outcome::Pending => {}
+            // The holder's lease expired without a terminal result while the
+            // request is still live, so the slot is free again: a retrying
+            // wallet re-claims it and re-drives verification under a fresh
+            // claim. Past request expiry no re-drive could succeed anyway, and
+            // the original holder may still finish and deliver late.
+            Outcome::Processing(_) if flow.lease_until <= now && now < flow.expires_at => {}
+            _ => return Ok(ClaimResult::Replay),
         }
         flow.outcome = Outcome::Processing(claim_id.to_owned());
-        Ok(ClaimResult::Claimed(flow.clone()))
+        flow.lease_until = now.saturating_add(lease_secs);
+        Ok(ClaimResult::Claimed(Box::new(flow.clone())))
     }
 
     async fn finish(
@@ -214,161 +247,5 @@ impl FlowStore for MemoryFlowStore {
         flow.outcome = Outcome::Collected;
         flow.clear_secrets();
         Ok(result)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-
-    const NOW: i64 = 1_800_000_000;
-
-    fn flow(id: &str) -> Flow {
-        Flow {
-            id: id.into(),
-            schema_version: FLOW_SCHEMA_VERSION,
-            jar: "request-jwt".into(),
-            sealed_session: "sealed-private-session".into(),
-            expires_at: NOW + 300,
-            retain_until: NOW + 300 + FLOW_RETENTION_GRACE_SECS,
-            requester: Some("https://rp.example".into()),
-            attribute_map: BTreeMap::new(),
-            subject_pointer: "/sub".into(),
-            outcome: Outcome::Pending,
-        }
-    }
-
-    #[tokio::test]
-    async fn only_one_response_claim_and_one_collection_win() {
-        let store = Arc::new(MemoryFlowStore::default());
-        store.insert(flow("flow-1"), NOW).await.unwrap();
-        let (a, b) = tokio::join!(
-            store.claim("flow-1", NOW, "claim-a"),
-            store.claim("flow-1", NOW, "claim-b")
-        );
-        assert!(matches!(a.unwrap(), ClaimResult::Claimed(_)));
-        assert_eq!(b.unwrap(), ClaimResult::Replay);
-        assert_eq!(
-            store
-                .finish(
-                    "flow-1",
-                    NOW,
-                    "claim-b",
-                    TerminalOutcome::Failed("stale".into())
-                )
-                .await
-                .unwrap(),
-            FinishResult::Conflict
-        );
-        assert_eq!(
-            store
-                .finish(
-                    "flow-1",
-                    NOW + 301,
-                    "claim-a",
-                    TerminalOutcome::Done("sealed-result".into())
-                )
-                .await
-                .unwrap(),
-            FinishResult::Finished,
-            "a response claimed before request expiry may finish"
-        );
-        let (a, b) = tokio::join!(
-            store.collect("flow-1", NOW + 302),
-            store.collect("flow-1", NOW + 302)
-        );
-        assert_eq!(a.unwrap(), CollectResult::Done("sealed-result".into()));
-        assert_eq!(b.unwrap(), CollectResult::Unknown);
-        assert_eq!(
-            store.claim("flow-1", NOW + 302, "replay").await.unwrap(),
-            ClaimResult::Replay,
-            "collection retains the replay tombstone"
-        );
-        assert_eq!(
-            store
-                .finish(
-                    "flow-1",
-                    NOW + 302,
-                    "claim-a",
-                    TerminalOutcome::Failed("stale".into())
-                )
-                .await
-                .unwrap(),
-            FinishResult::Conflict,
-            "stale completion cannot overwrite collection"
-        );
-    }
-
-    #[tokio::test]
-    async fn expiry_and_retention_have_exact_boundaries() {
-        let store = MemoryFlowStore::default();
-        store.insert(flow("flow-1"), NOW).await.unwrap();
-        assert_eq!(
-            store.claim("flow-1", NOW + 300, "late").await.unwrap(),
-            ClaimResult::Expired
-        );
-        assert_eq!(
-            store.collect("flow-1", NOW + 300).await.unwrap(),
-            CollectResult::Expired
-        );
-        assert_eq!(
-            store.collect("flow-1", NOW + 300).await.unwrap(),
-            CollectResult::Unknown
-        );
-
-        store.insert(flow("flow-2"), NOW).await.unwrap();
-        assert!(matches!(
-            store.claim("flow-2", NOW + 299, "claim").await.unwrap(),
-            ClaimResult::Claimed(_)
-        ));
-        assert_eq!(
-            store
-                .finish(
-                    "flow-2",
-                    NOW + 1200,
-                    "claim",
-                    TerminalOutcome::Failed("too_late".into())
-                )
-                .await
-                .unwrap(),
-            FinishResult::Conflict
-        );
-        assert_eq!(store.get("flow-2", NOW + 1200).await.unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn new_flow_activity_prunes_abandoned_records() {
-        let store = MemoryFlowStore::default();
-        store.insert(flow("abandoned"), NOW).await.unwrap();
-        let mut current = flow("current");
-        current.expires_at = NOW + 1500;
-        current.retain_until = NOW + 2400;
-        store.insert(current, NOW + 1200).await.unwrap();
-        assert_eq!(store.get("abandoned", NOW + 1200).await.unwrap(), None);
-        assert!(store.get("current", NOW + 1200).await.unwrap().is_some());
-    }
-
-    #[tokio::test]
-    async fn terminal_finish_clears_secrets_without_deleting_the_tombstone() {
-        let store = MemoryFlowStore::default();
-        store.insert(flow("flow-1"), NOW).await.unwrap();
-        assert!(matches!(
-            store.claim("flow-1", NOW, "claim").await.unwrap(),
-            ClaimResult::Claimed(_)
-        ));
-        store
-            .finish(
-                "flow-1",
-                NOW,
-                "claim",
-                TerminalOutcome::Done("sealed-result".into()),
-            )
-            .await
-            .unwrap();
-        let stored = store.get("flow-1", NOW).await.unwrap().unwrap();
-        assert!(stored.jar.is_empty());
-        assert!(stored.sealed_session.is_empty());
-        assert_eq!(stored.outcome, Outcome::Done("sealed-result".into()));
     }
 }

@@ -237,6 +237,12 @@ pub struct VpBackendConfig {
     /// Reported as `auth_class_ref`.
     #[serde(default)]
     pub auth_class_ref: Option<String>,
+    /// Seconds a runner holds the wallet-response processing lease. When the
+    /// lease expires without a terminal result (for example after a runner
+    /// crash), a retrying wallet re-claims the slot and re-drives
+    /// verification. Replay protection and one-time collection are unchanged.
+    #[serde(default = "default_processing_lease")]
+    pub processing_lease_secs: i64,
 }
 
 fn default_mdoc_role() -> String {
@@ -249,6 +255,10 @@ fn default_request_uri_method() -> String {
 
 fn default_ttl() -> i64 {
     300
+}
+
+fn default_processing_lease() -> i64 {
+    60
 }
 
 /// Configuration of a `zkp_req` (nym_auth) backend.
@@ -897,6 +907,11 @@ impl VpBackend {
         if cfg.request_ttl_secs <= 0 || cfg.request_ttl_secs > 900 {
             return Err(Error::Config("request_ttl_secs must be 1..=900".into()));
         }
+        if cfg.processing_lease_secs <= 0 || cfg.processing_lease_secs > 900 {
+            return Err(Error::Config(
+                "processing_lease_secs must be 1..=900".into(),
+            ));
+        }
         if !matches!(cfg.request_uri_method.as_str(), "get" | "post") {
             return Err(Error::Config(
                 "request_uri_method must be get or post".into(),
@@ -952,6 +967,7 @@ impl VpBackend {
             request_ttl_secs: mode.cfg.request_ttl_secs,
             request_uri_method: default_request_uri_method(),
             auth_class_ref: mode.cfg.auth_class_ref.clone(),
+            processing_lease_secs: default_processing_lease(),
         };
         let mut backend =
             Self::new_inner(name, module_base, cfg, gate, signer, chain_der, clock, true)?;
@@ -1159,8 +1175,12 @@ impl VpBackend {
         }
         let now = (self.clock)();
         let claim_id = new_flow_id();
-        let flow = match self.store.claim(&id, now, &claim_id).await {
-            Ok(ClaimResult::Claimed(flow)) => flow,
+        let flow = match self
+            .store
+            .claim(&id, now, &claim_id, self.cfg.processing_lease_secs)
+            .await
+        {
+            Ok(ClaimResult::Claimed(flow)) => *flow,
             Ok(ClaimResult::Unknown) => return Ok(Response::text(404, "unknown flow")),
             Ok(ClaimResult::Expired) => return Ok(Response::text(400, "expired flow")),
             Ok(ClaimResult::Replay) => {
@@ -1835,6 +1855,7 @@ impl Backend for VpBackend {
             sealed_session,
             expires_at,
             retain_until: expires_at.saturating_add(FLOW_RETENTION_GRACE_SECS),
+            lease_until: 0,
             requester: request.requester.clone(),
             attribute_map,
             subject_pointer,
