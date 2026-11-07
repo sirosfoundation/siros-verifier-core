@@ -271,6 +271,39 @@ fn default_processing_deadline() -> i64 {
     45
 }
 
+/// The terminal decision for one claimed wallet response: the outcome to
+/// persist plus the wallet-facing response. Built by the cancellable
+/// verification phase and finalized by the caller in a single bounded write,
+/// so a cancelled verification can never replace or duplicate a terminal
+/// outcome.
+struct Decision {
+    outcome: TerminalOutcome,
+    response: Response,
+}
+
+impl Decision {
+    fn failed(code: &str, response: Response) -> Result<Self> {
+        let status = response.status;
+        let description = String::from_utf8_lossy(&response.body).into_owned();
+        let mut response = Response::json(&serde_json::json!({
+            "error": code,
+            "error_description": description,
+        }))?;
+        response.status = status;
+        Ok(Self {
+            outcome: TerminalOutcome::Failed(code.to_owned()),
+            response,
+        })
+    }
+
+    fn done(result: String) -> Result<Self> {
+        Ok(Self {
+            outcome: TerminalOutcome::Done(result),
+            response: Response::json(&serde_json::json!({}))?,
+        })
+    }
+}
+
 /// Configuration of a `zkp_req` (nym_auth) backend.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1135,27 +1168,19 @@ impl VpBackend {
         }
     }
 
-    async fn fail(
-        &self,
-        id: &str,
-        claim_id: &str,
-        code: &str,
-        response: Response,
-    ) -> Result<Response> {
-        let status = response.status;
-        let description = String::from_utf8_lossy(&response.body).into_owned();
-        let mut response = Response::json(&serde_json::json!({
-            "error": code,
-            "error_description": description,
-        }))?;
-        response.status = status;
-        self.finish_response(
-            id,
-            claim_id,
-            TerminalOutcome::Failed(code.to_owned()),
-            response,
-        )
-        .await
+    /// Seconds reserved at the end of a lease for persisting the terminal
+    /// outcome of its claim.
+    const FINALIZE_RESERVE_SECS: i64 = 1;
+
+    /// The monotonic processing budget: the configured deadline, never taking
+    /// more of the lease than leaves room to persist the terminal outcome
+    /// while the claim is still held.
+    fn processing_budget(deadline_secs: i64, lease_until: i64, now: i64) -> std::time::Duration {
+        let remaining = lease_until.saturating_sub(now);
+        let secs = deadline_secs
+            .min(remaining.saturating_sub(Self::FINALIZE_RESERVE_SECS))
+            .max(1);
+        std::time::Duration::from_secs(secs as u64)
     }
 
     async fn check_sd_jwt_status(
@@ -1209,41 +1234,53 @@ impl VpBackend {
             }
             Err(_) => return Ok(Response::text(503, "flow store unavailable")),
         };
-        // The processing deadline is strictly shorter than the lease, so the
-        // deadline failure below is persisted while this claim still holds
-        // the flow; a stalled PDP or status endpoint cannot hang a
-        // presentation past its budget.
-        let deadline = std::time::Duration::from_secs(self.cfg.processing_deadline_secs as u64);
-        match tokio::time::timeout(
-            deadline,
-            self.process_claim(ctx, id.clone(), claim_id.clone(), now, flow),
-        )
-        .await
-        {
-            Ok(response) => response,
-            Err(_) => {
-                self.fail(
-                    &id,
-                    &claim_id,
+        // The budget never takes more of the lease than leaves room to
+        // persist the terminal outcome while this claim is still held; a
+        // stalled PDP or status endpoint cannot hang a presentation.
+        let lease_until = flow.lease_until;
+        let deadline = Self::processing_budget(
+            self.cfg.processing_deadline_secs,
+            lease_until,
+            (self.clock)(),
+        );
+        let decision =
+            match tokio::time::timeout(deadline, self.process_claim(ctx, id.clone(), now, flow))
+                .await
+            {
+                Ok(decision) => decision?,
+                Err(_) => Decision::failed(
                     "processing_deadline",
                     Response::text(504, "processing deadline exceeded"),
-                )
-                .await
-            }
-        }
+                )?,
+            };
+        // A synchronous verification overrun can produce a decision after
+        // the claim's safe window has closed; it is never persisted, so the
+        // lease deadline failure below is the only terminal write.
+        let decision = if (self.clock)() + Self::FINALIZE_RESERVE_SECS >= lease_until {
+            Decision::failed(
+                "processing_deadline",
+                Response::text(504, "processing deadline exceeded"),
+            )?
+        } else {
+            decision
+        };
+        // Single bounded terminal write, outside the cancellable verification
+        // phase: a cancelled verification can never replace or duplicate a
+        // committed terminal outcome.
+        self.finish_response(&id, &claim_id, decision.outcome, decision.response)
+            .await
     }
 
-    /// Verify one claimed wallet response and persist its result. The caller
-    /// bounds the whole step with the processing deadline; the lease guards
-    /// the store claim itself.
+    /// Decide the terminal outcome for one claimed wallet response without
+    /// touching the store. The caller bounds the whole step with the
+    /// processing budget and performs the single terminal write.
     async fn process_claim(
         &self,
         ctx: &mut Context,
         id: String,
-        claim_id: String,
         now: i64,
         flow: Flow,
-    ) -> Result<Response> {
+    ) -> Result<Decision> {
         let Flow {
             sealed_session,
             requester,
@@ -1254,14 +1291,10 @@ impl VpBackend {
         let session = match self.sealer.unseal(&sealed_session, id.as_bytes()) {
             Ok(s) => s,
             Err(e) => {
-                return self
-                    .fail(
-                        &id,
-                        &claim_id,
-                        e.code(),
-                        Response::text(500, "stored session cannot be opened"),
-                    )
-                    .await;
+                return Decision::failed(
+                    e.code(),
+                    Response::text(500, "stored session cannot be opened"),
+                );
             }
         };
         // RFC 6749 section 3.1 prohibits repeated request/response parameters.
@@ -1275,63 +1308,31 @@ impl VpBackend {
             .count()
             > 1
         {
-            return self
-                .fail(
-                    &id,
-                    &claim_id,
-                    "duplicate_response",
-                    Response::text(400, "duplicate response"),
-                )
-                .await;
+            return Decision::failed(
+                "duplicate_response",
+                Response::text(400, "duplicate response"),
+            );
         }
         let Some(jwe) = ctx.request.form.get("response").cloned() else {
-            return self
-                .fail(
-                    &id,
-                    &claim_id,
-                    "missing_response",
-                    Response::text(400, "missing response"),
-                )
-                .await;
+            return Decision::failed("missing_response", Response::text(400, "missing response"));
         };
         if is_zkp_query(&session.dcql_query) {
             let Some(z) = &self.zkp else {
-                return self
-                    .fail(
-                        &id,
-                        &claim_id,
-                        "verifier_error",
-                        Response::text(500, "verifier error"),
-                    )
-                    .await;
+                return Decision::failed("verifier_error", Response::text(500, "verifier error"));
             };
             return self
-                .on_zkp_response(&id, &claim_id, z, &session, &jwe, requester, now)
+                .on_zkp_response(&id, z, &session, &jwe, requester, now)
                 .await;
         }
         let verified = match oid4vp::process_response(&session, &jwe, now, &X5cLeaf) {
             Ok(v) => v,
             Err(e) => {
-                return self
-                    .fail(
-                        &id,
-                        &claim_id,
-                        e.code(),
-                        Response::text(400, "invalid response"),
-                    )
-                    .await;
+                return Decision::failed(e.code(), Response::text(400, "invalid response"));
             }
         };
         // Every presented credential's issuer must be trusted; a single denial fails the flow.
         if verified.is_empty() {
-            return self
-                .fail(
-                    &id,
-                    &claim_id,
-                    "no_presentation",
-                    Response::text(400, "no presentation"),
-                )
-                .await;
+            return Decision::failed("no_presentation", Response::text(400, "no presentation"));
         }
         // One result carries every verified document: the first credential names the
         // issuer, and each credential's mapped claims are appended in query order.
@@ -1352,70 +1353,45 @@ impl VpBackend {
             match self.gate.permits(&q, now).await {
                 Ok(true) => {}
                 Ok(false) => {
-                    return self
-                        .fail(
-                            &id,
-                            &claim_id,
-                            "issuer_not_trusted",
-                            Response::text(403, "issuer not trusted"),
-                        )
-                        .await;
+                    return Decision::failed(
+                        "issuer_not_trusted",
+                        Response::text(403, "issuer not trusted"),
+                    );
                 }
                 Err(e) => {
                     tracing_noop(&e);
-                    return self
-                        .fail(
-                            &id,
-                            &claim_id,
-                            "trust_unavailable",
-                            Response::text(503, "trust evaluation unavailable"),
-                        )
-                        .await;
+                    return Decision::failed(
+                        "trust_unavailable",
+                        Response::text(503, "trust evaluation unavailable"),
+                    );
                 }
             }
             if let oid4vp::VerifiedCredential::SdJwt(credential) = &p.verified {
                 if let Err((code, status)) = self.check_sd_jwt_status(credential, now).await {
-                    return self
-                        .fail(&id, &claim_id, &code, Response::text(status, &code))
-                        .await;
+                    return Decision::failed(&code, Response::text(status, &code));
                 }
             }
             let claims = match p.verified.claims() {
                 Ok(claims) => claims,
                 Err(_) => {
-                    return self
-                        .fail(
-                            &id,
-                            &claim_id,
-                            "claims_unavailable",
-                            Response::text(422, "cannot read claims"),
-                        )
-                        .await;
+                    return Decision::failed(
+                        "claims_unavailable",
+                        Response::text(422, "cannot read claims"),
+                    );
                 }
             };
             let claims_root = Value::Object(claims);
             if let Err(code) =
                 Self::merge_attributes(&claims_root, &mut data, &attribute_map, &subject_pointer)
             {
-                return self
-                    .fail(
-                        &id,
-                        &claim_id,
-                        &code,
-                        Response::text(422, "cannot map attributes"),
-                    )
-                    .await;
+                return Decision::failed(&code, Response::text(422, "cannot map attributes"));
             }
         }
         if data.subject_id.is_none() {
-            return self
-                .fail(
-                    &id,
-                    &claim_id,
-                    "subject_claim_missing",
-                    Response::text(422, "cannot map attributes"),
-                )
-                .await;
+            return Decision::failed(
+                "subject_claim_missing",
+                Response::text(422, "cannot map attributes"),
+            );
         }
         let sealed_result = match self
             .sealer
@@ -1423,59 +1399,30 @@ impl VpBackend {
         {
             Ok(result) => result,
             Err(e) => {
-                return self
-                    .fail(
-                        &id,
-                        &claim_id,
-                        e.code(),
-                        Response::text(500, "result cannot be sealed"),
-                    )
-                    .await;
+                return Decision::failed(e.code(), Response::text(500, "result cannot be sealed"));
             }
         };
-        self.finish_response(
-            &id,
-            &claim_id,
-            TerminalOutcome::Done(sealed_result),
-            Response::json(&serde_json::json!({}))?,
-        )
-        .await
+        Decision::done(sealed_result)
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn on_zkp_response(
         &self,
         id: &str,
-        claim_id: &str,
         z: &ZkpMode,
         session: &oid4vp::Session,
         jwe: &str,
         requester: Option<String>,
         now: i64,
-    ) -> Result<Response> {
+    ) -> Result<Decision> {
         let opened = match oid4vp::open_response(session, jwe, now) {
             Ok(o) => o,
             Err(e) => {
                 tracing::warn!(code = e.code(), error = %e, token_bytes = jwe.len(), "zkp response envelope rejected");
-                return self
-                    .fail(
-                        id,
-                        claim_id,
-                        e.code(),
-                        Response::text(400, "invalid response"),
-                    )
-                    .await;
+                return Decision::failed(e.code(), Response::text(400, "invalid response"));
             }
         };
         let Some(profile) = z.profile_for_query(&session.dcql_query) else {
-            return self
-                .fail(
-                    id,
-                    claim_id,
-                    "verifier_error",
-                    Response::text(500, "verifier error"),
-                )
-                .await;
+            return Decision::failed("verifier_error", Response::text(500, "verifier error"));
         };
         let thumbprint =
             match jose_rs::jwk::thumbprint::thumbprint_sha256(&session.enc_key.to_public_jwk())
@@ -1483,14 +1430,10 @@ impl VpBackend {
             {
                 Ok(t) => t,
                 Err(_) => {
-                    return self
-                        .fail(
-                            id,
-                            claim_id,
-                            "verifier_error",
-                            Response::text(500, "verifier error"),
-                        )
-                        .await;
+                    return Decision::failed(
+                        "verifier_error",
+                        Response::text(500, "verifier error"),
+                    );
                 }
             };
         let channel = match (
@@ -1506,14 +1449,7 @@ impl VpBackend {
                 origin: origin.to_owned(),
             },
             _ => {
-                return self
-                    .fail(
-                        id,
-                        claim_id,
-                        "verifier_error",
-                        Response::text(500, "verifier error"),
-                    )
-                    .await;
+                return Decision::failed("verifier_error", Response::text(500, "verifier error"));
             }
         };
         let exchange = Exchange {
@@ -1526,7 +1462,7 @@ impl VpBackend {
         };
         let pending = match z.verifier.begin(&exchange, &opened.vp_token_text()) {
             Ok(p) => p,
-            Err(e) => return self.zkp_failure(id, claim_id, &e).await,
+            Err(e) => return self.zkp_failure(&e),
         };
         let mut verdicts = Vec::new();
         for queries in pending.trust_queries() {
@@ -1551,14 +1487,10 @@ impl VpBackend {
                         })
                     }
                     _ => {
-                        return self
-                            .fail(
-                                id,
-                                claim_id,
-                                "trust_unavailable",
-                                Response::text(503, "trust evaluation unavailable"),
-                            )
-                            .await;
+                        return Decision::failed(
+                            "trust_unavailable",
+                            Response::text(503, "trust evaluation unavailable"),
+                        );
                     }
                 }
             }
@@ -1566,29 +1498,15 @@ impl VpBackend {
         }
         let verified = match pending.finish(&verdicts) {
             Ok(v) => v,
-            Err(e) => return self.zkp_failure(id, claim_id, &e).await,
+            Err(e) => return self.zkp_failure(&e),
         };
         let Some(first) = verified.first() else {
-            return self
-                .fail(
-                    id,
-                    claim_id,
-                    "no_presentation",
-                    Response::text(400, "no presentation"),
-                )
-                .await;
+            return Decision::failed("no_presentation", Response::text(400, "no presentation"));
         };
         let mut data = match self.map_zkp(z, profile, first) {
             Ok(d) => d,
             Err(code) => {
-                return self
-                    .fail(
-                        id,
-                        claim_id,
-                        &code,
-                        Response::text(422, "cannot map attributes"),
-                    )
-                    .await;
+                return Decision::failed(&code, Response::text(422, "cannot map attributes"));
             }
         };
         data.requester = requester;
@@ -1598,23 +1516,10 @@ impl VpBackend {
         {
             Ok(result) => result,
             Err(e) => {
-                return self
-                    .fail(
-                        id,
-                        claim_id,
-                        e.code(),
-                        Response::text(500, "result cannot be sealed"),
-                    )
-                    .await;
+                return Decision::failed(e.code(), Response::text(500, "result cannot be sealed"));
             }
         };
-        self.finish_response(
-            id,
-            claim_id,
-            TerminalOutcome::Done(sealed_result),
-            Response::json(&serde_json::json!({}))?,
-        )
-        .await
+        Decision::done(sealed_result)
     }
 
     fn map_zkp(
@@ -1653,7 +1558,7 @@ impl VpBackend {
         Ok(data)
     }
 
-    async fn zkp_failure(&self, id: &str, claim_id: &str, e: &ZkpError) -> Result<Response> {
+    fn zkp_failure(&self, e: &ZkpError) -> Result<Decision> {
         match e {
             ZkpError::Refused { code, detail } => {
                 let body = serde_json::to_vec(&serde_json::json!({
@@ -1661,24 +1566,15 @@ impl VpBackend {
                     "error_description": detail,
                 }))
                 .unwrap_or_else(|_| b"{\"error\":\"zkp_req\"}".to_vec());
-                self.fail(
-                    id,
-                    claim_id,
+                Decision::failed(
                     code,
                     Response::new(400)
                         .with_header("content-type", "application/json")
                         .with_body(body),
                 )
-                .await
             }
             ZkpError::Fault(_) => {
-                self.fail(
-                    id,
-                    claim_id,
-                    "verifier_error",
-                    Response::text(500, "verifier error"),
-                )
-                .await
+                Decision::failed("verifier_error", Response::text(500, "verifier error"))
             }
         }
     }
