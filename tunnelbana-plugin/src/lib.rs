@@ -726,6 +726,11 @@ pub struct VpBackend {
     store: Arc<dyn FlowStore>,
     /// Adapter-owned admission cap for concurrent response verifications.
     verification_permits: Arc<tokio::sync::Semaphore>,
+    /// The same cap for the cryptographic verification jobs themselves:
+    /// a permit is held inside the blocking job until it finishes, so
+    /// detached (caller-abandoned) jobs and the blocking pool's queue can
+    /// never hold more than the configured number.
+    crypto_permits: Arc<tokio::sync::Semaphore>,
     sealer: SessionSealer,
     gate: TrustGate,
     signer: kryptering::SoftwareSigner,
@@ -1005,12 +1010,16 @@ impl VpBackend {
         let verification_permits = Arc::new(tokio::sync::Semaphore::new(
             cfg.max_concurrent_verifications,
         ));
+        let crypto_permits = Arc::new(tokio::sync::Semaphore::new(
+            cfg.max_concurrent_verifications,
+        ));
         Ok(Self {
             name: name.into(),
             module_base: module_base.into(),
             cfg,
             store: Arc::new(MemoryFlowStore::default()),
             verification_permits,
+            crypto_permits,
             sealer: SessionSealer::from_master(&random_master(), name)
                 .map_err(|e| Error::Internal(format!("session sealer: {}", e.code())))?,
             gate,
@@ -1378,8 +1387,18 @@ impl VpBackend {
                 .await;
         }
         // Synchronous cryptographic verification runs on the blocking pool so
-        // it cannot stall the async workers polling other requests.
+        // it cannot stall the async workers polling other requests. Its
+        // permit moves into the job and is held until the job finishes —
+        // even a caller-abandoned job keeps its slot, so neither the
+        // running set nor the pool's queue can exceed the cap.
+        let crypto_permit = match self.crypto_permits.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                return Decision::failed("verifier_error", Response::text(500, "verifier error"));
+            }
+        };
         let verified = match tokio::task::spawn_blocking(move || {
+            let _held = crypto_permit;
             oid4vp::process_response(&session, &jwe, now, &X5cLeaf)
         })
         .await
