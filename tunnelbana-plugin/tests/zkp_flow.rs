@@ -233,6 +233,7 @@ fn build_with_store(
         request_uri_method: "get".into(),
         auth_class_ref: cfg.auth_class_ref.clone(),
         processing_lease_secs: 60,
+        processing_deadline_secs: 45,
     };
     let mut backend = VpBackend::new_with_zkp(
         "vp",

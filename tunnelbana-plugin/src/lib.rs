@@ -243,6 +243,12 @@ pub struct VpBackendConfig {
     /// verification. Replay protection and one-time collection are unchanged.
     #[serde(default = "default_processing_lease")]
     pub processing_lease_secs: i64,
+    /// Overall seconds to spend processing one claimed wallet response;
+    /// must be strictly shorter than the lease. On expiry the flow fails
+    /// closed with `processing_deadline` while the claim is still held, so
+    /// a stalled PDP or status-list endpoint cannot hang a presentation.
+    #[serde(default = "default_processing_deadline")]
+    pub processing_deadline_secs: i64,
 }
 
 fn default_mdoc_role() -> String {
@@ -259,6 +265,10 @@ fn default_ttl() -> i64 {
 
 fn default_processing_lease() -> i64 {
     60
+}
+
+fn default_processing_deadline() -> i64 {
+    45
 }
 
 /// Configuration of a `zkp_req` (nym_auth) backend.
@@ -912,6 +922,16 @@ impl VpBackend {
                 "processing_lease_secs must be 1..=900".into(),
             ));
         }
+        if cfg.processing_deadline_secs <= 0 || cfg.processing_deadline_secs > 900 {
+            return Err(Error::Config(
+                "processing_deadline_secs must be 1..=900".into(),
+            ));
+        }
+        if cfg.processing_deadline_secs >= cfg.processing_lease_secs {
+            return Err(Error::Config(
+                "processing_deadline_secs must be shorter than processing_lease_secs".into(),
+            ));
+        }
         if !matches!(cfg.request_uri_method.as_str(), "get" | "post") {
             return Err(Error::Config(
                 "request_uri_method must be get or post".into(),
@@ -968,6 +988,7 @@ impl VpBackend {
             request_uri_method: default_request_uri_method(),
             auth_class_ref: mode.cfg.auth_class_ref.clone(),
             processing_lease_secs: default_processing_lease(),
+            processing_deadline_secs: default_processing_deadline(),
         };
         let mut backend =
             Self::new_inner(name, module_base, cfg, gate, signer, chain_der, clock, true)?;
@@ -1188,6 +1209,41 @@ impl VpBackend {
             }
             Err(_) => return Ok(Response::text(503, "flow store unavailable")),
         };
+        // The processing deadline is strictly shorter than the lease, so the
+        // deadline failure below is persisted while this claim still holds
+        // the flow; a stalled PDP or status endpoint cannot hang a
+        // presentation past its budget.
+        let deadline = std::time::Duration::from_secs(self.cfg.processing_deadline_secs as u64);
+        match tokio::time::timeout(
+            deadline,
+            self.process_claim(ctx, id.clone(), claim_id.clone(), now, flow),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(_) => {
+                self.fail(
+                    &id,
+                    &claim_id,
+                    "processing_deadline",
+                    Response::text(504, "processing deadline exceeded"),
+                )
+                .await
+            }
+        }
+    }
+
+    /// Verify one claimed wallet response and persist its result. The caller
+    /// bounds the whole step with the processing deadline; the lease guards
+    /// the store claim itself.
+    async fn process_claim(
+        &self,
+        ctx: &mut Context,
+        id: String,
+        claim_id: String,
+        now: i64,
+        flow: Flow,
+    ) -> Result<Response> {
         let Flow {
             sealed_session,
             requester,
