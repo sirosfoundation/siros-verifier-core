@@ -92,11 +92,19 @@ impl FlowStore for CorruptStore {
             .map(|flow| flow.map(|flow| self.altered(flow)))
     }
 
-    async fn claim(&self, id: &str, now: i64, claim_id: &str) -> StoreResult<ClaimResult> {
-        Ok(match self.inner.claim(id, now, claim_id).await? {
-            ClaimResult::Claimed(flow) => ClaimResult::Claimed(self.altered(flow)),
-            other => other,
-        })
+    async fn claim(
+        &self,
+        id: &str,
+        now: i64,
+        claim_id: &str,
+        lease_secs: i64,
+    ) -> StoreResult<ClaimResult> {
+        Ok(
+            match self.inner.claim(id, now, claim_id, lease_secs).await? {
+                ClaimResult::Claimed(flow) => ClaimResult::Claimed(Box::new(self.altered(*flow))),
+                other => other,
+            },
+        )
     }
 
     async fn finish(
@@ -224,6 +232,7 @@ fn build_with_store(
         request_ttl_secs: cfg.request_ttl_secs,
         request_uri_method: "get".into(),
         auth_class_ref: cfg.auth_class_ref.clone(),
+        processing_lease_secs: 60,
     };
     let mut backend = VpBackend::new_with_zkp(
         "vp",

@@ -86,8 +86,14 @@ impl FlowStore for FinishFailingStore {
         self.inner.get(id, now).await
     }
 
-    async fn claim(&self, id: &str, now: i64, claim_id: &str) -> StoreResult<ClaimResult> {
-        self.inner.claim(id, now, claim_id).await
+    async fn claim(
+        &self,
+        id: &str,
+        now: i64,
+        claim_id: &str,
+        lease_secs: i64,
+    ) -> StoreResult<ClaimResult> {
+        self.inner.claim(id, now, claim_id, lease_secs).await
     }
 
     async fn finish(
@@ -755,6 +761,33 @@ async fn replayed_wallet_response_is_rejected_and_does_not_double_deliver() {
 }
 
 #[tokio::test]
+async fn a_wallet_retry_recovers_a_flow_whose_runner_died_mid_processing() {
+    let store = Arc::new(MemoryFlowStore::default());
+    let f = fx().with_storage(store.clone());
+    let (state, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    let jwe = wallet(&f, &jar);
+    // The first runner claimed the response slot and died mid-processing;
+    // its one-second lease expires while the browser keeps waiting.
+    assert!(matches!(
+        store.claim(&id, T0, "dead-claim", 1).await.unwrap(),
+        ClaimResult::Claimed(_)
+    ));
+    f.clock.store(T0 + 2, Ordering::SeqCst);
+    // The wallet's retry re-claims the expired lease and re-drives the flow.
+    assert_eq!(post(&f, &id, &jwe).await.0, 200);
+    assert_eq!(
+        post(&f, &id, &jwe).await.0,
+        409,
+        "replay protection is intact after recovery"
+    );
+    assert!(matches!(
+        complete(&f, &state).await.unwrap(),
+        BackendAction::AuthResponse(_)
+    ));
+}
+
+#[tokio::test]
 async fn two_replicas_share_the_complete_flow_and_replay_guard() {
     let store = Arc::new(MemoryFlowStore::default());
     let a = fx().with_storage(store.clone());
@@ -992,6 +1025,29 @@ fn config_rejects_unknown_fields_and_bad_pointers() {
     assert!(mk("/family_name", 0).is_err());
     assert!(mk("/family_name", 901).is_err());
     assert!(mk("/family_name", 300).is_ok());
+}
+
+#[test]
+fn processing_lease_is_bounded() {
+    let mk = |lease: i64| {
+        let cfg: VpBackendConfig = serde_json::from_value(json!({
+            "dcql": {"credentials": [{"id": "pid", "format": "dc+sd-jwt"}]},
+            "attribute_map": {}, "subject_pointer": "/family_name", "role": "r",
+            "processing_lease_secs": lease
+        }))
+        .unwrap();
+        backend_with_config(cfg)
+    };
+    let refusal = |lease: i64| {
+        mk(lease)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "OK".into())
+    };
+    assert!(refusal(0).contains("processing_lease_secs"));
+    assert!(refusal(901).contains("processing_lease_secs"));
+    assert!(mk(1).is_ok());
+    assert!(mk(900).is_ok());
 }
 
 #[test]
