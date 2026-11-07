@@ -159,7 +159,7 @@ fn fx_full(next_update_in: i64, subject_pointer: &str) -> Fx {
 }
 
 fn fx_with_method(next_update_in: i64, subject_pointer: &str, request_uri_method: &str) -> Fx {
-    let cfg = pid_cfg(subject_pointer, request_uri_method, None);
+    let cfg = pid_cfg(subject_pointer, request_uri_method, None, 16);
     assemble(cfg, mock_pdp(next_update_in, false), pid_parts())
 }
 
@@ -195,11 +195,13 @@ fn pid_parts() -> Parts {
 }
 
 /// The single-credential backend configuration; `lease_and_deadline` sets
-/// `processing_lease_secs` and `processing_deadline_secs` when present.
+/// `processing_lease_secs` and `processing_deadline_secs` when present, and
+/// `permits` sets `max_concurrent_verifications`.
 fn pid_cfg(
     subject_pointer: &str,
     request_uri_method: &str,
     lease_and_deadline: Option<(i64, i64)>,
+    permits: usize,
 ) -> VpBackendConfig {
     let mut cfg = json!({
         "dcql": {"credentials": [{"id": "pid", "format": "dc+sd-jwt",
@@ -210,6 +212,7 @@ fn pid_cfg(
         "role": "pid-provider",
         "auth_class_ref": "urn:eudi:loa:high",
         "request_uri_method": request_uri_method,
+        "max_concurrent_verifications": permits,
     });
     if let Some((lease, deadline)) = lease_and_deadline {
         cfg["processing_lease_secs"] = json!(lease);
@@ -234,7 +237,7 @@ fn mock_pdp(next_update_in: i64, stall: bool) -> Arc<MockPdp> {
 /// A backend whose PDP accepts requests and never answers, with the given
 /// overall processing deadline in seconds.
 fn fx_stalled(deadline: i64) -> Fx {
-    let cfg = pid_cfg("/family_name", "get", Some((60, deadline)));
+    let cfg = pid_cfg("/family_name", "get", Some((60, deadline)), 16);
     assemble(cfg, mock_pdp(100_000, true), pid_parts())
 }
 
@@ -930,7 +933,7 @@ async fn the_processing_budget_never_outlives_the_remaining_lease() {
         clock: clock.clone(),
         advance: 50,
     });
-    let cfg = pid_cfg("/family_name", "get", Some((60, 55)));
+    let cfg = pid_cfg("/family_name", "get", Some((60, 55)), 16);
     let f = fx_with_parts(
         cfg,
         mock_pdp(100_000, true),
@@ -962,7 +965,7 @@ async fn the_processing_budget_never_outlives_the_remaining_lease() {
         clock: clock.clone(),
         advance: 59,
     });
-    let cfg = pid_cfg("/family_name", "get", Some((60, 55)));
+    let cfg = pid_cfg("/family_name", "get", Some((60, 55)), 16);
     let gate_pdp = mock_pdp(100_000, true);
     let f = fx_with_parts(
         cfg,
@@ -996,7 +999,7 @@ async fn a_synchronous_overrun_past_the_deadline_is_not_persisted() {
     let pdp = Arc::new(BusyWaitPdp {
         spin: std::time::Duration::from_secs(2),
     });
-    let cfg = pid_cfg("/family_name", "get", Some((60, 1)));
+    let cfg = pid_cfg("/family_name", "get", Some((60, 1)), 16);
     let f = fx_with_parts(
         cfg,
         pdp,
@@ -1022,6 +1025,59 @@ async fn a_synchronous_overrun_past_the_deadline_is_not_persisted() {
 }
 
 #[tokio::test]
+async fn a_queued_response_aborts_without_verifying_when_admission_is_full() {
+    // One permit: the first response holds it while stalled at its PDP, so
+    // the second response queues on admission. When its own budget expires it
+    // is finalized without ever starting verification — the stalled PDP is
+    // called exactly once.
+    let clock = Arc::new(AtomicI64::new(T0));
+    let gate_pdp = mock_pdp(100_000, true);
+    let cfg = pid_cfg("/family_name", "get", Some((60, 1)), 1);
+    let f = fx_with_parts(
+        cfg,
+        gate_pdp.clone(),
+        mock_pdp(100_000, false),
+        Arc::new(MemoryFlowStore::default()),
+        clock,
+    );
+    let (_s1, id1) = start(&f).await;
+    let jar1 = fetch_jar(&f, &id1).await;
+    let (_s2, id2) = start(&f).await;
+    let jar2 = fetch_jar(&f, &id2).await;
+    let jwe1 = wallet(&f, &jar1);
+    let jwe2 = wallet(&f, &jar2);
+    let (r1, r2) = tokio::join!(
+        tokio::time::timeout(std::time::Duration::from_secs(10), post(&f, &id1, &jwe1)),
+        tokio::time::timeout(std::time::Duration::from_secs(10), post(&f, &id2, &jwe2)),
+    );
+    let (st1, body1) = r1.expect("the stalled holder must still finish");
+    let (st2, body2) = r2.expect("the queued response must finish");
+    assert_eq!(st1, 504, "{body1}");
+    assert_eq!(st2, 504, "{body2}");
+    assert_eq!(
+        gate_pdp.calls.load(Ordering::SeqCst),
+        1,
+        "only the admitted response may reach verification"
+    );
+    // The dead callers release their admissions: a fresh response is
+    // admitted and completes once the PDP answers again.
+    gate_pdp.stall.store(false, Ordering::SeqCst);
+    let (state, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    let (st, body) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        post(&f, &id, &wallet(&f, &jar)),
+    )
+    .await
+    .expect("a fresh response must be admitted after its predecessors died");
+    assert_eq!(st, 200, "{body}");
+    assert!(matches!(
+        complete(&f, &state).await.unwrap(),
+        BackendAction::AuthResponse(_)
+    ));
+}
+
+#[tokio::test]
 async fn a_decision_past_the_claims_safe_window_is_not_persisted() {
     // The PDP answers with a permit, but only after jumping the clock to the
     // lease deadline: the completed decision arrives past the safe window
@@ -1031,7 +1087,7 @@ async fn a_decision_past_the_claims_safe_window_is_not_persisted() {
         clock: clock.clone(),
         jump_to: T0 + 60,
     });
-    let cfg = pid_cfg("/family_name", "get", None);
+    let cfg = pid_cfg("/family_name", "get", None, 16);
     let f = fx_with_parts(
         cfg,
         pdp,

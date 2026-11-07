@@ -1328,6 +1328,19 @@ impl VpBackend {
             subject_pointer,
             ..
         } = flow;
+        // One verification admission per response, held for the whole
+        // pipeline (crypto, trust, status, mapping — every format including
+        // ZKP): a caller whose budget expires while queued is dropped before
+        // any work starts, and the permit is released when its future drops,
+        // so sustained overload cannot accumulate unbounded verification
+        // work. The millisecond crypto job a dropped caller leaves on the
+        // blocking pool is bounded by that pool.
+        let _admission = match self.verification_permits.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                return Decision::failed("verifier_error", Response::text(500, "verifier error"));
+            }
+        };
         let session = match self.sealer.unseal(&sealed_session, id.as_bytes()) {
             Ok(s) => s,
             Err(e) => {
@@ -1364,19 +1377,9 @@ impl VpBackend {
                 .on_zkp_response(&id, z, &session, &jwe, requester, now)
                 .await;
         }
-        // Synchronous cryptographic verification runs on the blocking pool,
-        // admitted by the adapter-owned permit: a caller whose budget
-        // expires while queued is dropped before its job starts, and a
-        // detached job holds its permit until it finishes, so overload
-        // cannot accumulate unbounded verification work.
-        let permit = match self.verification_permits.clone().acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => {
-                return Decision::failed("verifier_error", Response::text(500, "verifier error"));
-            }
-        };
+        // Synchronous cryptographic verification runs on the blocking pool so
+        // it cannot stall the async workers polling other requests.
         let verified = match tokio::task::spawn_blocking(move || {
-            let _held = permit;
             oid4vp::process_response(&session, &jwe, now, &X5cLeaf)
         })
         .await
