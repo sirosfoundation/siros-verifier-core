@@ -235,3 +235,65 @@ async fn an_expired_processing_lease_is_reclaimed_and_the_dead_claim_conflicts()
         "recovered processing still delivers exactly once"
     );
 }
+
+#[tokio::test]
+async fn a_dead_lease_is_not_reclaimed_once_the_request_expired() {
+    let store = MemoryFlowStore::default();
+    // Both flows expire at NOW + 300; a dead lease may be re-claimed right up
+    // to that boundary but not at it.
+    store.insert(flow("flow-retry"), NOW).await.unwrap();
+    assert!(matches!(
+        store
+            .claim("flow-retry", NOW, "dead-claim", 10)
+            .await
+            .unwrap(),
+        ClaimResult::Claimed(_)
+    ));
+    assert!(
+        matches!(
+            store
+                .claim("flow-retry", NOW + 299, "retry", 60)
+                .await
+                .unwrap(),
+            ClaimResult::Claimed(_)
+        ),
+        "a dead lease is re-claimed up to the request-expiry boundary"
+    );
+
+    // Past request expiry a retry is a replay, and the slow original holder
+    // may still finish and deliver its result exactly once.
+    store.insert(flow("flow-late"), NOW).await.unwrap();
+    assert!(matches!(
+        store.claim("flow-late", NOW, "claim-a", 10).await.unwrap(),
+        ClaimResult::Claimed(_)
+    ));
+    assert_eq!(
+        store
+            .claim("flow-late", NOW + 300, "retry", 60)
+            .await
+            .unwrap(),
+        ClaimResult::Replay,
+        "no re-drive can succeed once the request expired"
+    );
+    assert_eq!(
+        store
+            .finish(
+                "flow-late",
+                NOW + 300,
+                "claim-a",
+                TerminalOutcome::Done("late-result".into())
+            )
+            .await
+            .unwrap(),
+        FinishResult::Finished,
+        "the original holder may still complete an in-flight response"
+    );
+    assert_eq!(
+        store.collect("flow-late", NOW + 301).await.unwrap(),
+        CollectResult::Done("late-result".into())
+    );
+    assert_eq!(
+        store.collect("flow-late", NOW + 301).await.unwrap(),
+        CollectResult::Unknown
+    );
+}

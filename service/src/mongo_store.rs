@@ -148,9 +148,11 @@ impl FlowStore for MongoFlowStore {
         }
         match &current.outcome {
             Outcome::Pending => {}
-            // An expired lease frees the slot for a retrying wallet, so a
-            // runner that died mid-processing cannot strand the flow.
-            Outcome::Processing(_) if current.lease_until <= now => {}
+            // An expired lease frees the slot for a retrying wallet while the
+            // request is still live, so a runner that died mid-processing
+            // cannot strand the flow. Past request expiry no re-drive could
+            // succeed, and the original holder may still finish and deliver.
+            Outcome::Processing(_) if current.lease_until <= now && now < current.expires_at => {}
             _ => return Ok(ClaimResult::Replay),
         }
         let claimed = self
@@ -160,8 +162,8 @@ impl FlowStore for MongoFlowStore {
                     "retain_until": { "$gt": now },
                     "$or": [
                         { "outcome.state": "pending", "expires_at": { "$gt": now } },
-                        { "outcome.state": "processing", "lease_until": { "$lte": now } },
-                        { "outcome.state": "processing", "lease_until": { "$exists": false } },
+                        { "outcome.state": "processing", "expires_at": { "$gt": now }, "lease_until": { "$lte": now } },
+                        { "outcome.state": "processing", "expires_at": { "$gt": now }, "lease_until": { "$exists": false } },
                     ],
                 },
                 Outcome::Processing(claim_id.to_owned()),
@@ -821,6 +823,67 @@ mod tests {
             store.collect("flow-1", now + 12).await.unwrap(),
             CollectResult::Unknown,
             "recovered processing still delivers exactly once"
+        );
+
+        // The recovery window closes at request expiry: a retry is a replay
+        // there, and the slow original holder may still finish and deliver.
+        store
+            .insert(pending_flow("flow-window", now), now)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .claim("flow-window", now, "dead-claim", 10)
+                .await
+                .unwrap(),
+            ClaimResult::Claimed(_)
+        ));
+        assert!(
+            matches!(
+                store
+                    .claim("flow-window", now + 299, "retry", 60)
+                    .await
+                    .unwrap(),
+                ClaimResult::Claimed(_)
+            ),
+            "a dead lease is re-claimed up to the request-expiry boundary"
+        );
+        store
+            .insert(pending_flow("flow-late", now), now)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.claim("flow-late", now, "claim-a", 10).await.unwrap(),
+            ClaimResult::Claimed(_)
+        ));
+        assert_eq!(
+            store
+                .claim("flow-late", now + 300, "retry", 60)
+                .await
+                .unwrap(),
+            ClaimResult::Replay,
+            "no re-drive can succeed once the request expired"
+        );
+        assert_eq!(
+            store
+                .finish(
+                    "flow-late",
+                    now + 300,
+                    "claim-a",
+                    TerminalOutcome::Done("late-result".into())
+                )
+                .await
+                .unwrap(),
+            FinishResult::Finished,
+            "the original holder may still complete an in-flight response"
+        );
+        assert_eq!(
+            store.collect("flow-late", now + 301).await.unwrap(),
+            CollectResult::Done("late-result".into())
+        );
+        assert_eq!(
+            store.collect("flow-late", now + 301).await.unwrap(),
+            CollectResult::Unknown
         );
 
         // Pre-lease records (no `lease_until` field) are recoverable too.

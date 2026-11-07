@@ -198,10 +198,12 @@ impl FlowStore for MemoryFlowStore {
         }
         match &flow.outcome {
             Outcome::Pending => {}
-            // The holder's lease expired without a terminal result, so the
-            // slot is free again: a retrying wallet re-claims it and re-drives
-            // verification under a fresh claim.
-            Outcome::Processing(_) if flow.lease_until <= now => {}
+            // The holder's lease expired without a terminal result while the
+            // request is still live, so the slot is free again: a retrying
+            // wallet re-claims it and re-drives verification under a fresh
+            // claim. Past request expiry no re-drive could succeed anyway, and
+            // the original holder may still finish and deliver late.
+            Outcome::Processing(_) if flow.lease_until <= now && now < flow.expires_at => {}
             _ => return Ok(ClaimResult::Replay),
         }
         flow.outcome = Outcome::Processing(claim_id.to_owned());
