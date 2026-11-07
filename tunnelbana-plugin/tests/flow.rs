@@ -156,21 +156,22 @@ fn fx_full(next_update_in: i64, subject_pointer: &str) -> Fx {
 }
 
 fn fx_with_method(next_update_in: i64, subject_pointer: &str, request_uri_method: &str) -> Fx {
-    let (v_cert, v_key, holder, issued) = pid_parts();
     let cfg = pid_cfg(subject_pointer, request_uri_method, None);
-    assemble(
-        cfg,
-        mock_pdp(next_update_in, false),
-        v_cert,
-        &v_key,
-        holder,
-        issued,
-    )
+    assemble(cfg, mock_pdp(next_update_in, false), pid_parts())
 }
 
 /// The PID fixture: verifier and issuer keys, the holder key, and one issued
 /// PID credential disclosing `given_name` and `family_name`.
-fn pid_parts() -> (Vec<u8>, jose_rs::jwk::Jwk, jose_rs::jwk::Jwk, Issued) {
+/// The PID fixture: verifier and issuer keys, the holder key, and one issued
+/// PID credential disclosing `given_name` and `family_name`.
+struct Parts {
+    v_cert: Vec<u8>,
+    v_key: jose_rs::jwk::Jwk,
+    holder: jose_rs::jwk::Jwk,
+    issued: Issued,
+}
+
+fn pid_parts() -> Parts {
     let (v_cert, v_key) = self_signed_ec("verifier.example", "ES256");
     let (i_cert, i_key) = self_signed_ec("issuer.example", "ES256");
     let holder = ec_jwk("ES256", "holder");
@@ -182,7 +183,12 @@ fn pid_parts() -> (Vec<u8>, jose_rs::jwk::Jwk, jose_rs::jwk::Jwk, Issued) {
     spec.x5c_der = vec![i_cert];
     spec.conceal = vec![vec![Seg::Key("given_name")], vec![Seg::Key("family_name")]];
     let issued = issue(&i_key, &spec).unwrap();
-    (v_cert, v_key, holder, issued)
+    Parts {
+        v_cert,
+        v_key,
+        holder,
+        issued,
+    }
 }
 
 /// The single-credential backend configuration; `lease_and_deadline` sets
@@ -225,9 +231,8 @@ fn mock_pdp(next_update_in: i64, stall: bool) -> Arc<MockPdp> {
 /// A backend whose PDP accepts requests and never answers, with the given
 /// overall processing deadline in seconds.
 fn fx_stalled(deadline: i64) -> Fx {
-    let (v_cert, v_key, holder, issued) = pid_parts();
     let cfg = pid_cfg("/family_name", "get", Some((60, deadline)));
-    assemble(cfg, mock_pdp(100_000, true), v_cert, &v_key, holder, issued)
+    assemble(cfg, mock_pdp(100_000, true), pid_parts())
 }
 
 /// A trust gate over any PDP, with the same identity every fixture uses.
@@ -244,35 +249,16 @@ fn gate_over(pdp: Arc<dyn PdpClient>) -> TrustGate {
 }
 
 /// A fixture with an explicit shared clock, gate PDP, and flow store, for
-/// the processing-budget and lease-window regressions. The trust gate uses
-/// the passed-in `pdp`; `Fx.pdp` is an unrelated placeholder, so toggling
-/// its flags does not reach the backend.
+/// the processing-budget and lease-window regressions; the trust gate uses
+/// `gate_pdp` and `Fx.pdp` is the unrelated `fx_pdp` placeholder.
 fn fx_with_parts(
     cfg: VpBackendConfig,
-    pdp: Arc<dyn PdpClient>,
+    gate_pdp: Arc<dyn PdpClient>,
+    fx_pdp: Arc<MockPdp>,
     store: Arc<dyn FlowStore>,
     clock: Arc<AtomicI64>,
 ) -> Fx {
-    let (v_cert, v_key, holder, issued) = pid_parts();
-    let c2 = clock.clone();
-    let b = VpBackend::new(
-        "vp",
-        "https://proxy.example/vp",
-        cfg,
-        gate_over(pdp),
-        siros_verifier_core::oid4vp::software_signer(&v_key).unwrap(),
-        vec![v_cert],
-        Arc::new(move || c2.load(Ordering::SeqCst)),
-    )
-    .unwrap()
-    .with_flow_store(store);
-    Fx {
-        b,
-        pdp: mock_pdp(100_000, false),
-        clock,
-        holder,
-        issued,
-    }
+    assemble_parts(cfg, gate_pdp, fx_pdp, store, clock, pid_parts())
 }
 
 /// A flow store whose claim round-trip advances the shared clock as if the
@@ -342,30 +328,48 @@ fn fx() -> Fx {
 
 /// The backend assembly every fixture shares: the given mock PDP, the clock,
 /// the trust gate, and the service signer.
-fn assemble(
+fn assemble(cfg: VpBackendConfig, pdp: Arc<MockPdp>, parts: Parts) -> Fx {
+    assemble_parts(
+        cfg,
+        pdp.clone(),
+        pdp,
+        Arc::new(MemoryFlowStore::default()),
+        Arc::new(AtomicI64::new(T0)),
+        parts,
+    )
+}
+
+/// The shared backend construction: the trust gate uses `gate_pdp`, `Fx.pdp`
+/// is `fx_pdp`, and the flow store and clock are the caller's.
+fn assemble_parts(
     cfg: VpBackendConfig,
-    pdp: Arc<MockPdp>,
-    v_cert: Vec<u8>,
-    v_key: &jose_rs::jwk::Jwk,
-    holder: jose_rs::jwk::Jwk,
-    issued: Issued,
+    gate_pdp: Arc<dyn PdpClient>,
+    fx_pdp: Arc<MockPdp>,
+    store: Arc<dyn FlowStore>,
+    clock: Arc<AtomicI64>,
+    parts: Parts,
 ) -> Fx {
-    let gate = gate_over(pdp.clone());
-    let clock = Arc::new(AtomicI64::new(T0));
+    let Parts {
+        v_cert,
+        v_key,
+        holder,
+        issued,
+    } = parts;
     let c2 = clock.clone();
     let b = VpBackend::new(
         "vp",
         "https://proxy.example/vp",
         cfg,
-        gate,
-        siros_verifier_core::oid4vp::software_signer(v_key).unwrap(),
+        gate_over(gate_pdp),
+        siros_verifier_core::oid4vp::software_signer(&v_key).unwrap(),
         vec![v_cert],
         Arc::new(move || c2.load(Ordering::SeqCst)),
     )
-    .unwrap();
+    .unwrap()
+    .with_flow_store(store);
     Fx {
         b,
-        pdp,
+        pdp: fx_pdp,
         clock,
         holder,
         issued,
@@ -418,10 +422,12 @@ fn fx_multi_at(loyalty_level: Value, subject_pointer: &str) -> (Fx, Issued) {
         assemble(
             cfg,
             mock_pdp(100_000, false),
-            v_cert,
-            &v_key,
-            holder,
-            issued_pid,
+            Parts {
+                v_cert,
+                v_key,
+                holder,
+                issued: issued_pid,
+            },
         ),
         issued_loyalty,
     )
@@ -946,7 +952,13 @@ async fn the_processing_budget_never_outlives_the_remaining_lease() {
         advance: 8,
     });
     let cfg = pid_cfg("/family_name", "get", Some((10, 9)));
-    let f = fx_with_parts(cfg, mock_pdp(100_000, true), store, clock);
+    let f = fx_with_parts(
+        cfg,
+        mock_pdp(100_000, true),
+        mock_pdp(100_000, false),
+        store,
+        clock,
+    );
     let (state, id) = start(&f).await;
     let jar = fetch_jar(&f, &id).await;
     let (st, body) = tokio::time::timeout(
@@ -975,7 +987,13 @@ async fn a_decision_past_the_claims_safe_window_is_not_persisted() {
         jump_to: T0 + 60,
     });
     let cfg = pid_cfg("/family_name", "get", None);
-    let f = fx_with_parts(cfg, pdp, Arc::new(MemoryFlowStore::default()), clock);
+    let f = fx_with_parts(
+        cfg,
+        pdp,
+        mock_pdp(100_000, false),
+        Arc::new(MemoryFlowStore::default()),
+        clock,
+    );
     let (state, id) = start(&f).await;
     let jar = fetch_jar(&f, &id).await;
     let (st, body) = post(&f, &id, &wallet(&f, &jar)).await;
