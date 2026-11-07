@@ -250,6 +250,12 @@ pub struct VpBackendConfig {
     /// a stalled PDP or status-list endpoint cannot hang a presentation.
     #[serde(default = "default_processing_deadline")]
     pub processing_deadline_secs: i64,
+    /// Adapter-owned cap on concurrently running response verifications.
+    /// A caller whose budget expires while queued is aborted before its
+    /// verification job starts; a detached job holds its permit until it
+    /// finishes, so sustained overload cannot accumulate unbounded work.
+    #[serde(default = "default_max_concurrent_verifications")]
+    pub max_concurrent_verifications: usize,
 }
 
 fn default_mdoc_role() -> String {
@@ -270,6 +276,10 @@ fn default_processing_lease() -> i64 {
 
 fn default_processing_deadline() -> i64 {
     45
+}
+
+fn default_max_concurrent_verifications() -> usize {
+    16
 }
 
 /// The terminal decision for one claimed wallet response: the outcome to
@@ -714,6 +724,8 @@ pub struct VpBackend {
     module_base: String,
     cfg: VpBackendConfig,
     store: Arc<dyn FlowStore>,
+    /// Adapter-owned admission cap for concurrent response verifications.
+    verification_permits: Arc<tokio::sync::Semaphore>,
     sealer: SessionSealer,
     gate: TrustGate,
     signer: kryptering::SoftwareSigner,
@@ -956,19 +968,22 @@ impl VpBackend {
                 "processing_lease_secs must be 1..=900".into(),
             ));
         }
-        if cfg.processing_lease_secs <= FLOW_STORE_WRITE_BOUND_SECS {
-            return Err(Error::Config(
-                "processing_lease_secs must exceed the flow-store write bound".into(),
-            ));
-        }
+        // The write-bound accommodation below (deadline + bound <= lease, with
+        // deadline >= 1) already forces the lease above the write bound, so
+        // no separate lease floor is needed.
         if cfg.processing_deadline_secs <= 0 || cfg.processing_deadline_secs > 900 {
             return Err(Error::Config(
                 "processing_deadline_secs must be 1..=900".into(),
             ));
         }
-        if cfg.processing_deadline_secs >= cfg.processing_lease_secs {
+        if cfg.processing_deadline_secs + FLOW_STORE_WRITE_BOUND_SECS > cfg.processing_lease_secs {
             return Err(Error::Config(
-                "processing_deadline_secs must be shorter than processing_lease_secs".into(),
+                "processing_deadline_secs must leave room for the flow-store write bound".into(),
+            ));
+        }
+        if cfg.max_concurrent_verifications == 0 || cfg.max_concurrent_verifications > 512 {
+            return Err(Error::Config(
+                "max_concurrent_verifications must be 1..=512".into(),
             ));
         }
         if !matches!(cfg.request_uri_method.as_str(), "get" | "post") {
@@ -987,11 +1002,15 @@ impl VpBackend {
                 )));
             }
         }
+        let verification_permits = Arc::new(tokio::sync::Semaphore::new(
+            cfg.max_concurrent_verifications,
+        ));
         Ok(Self {
             name: name.into(),
             module_base: module_base.into(),
             cfg,
             store: Arc::new(MemoryFlowStore::default()),
+            verification_permits,
             sealer: SessionSealer::from_master(&random_master(), name)
                 .map_err(|e| Error::Internal(format!("session sealer: {}", e.code())))?,
             gate,
@@ -1028,6 +1047,7 @@ impl VpBackend {
             auth_class_ref: mode.cfg.auth_class_ref.clone(),
             processing_lease_secs: default_processing_lease(),
             processing_deadline_secs: default_processing_deadline(),
+            max_concurrent_verifications: default_max_concurrent_verifications(),
         };
         let mut backend =
             Self::new_inner(name, module_base, cfg, gate, signer, chain_der, clock, true)?;
@@ -1250,9 +1270,9 @@ impl VpBackend {
         // stalled PDP or status endpoint cannot hang a presentation.
         let lease_until = flow.lease_until;
         // The budget never takes more of the lease than leaves room for the
-        // terminal write; an exhausted window (budget <= 0) becomes a
-        // zero-duration timeout, so the refusal is finalized before the
-        // first poll can reach any trust or store call.
+        // terminal write; an exhausted window (budget <= 0) is finalized
+        // without polling: the first poll of the ZKP path would already
+        // reach trust evaluation and native verification.
         let budget = Self::processing_budget(
             self.cfg.processing_deadline_secs,
             lease_until,
@@ -1260,13 +1280,16 @@ impl VpBackend {
         );
         let started = std::time::Instant::now();
         let deadline = std::time::Duration::from_secs(budget.max(0) as u64);
-        let decided =
+        let decided = if budget <= 0 {
+            Self::deadline_decision()?
+        } else {
             match tokio::time::timeout(deadline, self.process_claim(ctx, id.clone(), now, flow))
                 .await
             {
                 Ok(decided) => decided?,
                 Err(_) => Self::deadline_decision()?,
-            };
+            }
+        };
         // A synchronous verification overrun can complete the decision after
         // the budget passed; such a decision is never accepted.
         let decision = if started.elapsed() > deadline {
@@ -1341,9 +1364,19 @@ impl VpBackend {
                 .on_zkp_response(&id, z, &session, &jwe, requester, now)
                 .await;
         }
-        // Synchronous cryptographic verification runs on the blocking pool
-        // so it cannot stall the async workers polling other requests.
+        // Synchronous cryptographic verification runs on the blocking pool,
+        // admitted by the adapter-owned permit: a caller whose budget
+        // expires while queued is dropped before its job starts, and a
+        // detached job holds its permit until it finishes, so overload
+        // cannot accumulate unbounded verification work.
+        let permit = match self.verification_permits.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                return Decision::failed("verifier_error", Response::text(500, "verifier error"));
+            }
+        };
         let verified = match tokio::task::spawn_blocking(move || {
+            let _held = permit;
             oid4vp::process_response(&session, &jwe, now, &X5cLeaf)
         })
         .await

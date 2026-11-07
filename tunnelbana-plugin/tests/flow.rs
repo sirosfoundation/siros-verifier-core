@@ -4,6 +4,9 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+mod common;
+use common::ClockBumpingClaimStore;
+
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use siros_verifier_core::session_seal::SessionSealer;
@@ -259,50 +262,6 @@ fn fx_with_parts(
     clock: Arc<AtomicI64>,
 ) -> Fx {
     assemble_parts(cfg, gate_pdp, fx_pdp, store, clock, pid_parts())
-}
-
-/// A flow store whose claim round-trip advances the shared clock as if the
-/// store call had consumed `advance` seconds.
-struct ClockBumpingClaimStore {
-    inner: MemoryFlowStore,
-    clock: Arc<AtomicI64>,
-    advance: i64,
-}
-
-#[async_trait]
-impl FlowStore for ClockBumpingClaimStore {
-    async fn insert(&self, flow: Flow, now: i64) -> StoreResult<()> {
-        self.inner.insert(flow, now).await
-    }
-
-    async fn get(&self, id: &str, now: i64) -> StoreResult<Option<Flow>> {
-        self.inner.get(id, now).await
-    }
-
-    async fn claim(
-        &self,
-        id: &str,
-        now: i64,
-        claim_id: &str,
-        lease_secs: i64,
-    ) -> StoreResult<ClaimResult> {
-        self.clock.fetch_add(self.advance, Ordering::SeqCst);
-        self.inner.claim(id, now, claim_id, lease_secs).await
-    }
-
-    async fn finish(
-        &self,
-        id: &str,
-        now: i64,
-        claim_id: &str,
-        outcome: TerminalOutcome,
-    ) -> StoreResult<FinishResult> {
-        self.inner.finish(id, now, claim_id, outcome).await
-    }
-
-    async fn collect(&self, id: &str, now: i64) -> StoreResult<CollectResult> {
-        self.inner.collect(id, now).await
-    }
 }
 
 /// A PDP that answers with a permit but first busy-waits `spin`, like a
@@ -1406,12 +1365,35 @@ fn processing_deadline_is_bounded() {
     };
     assert!(refusal(60, 0).contains("processing_deadline_secs"));
     assert!(refusal(60, 901).contains("processing_deadline_secs"));
+    assert!(refusal(60, 60).contains("processing_deadline_secs"));
     assert!(
-        refusal(60, 60).contains("processing_deadline_secs"),
-        "the deadline must be strictly shorter than the lease"
+        refusal(60, 56).contains("processing_deadline_secs"),
+        "the deadline must leave room for the flow-store write bound"
     );
-    assert!(refusal(60, 61).contains("processing_deadline_secs"));
-    assert!(mk(60, 59).is_ok());
+    assert!(mk(60, 55).is_ok());
+}
+
+#[test]
+fn verification_concurrency_is_bounded() {
+    let mk = |permits: usize| {
+        let cfg: VpBackendConfig = serde_json::from_value(json!({
+            "dcql": {"credentials": [{"id": "pid", "format": "dc+sd-jwt"}]},
+            "attribute_map": {}, "subject_pointer": "/family_name", "role": "r",
+            "max_concurrent_verifications": permits
+        }))
+        .unwrap();
+        backend_with_config(cfg)
+    };
+    let refusal = |permits: usize| {
+        mk(permits)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "OK".into())
+    };
+    assert!(refusal(0).contains("max_concurrent_verifications"));
+    assert!(refusal(513).contains("max_concurrent_verifications"));
+    assert!(mk(1).is_ok());
+    assert!(mk(512).is_ok());
 }
 
 #[test]
