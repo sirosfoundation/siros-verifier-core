@@ -12,6 +12,10 @@ use serde::{Deserialize, Serialize};
 
 pub const FLOW_SCHEMA_VERSION: u32 = 1;
 pub const FLOW_RETENTION_GRACE_SECS: i64 = 900;
+/// Upper bound on one flow-store write (the MongoDB operation timeout),
+/// reserved at the end of every processing lease so the single terminal
+/// write fits while the claim is still held.
+pub const FLOW_STORE_WRITE_BOUND_SECS: i64 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", content = "value", rename_all = "snake_case")]

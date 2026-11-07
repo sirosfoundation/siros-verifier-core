@@ -4,6 +4,9 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+mod common;
+use common::ClockBumpingClaimStore;
+
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use siros_verifier_core::session_seal::SessionSealer;
@@ -28,11 +31,16 @@ struct MockPdp {
     next_update_in: i64,
     /// Answer exactly as go-trust does today: no context.id, no trust_data.
     go_trust_today: AtomicBool,
+    /// Accept the request and never answer, like a stalled endpoint.
+    stall: AtomicBool,
 }
 #[async_trait]
 impl PdpClient for MockPdp {
     async fn evaluate(&self, req: &Value) -> Result<Value, String> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.stall.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         if self.down.load(Ordering::SeqCst) {
             return Err("connect refused".into());
         }
@@ -151,6 +159,22 @@ fn fx_full(next_update_in: i64, subject_pointer: &str) -> Fx {
 }
 
 fn fx_with_method(next_update_in: i64, subject_pointer: &str, request_uri_method: &str) -> Fx {
+    let cfg = pid_cfg(subject_pointer, request_uri_method, None, 16);
+    assemble(cfg, mock_pdp(next_update_in, false), pid_parts())
+}
+
+/// The PID fixture: verifier and issuer keys, the holder key, and one issued
+/// PID credential disclosing `given_name` and `family_name`.
+/// The PID fixture: verifier and issuer keys, the holder key, and one issued
+/// PID credential disclosing `given_name` and `family_name`.
+struct Parts {
+    v_cert: Vec<u8>,
+    v_key: jose_rs::jwk::Jwk,
+    holder: jose_rs::jwk::Jwk,
+    issued: Issued,
+}
+
+fn pid_parts() -> Parts {
     let (v_cert, v_key) = self_signed_ec("verifier.example", "ES256");
     let (i_cert, i_key) = self_signed_ec("issuer.example", "ES256");
     let holder = ec_jwk("ES256", "holder");
@@ -162,8 +186,24 @@ fn fx_with_method(next_update_in: i64, subject_pointer: &str, request_uri_method
     spec.x5c_der = vec![i_cert];
     spec.conceal = vec![vec![Seg::Key("given_name")], vec![Seg::Key("family_name")]];
     let issued = issue(&i_key, &spec).unwrap();
+    Parts {
+        v_cert,
+        v_key,
+        holder,
+        issued,
+    }
+}
 
-    let cfg: VpBackendConfig = serde_json::from_value(json!({
+/// The single-credential backend configuration; `lease_and_deadline` sets
+/// `processing_lease_secs` and `processing_deadline_secs` when present, and
+/// `permits` sets `max_concurrent_verifications`.
+fn pid_cfg(
+    subject_pointer: &str,
+    request_uri_method: &str,
+    lease_and_deadline: Option<(i64, i64)>,
+    permits: usize,
+) -> VpBackendConfig {
+    let mut cfg = json!({
         "dcql": {"credentials": [{"id": "pid", "format": "dc+sd-jwt",
                  "meta": {"vct_values": ["urn:eudi:pid:1"]},
                  "claims": [{"path": ["given_name"]}, {"path": ["family_name"]}]}]},
@@ -172,54 +212,146 @@ fn fx_with_method(next_update_in: i64, subject_pointer: &str, request_uri_method
         "role": "pid-provider",
         "auth_class_ref": "urn:eudi:loa:high",
         "request_uri_method": request_uri_method,
-    })).unwrap();
-    assemble(cfg, next_update_in, v_cert, &v_key, holder, issued)
-}
-fn fx() -> Fx {
-    fx_with(100_000)
+        "max_concurrent_verifications": permits,
+    });
+    if let Some((lease, deadline)) = lease_and_deadline {
+        cfg["processing_lease_secs"] = json!(lease);
+        cfg["processing_deadline_secs"] = json!(deadline);
+    }
+    serde_json::from_value(cfg).unwrap()
 }
 
-/// The backend assembly every fixture shares: the mock PDP with the given
-/// freshness window, the clock, the trust gate, and the service signer.
-fn assemble(
-    cfg: VpBackendConfig,
-    next_update_in: i64,
-    v_cert: Vec<u8>,
-    v_key: &jose_rs::jwk::Jwk,
-    holder: jose_rs::jwk::Jwk,
-    issued: Issued,
-) -> Fx {
-    let pdp = Arc::new(MockPdp {
+/// A mock go-trust with the given freshness window that never answers when
+/// `stall` is set.
+fn mock_pdp(next_update_in: i64, stall: bool) -> Arc<MockPdp> {
+    Arc::new(MockPdp {
         permit: AtomicBool::new(true),
         down: AtomicBool::new(false),
         calls: AtomicUsize::new(0),
         next_update_in,
         go_trust_today: AtomicBool::new(false),
-    });
-    let gate = TrustGate::new(
-        pdp.clone(),
+        stall: AtomicBool::new(stall),
+    })
+}
+
+/// A backend whose PDP accepts requests and never answers, with the given
+/// overall processing deadline in seconds.
+fn fx_stalled(deadline: i64) -> Fx {
+    let cfg = pid_cfg("/family_name", "get", Some((60, deadline)), 16);
+    assemble(cfg, mock_pdp(100_000, true), pid_parts())
+}
+
+/// A trust gate over any PDP, with the same identity every fixture uses.
+fn gate_over(pdp: Arc<dyn PdpClient>) -> TrustGate {
+    TrustGate::new(
+        pdp,
         p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap(),
         "k1",
         "core-1",
         "tenant-a",
         "https://pdp.example",
         3600,
-    );
-    let clock = Arc::new(AtomicI64::new(T0));
+    )
+}
+
+/// A fixture with an explicit shared clock, gate PDP, and flow store, for
+/// the processing-budget and lease-window regressions; the trust gate uses
+/// `gate_pdp` and `Fx.pdp` is the unrelated `fx_pdp` placeholder.
+fn fx_with_parts(
+    cfg: VpBackendConfig,
+    gate_pdp: Arc<dyn PdpClient>,
+    fx_pdp: Arc<MockPdp>,
+    store: Arc<dyn FlowStore>,
+    clock: Arc<AtomicI64>,
+) -> Fx {
+    assemble_parts(cfg, gate_pdp, fx_pdp, store, clock, pid_parts())
+}
+
+/// A PDP that answers with a permit but first busy-waits `spin`, like a
+/// synchronous verification the async runtime cannot preempt.
+struct BusyWaitPdp {
+    spin: std::time::Duration,
+}
+
+#[async_trait]
+impl PdpClient for BusyWaitPdp {
+    async fn evaluate(&self, _request: &Value) -> Result<Value, String> {
+        let until = std::time::Instant::now() + self.spin;
+        while std::time::Instant::now() < until {
+            std::hint::spin_loop();
+        }
+        Ok(json!({"decision": true,
+                  "context": {"id": "dec-1",
+                              "trust_data": [{"registry": "etsi", "as_of": "2027-01-15T00:00:00Z",
+                                               "next_update": next_update(100_000)}]}}))
+    }
+}
+
+/// A PDP that answers with a permit but first jumps the shared clock to
+/// `jump_to`, as if the evaluation had run until then.
+struct ClockJumpingPdp {
+    clock: Arc<AtomicI64>,
+    jump_to: i64,
+}
+
+#[async_trait]
+impl PdpClient for ClockJumpingPdp {
+    async fn evaluate(&self, _request: &Value) -> Result<Value, String> {
+        self.clock.store(self.jump_to, Ordering::SeqCst);
+        Ok(json!({"decision": true,
+                  "context": {"id": "dec-1",
+                              "trust_data": [{"registry": "etsi", "as_of": "2027-01-15T00:00:00Z",
+                                               "next_update": next_update(100_000)}]}}))
+    }
+}
+fn fx() -> Fx {
+    fx_with(100_000)
+}
+
+/// The backend assembly every fixture shares: the given mock PDP, the clock,
+/// the trust gate, and the service signer.
+fn assemble(cfg: VpBackendConfig, pdp: Arc<MockPdp>, parts: Parts) -> Fx {
+    assemble_parts(
+        cfg,
+        pdp.clone(),
+        pdp,
+        Arc::new(MemoryFlowStore::default()),
+        Arc::new(AtomicI64::new(T0)),
+        parts,
+    )
+}
+
+/// The shared backend construction: the trust gate uses `gate_pdp`, `Fx.pdp`
+/// is `fx_pdp`, and the flow store and clock are the caller's.
+fn assemble_parts(
+    cfg: VpBackendConfig,
+    gate_pdp: Arc<dyn PdpClient>,
+    fx_pdp: Arc<MockPdp>,
+    store: Arc<dyn FlowStore>,
+    clock: Arc<AtomicI64>,
+    parts: Parts,
+) -> Fx {
+    let Parts {
+        v_cert,
+        v_key,
+        holder,
+        issued,
+    } = parts;
     let c2 = clock.clone();
     let b = VpBackend::new(
         "vp",
         "https://proxy.example/vp",
         cfg,
-        gate,
-        siros_verifier_core::oid4vp::software_signer(v_key).unwrap(),
+        gate_over(gate_pdp),
+        siros_verifier_core::oid4vp::software_signer(&v_key).unwrap(),
         vec![v_cert],
         Arc::new(move || c2.load(Ordering::SeqCst)),
     )
-    .unwrap();
+    .unwrap()
+    .with_flow_store(store);
     Fx {
         b,
-        pdp,
+        pdp: fx_pdp,
         clock,
         holder,
         issued,
@@ -269,7 +401,16 @@ fn fx_multi_at(loyalty_level: Value, subject_pointer: &str) -> (Fx, Issued) {
     }))
     .unwrap();
     (
-        assemble(cfg, 100_000, v_cert, &v_key, holder, issued_pid),
+        assemble(
+            cfg,
+            mock_pdp(100_000, false),
+            Parts {
+                v_cert,
+                v_key,
+                holder,
+                issued: issued_pid,
+            },
+        ),
         issued_loyalty,
     )
 }
@@ -761,6 +902,233 @@ async fn replayed_wallet_response_is_rejected_and_does_not_double_deliver() {
 }
 
 #[tokio::test]
+async fn a_stalled_pdp_fails_the_flow_within_the_processing_deadline() {
+    let f = fx_stalled(1);
+    let (state, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    let (st, body) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        post(&f, &id, &wallet(&f, &jar)),
+    )
+    .await
+    .expect("the processing deadline must bound a stalled PDP");
+    assert_eq!(st, 504, "{body}");
+    let error: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(error["error"], "processing_deadline");
+    assert_eq!(
+        complete(&f, &state).await.err().unwrap(),
+        "authentication error: processing_deadline",
+        "the failure is terminal, not a hang until the lease"
+    );
+}
+
+#[tokio::test]
+async fn the_processing_budget_never_outlives_the_remaining_lease() {
+    // A claim round-trip that consumes 50 of the lease's 60 seconds leaves a
+    // five-second budget (deadline 55, minus the finalize reserve) even though
+    // the configured deadline is 55.
+    let clock = Arc::new(AtomicI64::new(T0));
+    let store = Arc::new(ClockBumpingClaimStore {
+        inner: MemoryFlowStore::default(),
+        clock: clock.clone(),
+        advance: 50,
+    });
+    let cfg = pid_cfg("/family_name", "get", Some((60, 55)), 16);
+    let f = fx_with_parts(
+        cfg,
+        mock_pdp(100_000, true),
+        mock_pdp(100_000, false),
+        store,
+        clock,
+    );
+    let (state, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    let (st, body) = tokio::time::timeout(
+        std::time::Duration::from_secs(25),
+        post(&f, &id, &wallet(&f, &jar)),
+    )
+    .await
+    .expect("the budget must collapse to the lease's remaining time");
+    assert_eq!(st, 504, "{body}");
+    let error: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(error["error"], "processing_deadline");
+    assert_eq!(
+        complete(&f, &state).await.err().unwrap(),
+        "authentication error: processing_deadline"
+    );
+
+    // With one second of lease left there is no safe processing window at
+    // all: verification is never polled, so the stalled PDP is never called.
+    let clock = Arc::new(AtomicI64::new(T0));
+    let store = Arc::new(ClockBumpingClaimStore {
+        inner: MemoryFlowStore::default(),
+        clock: clock.clone(),
+        advance: 59,
+    });
+    let cfg = pid_cfg("/family_name", "get", Some((60, 55)), 16);
+    let gate_pdp = mock_pdp(100_000, true);
+    let f = fx_with_parts(
+        cfg,
+        gate_pdp.clone(),
+        mock_pdp(100_000, false),
+        store,
+        clock,
+    );
+    let (state, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    let (st, body) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        post(&f, &id, &wallet(&f, &jar)),
+    )
+    .await
+    .expect("an exhausted window must finalize without polling");
+    assert_eq!(st, 504, "{body}");
+    assert_eq!(gate_pdp.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        complete(&f, &state).await.err().unwrap(),
+        "authentication error: processing_deadline"
+    );
+}
+
+#[tokio::test]
+async fn a_synchronous_overrun_past_the_deadline_is_not_persisted() {
+    // The PDP busy-waits two seconds: the one-second timer cannot preempt
+    // synchronous code, so the decision completes past the deadline and must
+    // not be accepted even though the lease window is still wide open.
+    let clock = Arc::new(AtomicI64::new(T0));
+    let pdp = Arc::new(BusyWaitPdp {
+        spin: std::time::Duration::from_secs(2),
+    });
+    let cfg = pid_cfg("/family_name", "get", Some((60, 1)), 16);
+    let f = fx_with_parts(
+        cfg,
+        pdp,
+        mock_pdp(100_000, false),
+        Arc::new(MemoryFlowStore::default()),
+        clock,
+    );
+    let (state, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    let (st, body) = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        post(&f, &id, &wallet(&f, &jar)),
+    )
+    .await
+    .expect("the overrun must still finish within the outer bound");
+    assert_eq!(st, 504, "{body}");
+    let error: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(error["error"], "processing_deadline");
+    assert_eq!(
+        complete(&f, &state).await.err().unwrap(),
+        "authentication error: processing_deadline"
+    );
+}
+
+#[tokio::test]
+async fn a_queued_response_aborts_without_verifying_when_admission_is_full() {
+    // Two backends share one admission slot. The holder (a 3s budget)
+    // stalls at its PDP while holding the slot; the queued response (a 1s
+    // budget on the other backend) expires while still queued — seconds
+    // before the holder can ever release — so its verification provably
+    // never starts, with no expiry-boundary race.
+    let shared = Arc::new(tokio::sync::Semaphore::new(1));
+    let holder_pdp = mock_pdp(100_000, true);
+    let mut holder = fx_with_parts(
+        pid_cfg("/family_name", "get", Some((60, 3)), 1),
+        holder_pdp.clone(),
+        mock_pdp(100_000, false),
+        Arc::new(MemoryFlowStore::default()),
+        Arc::new(AtomicI64::new(T0)),
+    );
+    holder.b = holder.b.with_verification_permits(shared.clone());
+    let queued_pdp = mock_pdp(100_000, false);
+    let mut queued = fx_with_parts(
+        pid_cfg("/family_name", "get", Some((60, 1)), 1),
+        queued_pdp.clone(),
+        mock_pdp(100_000, false),
+        Arc::new(MemoryFlowStore::default()),
+        Arc::new(AtomicI64::new(T0)),
+    );
+    queued.b = queued.b.with_verification_permits(shared.clone());
+
+    let (_s1, id1) = start(&holder).await;
+    let jar1 = fetch_jar(&holder, &id1).await;
+    let (_s2, id2) = start(&queued).await;
+    let jar2 = fetch_jar(&queued, &id2).await;
+    let jwe1 = wallet(&holder, &jar1);
+    let jwe2 = wallet(&queued, &jar2);
+    let (r1, r2) = tokio::join!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            post(&holder, &id1, &jwe1)
+        ),
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            post(&queued, &id2, &jwe2)
+        ),
+    );
+    let (st1, body1) = r1.expect("the stalled holder must still finish");
+    let (st2, body2) = r2.expect("the queued response must finish");
+    assert_eq!(st1, 504, "{body1}");
+    assert_eq!(st2, 504, "{body2}");
+    assert_eq!(
+        holder_pdp.calls.load(Ordering::SeqCst),
+        1,
+        "the admitted holder reaches its trust evaluation"
+    );
+    assert_eq!(
+        queued_pdp.calls.load(Ordering::SeqCst),
+        0,
+        "the queued response expires before the holder can release, so its verification never starts"
+    );
+    // The dead callers release their admissions: a fresh response is
+    // admitted and completes.
+    let (state, id) = start(&queued).await;
+    let jar = fetch_jar(&queued, &id).await;
+    let (st, body) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        post(&queued, &id, &wallet(&queued, &jar)),
+    )
+    .await
+    .expect("a fresh response must be admitted after its predecessors died");
+    assert_eq!(st, 200, "{body}");
+    assert!(matches!(
+        complete(&queued, &state).await.unwrap(),
+        BackendAction::AuthResponse(_)
+    ));
+}
+
+#[tokio::test]
+async fn a_decision_past_the_claims_safe_window_is_not_persisted() {
+    // The PDP answers with a permit, but only after jumping the clock to the
+    // lease deadline: the completed decision arrives past the safe window
+    // and the deadline refusal is what gets persisted.
+    let clock = Arc::new(AtomicI64::new(T0));
+    let pdp = Arc::new(ClockJumpingPdp {
+        clock: clock.clone(),
+        jump_to: T0 + 60,
+    });
+    let cfg = pid_cfg("/family_name", "get", None, 16);
+    let f = fx_with_parts(
+        cfg,
+        pdp,
+        mock_pdp(100_000, false),
+        Arc::new(MemoryFlowStore::default()),
+        clock,
+    );
+    let (state, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    let (st, body) = post(&f, &id, &wallet(&f, &jar)).await;
+    assert_eq!(st, 504, "{body}");
+    let error: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(error["error"], "processing_deadline");
+    assert_eq!(
+        complete(&f, &state).await.err().unwrap(),
+        "authentication error: processing_deadline"
+    );
+}
+
+#[tokio::test]
 async fn a_wallet_retry_recovers_a_flow_whose_runner_died_mid_processing() {
     let store = Arc::new(MemoryFlowStore::default());
     let f = fx().with_storage(store.clone());
@@ -1033,7 +1401,7 @@ fn processing_lease_is_bounded() {
         let cfg: VpBackendConfig = serde_json::from_value(json!({
             "dcql": {"credentials": [{"id": "pid", "format": "dc+sd-jwt"}]},
             "attribute_map": {}, "subject_pointer": "/family_name", "role": "r",
-            "processing_lease_secs": lease
+            "processing_lease_secs": lease, "processing_deadline_secs": 1
         }))
         .unwrap();
         backend_with_config(cfg)
@@ -1046,8 +1414,63 @@ fn processing_lease_is_bounded() {
     };
     assert!(refusal(0).contains("processing_lease_secs"));
     assert!(refusal(901).contains("processing_lease_secs"));
-    assert!(mk(1).is_ok());
+    // The deadline must stay strictly shorter than the lease and the lease
+    // must exceed the flow-store write bound, so six seconds is the smallest
+    // lease that fits.
+    assert!(mk(1).is_err());
+    assert!(mk(5).is_err());
+    assert!(mk(6).is_ok());
     assert!(mk(900).is_ok());
+}
+
+#[test]
+fn processing_deadline_is_bounded() {
+    let mk = |lease: i64, deadline: i64| {
+        let cfg: VpBackendConfig = serde_json::from_value(json!({
+            "dcql": {"credentials": [{"id": "pid", "format": "dc+sd-jwt"}]},
+            "attribute_map": {}, "subject_pointer": "/family_name", "role": "r",
+            "processing_lease_secs": lease, "processing_deadline_secs": deadline
+        }))
+        .unwrap();
+        backend_with_config(cfg)
+    };
+    let refusal = |lease: i64, deadline: i64| {
+        mk(lease, deadline)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "OK".into())
+    };
+    assert!(refusal(60, 0).contains("processing_deadline_secs"));
+    assert!(refusal(60, 901).contains("processing_deadline_secs"));
+    assert!(refusal(60, 60).contains("processing_deadline_secs"));
+    assert!(
+        refusal(60, 56).contains("processing_deadline_secs"),
+        "the deadline must leave room for the flow-store write bound"
+    );
+    assert!(mk(60, 55).is_ok());
+}
+
+#[test]
+fn verification_concurrency_is_bounded() {
+    let mk = |permits: usize| {
+        let cfg: VpBackendConfig = serde_json::from_value(json!({
+            "dcql": {"credentials": [{"id": "pid", "format": "dc+sd-jwt"}]},
+            "attribute_map": {}, "subject_pointer": "/family_name", "role": "r",
+            "max_concurrent_verifications": permits
+        }))
+        .unwrap();
+        backend_with_config(cfg)
+    };
+    let refusal = |permits: usize| {
+        mk(permits)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "OK".into())
+    };
+    assert!(refusal(0).contains("max_concurrent_verifications"));
+    assert!(refusal(513).contains("max_concurrent_verifications"));
+    assert!(mk(1).is_ok());
+    assert!(mk(512).is_ok());
 }
 
 #[test]
@@ -1364,8 +1787,9 @@ async fn one_shot(raw: &'static str) -> (String, tokio::task::JoinHandle<String>
     (url, h)
 }
 
-/// Sends a response and then leaves the connection open, so a client that
-/// collects the whole body instead of enforcing the limit early will time out.
+/// Sends `raw` (nothing at all when it is empty) and then leaves the
+/// connection open, so a client that collects the whole body instead of
+/// enforcing the limit early — or that has no request deadline — will fail.
 #[cfg(feature = "http")]
 async fn stalled_response(raw: &'static str) -> (String, tokio::task::JoinHandle<()>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1552,6 +1976,32 @@ async fn http_pdp_enforces_limits_before_end_of_body() {
         .await
         .unwrap_err();
     assert_eq!(error, "pdp response too large");
+}
+
+#[cfg(feature = "http")]
+#[tokio::test]
+async fn a_never_responding_pdp_fails_within_its_request_deadline() {
+    let (url, _handle) = stalled_response("").await;
+    let pdp = HttpPdp::new(&url, None, std::time::Duration::from_millis(150)).unwrap();
+    let error = tokio::time::timeout(std::time::Duration::from_secs(3), pdp.evaluate(&json!({})))
+        .await
+        .expect("the request deadline must bound a stalled PDP")
+        .unwrap_err();
+    assert!(error.starts_with("pdp unreachable"), "{error}");
+}
+
+#[cfg(feature = "http")]
+#[tokio::test]
+async fn a_never_responding_status_endpoint_fails_within_its_request_deadline() {
+    let (url, _handle) = https_response("", true).await;
+    let client = ReqwestStatusListClient::new_allow_invalid_certificates_for_testing(
+        std::time::Duration::from_millis(150),
+    )
+    .unwrap();
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(3), client.fetch(&url))
+        .await
+        .expect("the request deadline must bound a stalled status endpoint");
+    assert!(outcome.is_err(), "{:?}", outcome.ok());
 }
 
 #[cfg(feature = "http")]

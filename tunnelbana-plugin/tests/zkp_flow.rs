@@ -6,6 +6,9 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+mod common;
+use common::ClockBumpingClaimStore;
+
 use async_trait::async_trait;
 use jose_rs::algorithm::{JweAlgorithm, JweEncryption};
 use jose_rs::JoseHeader;
@@ -179,6 +182,27 @@ fn build_with_store(
     store: Option<Arc<dyn FlowStore>>,
     fallback: Option<Value>,
 ) -> Result<Fx, String> {
+    build_with_clock_store(
+        zcfg,
+        verifier_id,
+        store.map(|s| {
+            Arc::new(move |_: Arc<AtomicI64>| s.clone())
+                as Arc<dyn Fn(Arc<AtomicI64>) -> Arc<dyn FlowStore>>
+        }),
+        fallback,
+    )
+}
+
+/// Like [`build_with_store`], but the store factory receives the fixture
+/// clock, so a store can advance it as its operations "take" time.
+#[allow(clippy::type_complexity)]
+fn build_with_clock_store(
+    zcfg: Value,
+    verifier_id: Option<&str>,
+    store: Option<Arc<dyn Fn(Arc<AtomicI64>) -> Arc<dyn FlowStore>>>,
+    fallback: Option<Value>,
+) -> Result<Fx, String> {
+    let store_factory = store;
     let (v_cert, v_key) = self_signed_ec("verifier.example", "ES256");
     let (artifact, circuit) = zk::artifact(b"a model circuit artifact");
     let allow = Allowlist::new(&CircuitsConfig {
@@ -213,6 +237,7 @@ fn build_with_store(
         3600,
     );
     let clock = Arc::new(AtomicI64::new(T0));
+    let injected_store = store_factory.as_ref().map(|factory| factory(clock.clone()));
     let c2 = clock.clone();
     let mut zcfg = zcfg;
     if let Some(verifier_id) = verifier_id {
@@ -233,6 +258,8 @@ fn build_with_store(
         request_uri_method: "get".into(),
         auth_class_ref: cfg.auth_class_ref.clone(),
         processing_lease_secs: 60,
+        processing_deadline_secs: 45,
+        max_concurrent_verifications: 16,
     };
     let mut backend = VpBackend::new_with_zkp(
         "vp",
@@ -246,7 +273,7 @@ fn build_with_store(
         Arc::new(move || c2.load(Ordering::SeqCst)),
     )
     .map_err(|e| e.to_string())?;
-    if let Some(store) = store {
+    if let Some(store) = injected_store {
         backend = backend.with_flow_store(store).with_session_sealer(
             siros_verifier_core::session_seal::SessionSealer::from_master(&[41u8; 32], "vp")
                 .unwrap(),
@@ -476,6 +503,43 @@ async fn a_pseudonym_login_reaches_the_frontend_as_a_pairwise_subject() {
         "one issuer certificate, one trust question"
     );
     assert_eq!(f.loads.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn an_exhausted_budget_starts_no_zkp_verification() {
+    // A claim round-trip that consumes the whole safe window finalizes the
+    // refusal without polling: no trust evaluation and no circuit load —
+    // the first poll of the ZKP path would already start both.
+    let store: Arc<dyn Fn(Arc<AtomicI64>) -> Arc<dyn FlowStore>> = Arc::new(|clock| {
+        Arc::new(ClockBumpingClaimStore {
+            inner: MemoryFlowStore::default(),
+            clock,
+            advance: 59,
+        })
+    });
+    let f = build_with_clock_store(zcfg(), None, Some(store), None).unwrap();
+    let (state, id) = start(&f).await;
+    let payload = jar(&f, &id).await;
+    let (jwe, _pseudonym) =
+        wallet_body(&payload, T0, &f.issuer_cert, &key_of(&f.issuer_cert), None);
+    let (st, body) = post(&f, &id, &jwe).await;
+    assert_eq!(st, 504, "{body}");
+    let error: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(error["error"], "processing_deadline");
+    assert_eq!(
+        f.pdp.calls.load(Ordering::SeqCst),
+        0,
+        "no trust evaluation may start"
+    );
+    assert_eq!(
+        f.loads.load(Ordering::SeqCst),
+        0,
+        "no circuit may be loaded"
+    );
+    assert_eq!(
+        complete(&f, &state).await.err().unwrap(),
+        "authentication error: processing_deadline"
+    );
 }
 
 #[tokio::test]
