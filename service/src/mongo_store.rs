@@ -15,10 +15,12 @@ use mongodb::{Client, Collection, IndexModel};
 use serde::{Deserialize, Serialize};
 use siros_verifier_core_tunnelbana::{
     ClaimResult, CollectResult, FinishResult, Flow, FlowStore, FlowStoreError, Outcome,
-    StoreResult, TerminalOutcome, FLOW_SCHEMA_VERSION,
+    StoreResult, TerminalOutcome, FLOW_SCHEMA_VERSION, FLOW_STORE_WRITE_BOUND_SECS,
 };
 
-const OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
+/// The adapter reserves this bound at the end of every processing lease;
+/// the stores never take longer for one write.
+const OPERATION_TIMEOUT: Duration = Duration::from_secs(FLOW_STORE_WRITE_BOUND_SECS as u64);
 const RETENTION_INDEX: &str = "retain_at_ttl";
 const TOKEN_USE_INDEX: &str = "expires_at_ttl";
 

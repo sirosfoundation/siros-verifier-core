@@ -305,6 +305,26 @@ impl FlowStore for ClockBumpingClaimStore {
     }
 }
 
+/// A PDP that answers with a permit but first busy-waits `spin`, like a
+/// synchronous verification the async runtime cannot preempt.
+struct BusyWaitPdp {
+    spin: std::time::Duration,
+}
+
+#[async_trait]
+impl PdpClient for BusyWaitPdp {
+    async fn evaluate(&self, _request: &Value) -> Result<Value, String> {
+        let until = std::time::Instant::now() + self.spin;
+        while std::time::Instant::now() < until {
+            std::hint::spin_loop();
+        }
+        Ok(json!({"decision": true,
+                  "context": {"id": "dec-1",
+                              "trust_data": [{"registry": "etsi", "as_of": "2027-01-15T00:00:00Z",
+                                               "next_update": next_update(100_000)}]}}))
+    }
+}
+
 /// A PDP that answers with a permit but first jumps the shared clock to
 /// `jump_to`, as if the evaluation had run until then.
 struct ClockJumpingPdp {
@@ -942,19 +962,52 @@ async fn a_stalled_pdp_fails_the_flow_within_the_processing_deadline() {
 
 #[tokio::test]
 async fn the_processing_budget_never_outlives_the_remaining_lease() {
-    // A claim round-trip that consumes 8 of the lease's 10 seconds leaves a
-    // one-second budget (deadline 9, minus the finalize reserve) even though
-    // the configured deadline is 9.
+    // A claim round-trip that consumes 50 of the lease's 60 seconds leaves a
+    // five-second budget (deadline 55, minus the finalize reserve) even though
+    // the configured deadline is 55.
     let clock = Arc::new(AtomicI64::new(T0));
     let store = Arc::new(ClockBumpingClaimStore {
         inner: MemoryFlowStore::default(),
         clock: clock.clone(),
-        advance: 8,
+        advance: 50,
     });
-    let cfg = pid_cfg("/family_name", "get", Some((10, 9)));
+    let cfg = pid_cfg("/family_name", "get", Some((60, 55)));
     let f = fx_with_parts(
         cfg,
         mock_pdp(100_000, true),
+        mock_pdp(100_000, false),
+        store,
+        clock,
+    );
+    let (state, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    let (st, body) = tokio::time::timeout(
+        std::time::Duration::from_secs(25),
+        post(&f, &id, &wallet(&f, &jar)),
+    )
+    .await
+    .expect("the budget must collapse to the lease's remaining time");
+    assert_eq!(st, 504, "{body}");
+    let error: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(error["error"], "processing_deadline");
+    assert_eq!(
+        complete(&f, &state).await.err().unwrap(),
+        "authentication error: processing_deadline"
+    );
+
+    // With one second of lease left there is no safe processing window at
+    // all: verification is never polled, so the stalled PDP is never called.
+    let clock = Arc::new(AtomicI64::new(T0));
+    let store = Arc::new(ClockBumpingClaimStore {
+        inner: MemoryFlowStore::default(),
+        clock: clock.clone(),
+        advance: 59,
+    });
+    let cfg = pid_cfg("/family_name", "get", Some((60, 55)));
+    let gate_pdp = mock_pdp(100_000, true);
+    let f = fx_with_parts(
+        cfg,
+        gate_pdp.clone(),
         mock_pdp(100_000, false),
         store,
         clock,
@@ -966,7 +1019,40 @@ async fn the_processing_budget_never_outlives_the_remaining_lease() {
         post(&f, &id, &wallet(&f, &jar)),
     )
     .await
-    .expect("the budget must collapse to the lease's remaining time");
+    .expect("an exhausted window must finalize without polling");
+    assert_eq!(st, 504, "{body}");
+    assert_eq!(gate_pdp.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        complete(&f, &state).await.err().unwrap(),
+        "authentication error: processing_deadline"
+    );
+}
+
+#[tokio::test]
+async fn a_synchronous_overrun_past_the_deadline_is_not_persisted() {
+    // The PDP busy-waits two seconds: the one-second timer cannot preempt
+    // synchronous code, so the decision completes past the deadline and must
+    // not be accepted even though the lease window is still wide open.
+    let clock = Arc::new(AtomicI64::new(T0));
+    let pdp = Arc::new(BusyWaitPdp {
+        spin: std::time::Duration::from_secs(2),
+    });
+    let cfg = pid_cfg("/family_name", "get", Some((60, 1)));
+    let f = fx_with_parts(
+        cfg,
+        pdp,
+        mock_pdp(100_000, false),
+        Arc::new(MemoryFlowStore::default()),
+        clock,
+    );
+    let (state, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    let (st, body) = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        post(&f, &id, &wallet(&f, &jar)),
+    )
+    .await
+    .expect("the overrun must still finish within the outer bound");
     assert_eq!(st, 504, "{body}");
     let error: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(error["error"], "processing_deadline");
@@ -1292,10 +1378,12 @@ fn processing_lease_is_bounded() {
     };
     assert!(refusal(0).contains("processing_lease_secs"));
     assert!(refusal(901).contains("processing_lease_secs"));
-    // The deadline must stay strictly shorter than the lease, so a one-second
-    // lease can never be valid; two seconds is the smallest that fits.
+    // The deadline must stay strictly shorter than the lease and the lease
+    // must exceed the flow-store write bound, so six seconds is the smallest
+    // lease that fits.
     assert!(mk(1).is_err());
-    assert!(mk(2).is_ok());
+    assert!(mk(5).is_err());
+    assert!(mk(6).is_ok());
     assert!(mk(900).is_ok());
 }
 

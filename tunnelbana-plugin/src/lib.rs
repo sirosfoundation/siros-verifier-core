@@ -38,6 +38,7 @@ pub mod ui;
 pub use flow::{
     ClaimResult, CollectResult, FinishResult, Flow, FlowStore, FlowStoreError, MemoryFlowStore,
     Outcome, StoreResult, TerminalOutcome, FLOW_RETENTION_GRACE_SECS, FLOW_SCHEMA_VERSION,
+    FLOW_STORE_WRITE_BOUND_SECS,
 };
 use tunnelbana_core::{Error, Response, Result};
 
@@ -955,6 +956,11 @@ impl VpBackend {
                 "processing_lease_secs must be 1..=900".into(),
             ));
         }
+        if cfg.processing_lease_secs <= FLOW_STORE_WRITE_BOUND_SECS {
+            return Err(Error::Config(
+                "processing_lease_secs must exceed the flow-store write bound".into(),
+            ));
+        }
         if cfg.processing_deadline_secs <= 0 || cfg.processing_deadline_secs > 900 {
             return Err(Error::Config(
                 "processing_deadline_secs must be 1..=900".into(),
@@ -1168,19 +1174,24 @@ impl VpBackend {
         }
     }
 
-    /// Seconds reserved at the end of a lease for persisting the terminal
-    /// outcome of its claim.
-    const FINALIZE_RESERVE_SECS: i64 = 1;
+    /// Seconds reserved at the end of every lease for the single terminal
+    /// write; the stores never take longer ([`FLOW_STORE_WRITE_BOUND_SECS`]).
+    const FINALIZE_RESERVE_SECS: i64 = FLOW_STORE_WRITE_BOUND_SECS;
 
-    /// The monotonic processing budget: the configured deadline, never taking
-    /// more of the lease than leaves room to persist the terminal outcome
-    /// while the claim is still held.
-    fn processing_budget(deadline_secs: i64, lease_until: i64, now: i64) -> std::time::Duration {
+    /// The monotonic processing budget in seconds: the configured deadline,
+    /// never taking more of the lease than leaves room for the terminal
+    /// write. Zero or negative when the claim's safe window is exhausted.
+    fn processing_budget(deadline_secs: i64, lease_until: i64, now: i64) -> i64 {
         let remaining = lease_until.saturating_sub(now);
-        let secs = deadline_secs
-            .min(remaining.saturating_sub(Self::FINALIZE_RESERVE_SECS))
-            .max(1);
-        std::time::Duration::from_secs(secs as u64)
+        deadline_secs.min(remaining.saturating_sub(Self::FINALIZE_RESERVE_SECS))
+    }
+
+    /// The deadline refusal every expired budget converges on.
+    fn deadline_decision() -> Result<Decision> {
+        Decision::failed(
+            "processing_deadline",
+            Response::text(504, "processing deadline exceeded"),
+        )
     }
 
     async fn check_sd_jwt_status(
@@ -1238,29 +1249,35 @@ impl VpBackend {
         // persist the terminal outcome while this claim is still held; a
         // stalled PDP or status endpoint cannot hang a presentation.
         let lease_until = flow.lease_until;
-        let deadline = Self::processing_budget(
+        // The budget never takes more of the lease than leaves room for the
+        // terminal write; an exhausted window (budget <= 0) becomes a
+        // zero-duration timeout, so the refusal is finalized before the
+        // first poll can reach any trust or store call.
+        let budget = Self::processing_budget(
             self.cfg.processing_deadline_secs,
             lease_until,
             (self.clock)(),
         );
-        let decision =
+        let started = std::time::Instant::now();
+        let deadline = std::time::Duration::from_secs(budget.max(0) as u64);
+        let decided =
             match tokio::time::timeout(deadline, self.process_claim(ctx, id.clone(), now, flow))
                 .await
             {
-                Ok(decision) => decision?,
-                Err(_) => Decision::failed(
-                    "processing_deadline",
-                    Response::text(504, "processing deadline exceeded"),
-                )?,
+                Ok(decided) => decided?,
+                Err(_) => Self::deadline_decision()?,
             };
-        // A synchronous verification overrun can produce a decision after
-        // the claim's safe window has closed; it is never persisted, so the
-        // lease deadline failure below is the only terminal write.
+        // A synchronous verification overrun can complete the decision after
+        // the budget passed; such a decision is never accepted.
+        let decision = if started.elapsed() > deadline {
+            Self::deadline_decision()?
+        } else {
+            decided
+        };
+        // The lease guard: a decision is persisted only while the claim
+        // still owns its safe window.
         let decision = if (self.clock)() + Self::FINALIZE_RESERVE_SECS >= lease_until {
-            Decision::failed(
-                "processing_deadline",
-                Response::text(504, "processing deadline exceeded"),
-            )?
+            Self::deadline_decision()?
         } else {
             decision
         };
@@ -1324,10 +1341,19 @@ impl VpBackend {
                 .on_zkp_response(&id, z, &session, &jwe, requester, now)
                 .await;
         }
-        let verified = match oid4vp::process_response(&session, &jwe, now, &X5cLeaf) {
-            Ok(v) => v,
-            Err(e) => {
+        // Synchronous cryptographic verification runs on the blocking pool
+        // so it cannot stall the async workers polling other requests.
+        let verified = match tokio::task::spawn_blocking(move || {
+            oid4vp::process_response(&session, &jwe, now, &X5cLeaf)
+        })
+        .await
+        {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
                 return Decision::failed(e.code(), Response::text(400, "invalid response"));
+            }
+            Err(_) => {
+                return Decision::failed("verifier_error", Response::text(500, "verifier error"));
             }
         };
         // Every presented credential's issuer must be trusted; a single denial fails the flow.
