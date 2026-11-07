@@ -970,7 +970,10 @@ impl VpBackend {
         }
         if cfg.processing_lease_secs <= 0 || cfg.processing_lease_secs > 900 {
             return Err(Error::Config(
-                "processing_lease_secs must be 1..=900".into(),
+                "processing_lease_secs must be 1..=900 (the deadline \
+                 accommodation below enforces the effective minimum of the \
+                 flow-store write bound plus one second)"
+                    .into(),
             ));
         }
         // The write-bound accommodation below (deadline + bound <= lease, with
