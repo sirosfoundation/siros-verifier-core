@@ -1112,6 +1112,13 @@ impl VpBackend {
         self
     }
 
+    /// Share the verification-admission pool with other backend instances:
+    /// one admission budget across every backend that receives it.
+    pub fn with_verification_permits(mut self, permits: Arc<tokio::sync::Semaphore>) -> Self {
+        self.verification_permits = permits;
+        self
+    }
+
     /// Override the per-tenant sealing key. Shared-store deployments must construct every
     /// instance from the same high-entropy master secret and tenant name.
     pub fn with_session_sealer(mut self, sealer: SessionSealer) -> Self {

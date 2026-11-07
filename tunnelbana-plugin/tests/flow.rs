@@ -1026,53 +1026,74 @@ async fn a_synchronous_overrun_past_the_deadline_is_not_persisted() {
 
 #[tokio::test]
 async fn a_queued_response_aborts_without_verifying_when_admission_is_full() {
-    // One permit: the first response holds it while stalled at its PDP, so
-    // the second response queues on admission. When its own budget expires it
-    // is finalized without ever starting verification — the stalled PDP is
-    // called exactly once.
-    let clock = Arc::new(AtomicI64::new(T0));
-    let gate_pdp = mock_pdp(100_000, true);
-    let cfg = pid_cfg("/family_name", "get", Some((60, 1)), 1);
-    let f = fx_with_parts(
-        cfg,
-        gate_pdp.clone(),
+    // Two backends share one admission slot. The holder (a 3s budget)
+    // stalls at its PDP while holding the slot; the queued response (a 1s
+    // budget on the other backend) expires while still queued — seconds
+    // before the holder can ever release — so its verification provably
+    // never starts, with no expiry-boundary race.
+    let shared = Arc::new(tokio::sync::Semaphore::new(1));
+    let holder_pdp = mock_pdp(100_000, true);
+    let mut holder = fx_with_parts(
+        pid_cfg("/family_name", "get", Some((60, 3)), 1),
+        holder_pdp.clone(),
         mock_pdp(100_000, false),
         Arc::new(MemoryFlowStore::default()),
-        clock,
+        Arc::new(AtomicI64::new(T0)),
     );
-    let (_s1, id1) = start(&f).await;
-    let jar1 = fetch_jar(&f, &id1).await;
-    let (_s2, id2) = start(&f).await;
-    let jar2 = fetch_jar(&f, &id2).await;
-    let jwe1 = wallet(&f, &jar1);
-    let jwe2 = wallet(&f, &jar2);
+    holder.b = holder.b.with_verification_permits(shared.clone());
+    let queued_pdp = mock_pdp(100_000, false);
+    let mut queued = fx_with_parts(
+        pid_cfg("/family_name", "get", Some((60, 1)), 1),
+        queued_pdp.clone(),
+        mock_pdp(100_000, false),
+        Arc::new(MemoryFlowStore::default()),
+        Arc::new(AtomicI64::new(T0)),
+    );
+    queued.b = queued.b.with_verification_permits(shared.clone());
+
+    let (_s1, id1) = start(&holder).await;
+    let jar1 = fetch_jar(&holder, &id1).await;
+    let (_s2, id2) = start(&queued).await;
+    let jar2 = fetch_jar(&queued, &id2).await;
+    let jwe1 = wallet(&holder, &jar1);
+    let jwe2 = wallet(&queued, &jar2);
     let (r1, r2) = tokio::join!(
-        tokio::time::timeout(std::time::Duration::from_secs(10), post(&f, &id1, &jwe1)),
-        tokio::time::timeout(std::time::Duration::from_secs(10), post(&f, &id2, &jwe2)),
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            post(&holder, &id1, &jwe1)
+        ),
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            post(&queued, &id2, &jwe2)
+        ),
     );
     let (st1, body1) = r1.expect("the stalled holder must still finish");
     let (st2, body2) = r2.expect("the queued response must finish");
     assert_eq!(st1, 504, "{body1}");
     assert_eq!(st2, 504, "{body2}");
     assert_eq!(
-        gate_pdp.calls.load(Ordering::SeqCst),
+        holder_pdp.calls.load(Ordering::SeqCst),
         1,
-        "only the admitted response may reach verification"
+        "the admitted holder reaches its trust evaluation"
+    );
+    assert_eq!(
+        queued_pdp.calls.load(Ordering::SeqCst),
+        0,
+        "the queued response expires before the holder can release, so its verification never starts"
     );
     // The dead callers release their admissions: a fresh response is
-    // admitted and completes once the PDP answers again.
-    gate_pdp.stall.store(false, Ordering::SeqCst);
-    let (state, id) = start(&f).await;
-    let jar = fetch_jar(&f, &id).await;
+    // admitted and completes.
+    let (state, id) = start(&queued).await;
+    let jar = fetch_jar(&queued, &id).await;
     let (st, body) = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        post(&f, &id, &wallet(&f, &jar)),
+        post(&queued, &id, &wallet(&queued, &jar)),
     )
     .await
     .expect("a fresh response must be admitted after its predecessors died");
     assert_eq!(st, 200, "{body}");
     assert!(matches!(
-        complete(&f, &state).await.unwrap(),
+        complete(&queued, &state).await.unwrap(),
         BackendAction::AuthResponse(_)
     ));
 }
