@@ -62,13 +62,13 @@ The conformance repo owns the stack; from its checkout:
 
 ```sh
 docker build -t siros-verifier-core:local /path/to/siros-verifier-core
-npm ci && npx playwright install chromium --with-deps
+npm ci --ignore-scripts && node_modules/.bin/playwright install chrome --with-deps
 echo '127.0.0.1 localhost.emobix.co.uk conformance.example.com' | sudo tee -a /etc/hosts
 CONFORMANCE_SUITE_TAG=release-v5.3.4 SIROS_VERIFIER_CORE_IMAGE=siros-verifier-core:local \
   docker compose -f compose/siros-verifier-core.yml -f compose/go-trust.yml \
     -f compose/conformance-suite.yml up -d --remove-orphans
 VERIFIER_IMPL=core NODE_TLS_REJECT_UNAUTHORIZED=0 \
-  npx playwright test specs/conformance/oid4vp-verifier.spec.ts
+  node_modules/.bin/playwright test specs/conformance/oid4vp-verifier.spec.ts
 ```
 
 The suite's first boot is slow (its Mongo seed and Spring context); the

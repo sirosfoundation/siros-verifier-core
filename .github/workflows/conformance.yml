@@ -102,8 +102,8 @@ jobs:
       - name: Bring up the verifier stack
         working-directory: conformance-repo
         run: |
-          npm ci
-          npx playwright install chromium --with-deps
+          npm ci --ignore-scripts
+          node_modules/.bin/playwright install chrome --with-deps
           CONFORMANCE_SUITE_TAG="$CONFORMANCE_SUITE_TAG" \
             SIROS_VERIFIER_CORE_IMAGE=siros-verifier-core:local \
             docker compose \
@@ -138,7 +138,7 @@ jobs:
           VERIFIER_IMPL: core
         run: |
           export CONFORMANCE_BLACKLIST="$(cat "$GITHUB_WORKSPACE/conformance/blacklist.json" 2>/dev/null || echo '{}')"
-          npx playwright test specs/conformance/oid4vp-verifier.spec.ts
+          node_modules/.bin/playwright test specs/conformance/oid4vp-verifier.spec.ts
 
       - name: The results, as artifacts
         if: always()
