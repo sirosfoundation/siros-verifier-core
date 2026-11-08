@@ -214,8 +214,11 @@ jobs:
           VERIFIER_IMPL: core
         run: |
           # Any summary a previous attempt or retry left behind must not
-          # survive: the verdict step below demands a summary from THIS run.
+          # survive: the verdict step below demands a summary from THIS run,
+          # and the certification packages of earlier runs must not be
+          # mistakable for this one's evidence.
           rm -f conformance-results/verifier-summary.json
+          rm -f conformance-results/conformance-report-*.zip
           echo "CONFORMANCE_PLAN_STARTED=$(date +%s)" >> "$GITHUB_ENV"
           # Exported for the harness's skip interface. The pinned verifier
           # spec does not read CONFORMANCE_BLACKLIST yet (the wallet specs
@@ -271,14 +274,16 @@ jobs:
             exit 1
           fi
           echo "The plan: $TOTAL modules, $PASSED passed, $FAILED failed, $SKIPPED skipped."
-          # The EVIDENCE SET must exist too: the certification packages
-          # (per-module logs — what a human reviewing the REVIEW-completed
-          # evidence modules actually reads) and the Playwright HTML report.
-          # The upload's if-no-files-found only fails when NOTHING matches,
-          # so a partial export would otherwise pass the gate and let a tag
-          # run dispatch a release record nobody can evaluate.
-          if ! ls conformance-results/conformance-report-*.zip >/dev/null 2>&1; then
-            echo "::error::No certification-package export — the per-module logs are missing."
+          # The EVIDENCE SET must exist too, and it must be THIS attempt's:
+          # the certification package is named for the planId the summary
+          # describes, so a failed attempt's export (Playwright retries leave
+          # one behind) can never stand in for the passing retry's evidence.
+          # The Playwright HTML report is required alongside it — together
+          # they are what a human reviewing the REVIEW-completed evidence
+          # modules reads.
+          PLAN_ID=$(jq -r '.planId' "$SUMMARY")
+          if [ ! -f "conformance-results/conformance-report-${PLAN_ID}.zip" ]; then
+            echo "::error::No certification-package export for plan ${PLAN_ID} — the passing attempt's per-module logs are missing."
             exit 1
           fi
           if [ ! -f playwright-report/index.html ]; then

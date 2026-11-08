@@ -52,9 +52,11 @@ module when its own readiness checks fail, and Playwright exits 0 on skips
   nginx 302; the verifier's `/health` with a success status) — a stack that
   never comes up fails the job with the stack's logs.
 - **After the plan**: the verdict gate requires a summary **fresh from this
-  run** (any stale one is deleted first), with at least one module passed,
-  none skipped, none failed — **and the evidence set**: the per-module
-  certification packages and the Playwright HTML report, which is what a
+  run** (any stale summary and any stale certification package is deleted
+  first), with at least one module passed, none skipped, none failed —
+  **and the evidence set**: the certification package whose planId matches
+  the summary (so a failed Playwright retry's export can never stand in for
+  the passing attempt's) and the Playwright HTML report, which is what a
   human reviewing the REVIEW-completed evidence modules reads. A
   self-skipped plan leaves no summary, and a partial export fails the run
   instead of dispatching an unevaluable record.
