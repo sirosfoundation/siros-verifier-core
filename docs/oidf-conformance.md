@@ -53,8 +53,11 @@ module when its own readiness checks fail, and Playwright exits 0 on skips
   never comes up fails the job with the stack's logs.
 - **After the plan**: the verdict gate requires a summary **fresh from this
   run** (any stale one is deleted first), with at least one module passed,
-  none skipped, none failed. A self-skipped plan leaves no summary and the
-  job goes red.
+  none skipped, none failed — **and the evidence set**: the per-module
+  certification packages and the Playwright HTML report, which is what a
+  human reviewing the REVIEW-completed evidence modules reads. A
+  self-skipped plan leaves no summary, and a partial export fails the run
+  instead of dispatching an unevaluable record.
 - **During the plan**: module failures error the test step itself.
 
 So a green `OIDF verifier conformance` check certifies that every module of
