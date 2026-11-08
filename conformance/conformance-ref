@@ -1,0 +1,16 @@
+# The conformance repo (sirosfoundation/siros-conformance) revision this
+# workflow runs, PINNED to an immutable commit.
+#
+# The harness is part of the judged reference exactly like the OIDF suite
+# image: its specs, compose fixtures, and assertions define what "conformant"
+# means here, and an invisible change on its main would change the verdict
+# when the same verifier commit is rerun — despite the pinned suite image.
+# Adopt a new revision deliberately, in one PR that reads the diff between
+# the pins, the same discipline as conformance/suite-version. Bump this pin
+# in the same PR that relies on a new harness capability (for example: the
+# verifier harness's CONFORMANCE_BLACKLIST support, or its core-mode
+# publish chain).
+#
+# workflow_dispatch may override this pin for a single manual run (the
+# conformance-ref input); PR and tag runs always use this commit.
+conformance-repo-ref: f71aee4ba4a822a955e62746053bf635db1c00f0

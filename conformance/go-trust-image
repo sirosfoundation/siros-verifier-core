@@ -1,0 +1,11 @@
+# The go-trust image the conformance run trusts, PINNED by digest (never a
+# moving tag): compose/go-trust.yml defaults GO_TRUST_IMAGE to `:latest`, and
+# an invisible upstream re-push would change the trust service — and with it
+# the verdict — between two runs of the same verifier commit.
+#
+# This is the digest the current baseline run validated (always-trusted
+# registry mode, `--registry always-trusted`): the PDP whose AuthZEN answers
+# the trust gate parses. Adopt a new go-trust deliberately, in one PR that
+# reads its release notes and re-reads the parse contract in
+# tunnelbana-plugin's `parse_authzen_response`.
+go-trust-image: ghcr.io/sirosfoundation/go-trust@sha256:238f6f3adec65ec3950482c1173705a72db0a6d297f2fd1afa3a3eb3e847badc

@@ -1,0 +1,340 @@
+name: OIDF conformance (verifier)
+
+# The OpenID Foundation OID4VP verifier plan against this repository's
+# verifier: the suite acts as the wallet and drives our service as the
+# relying party (the conformance repo's VERIFIER_IMPL=core mode,
+# docs/oidf-conformance.md). The image is built from the PR's own source,
+# so every run judges exactly the code under review.
+#
+# PRs only (not pushes to main) — the suite run costs minutes the merge
+# queue does not need twice; the tag path and workflow_dispatch cover main.
+#
+# Release tags (v*) hand the report set to the conformance repo via a
+# repository_dispatch (event_type: conformance-verifier). THE PUBLISH CHAIN
+# IS PENDING ON THAT REPO'S SIDE: its verifier workflow accepts the
+# dispatch but does not yet honor verifier-impl=core, and no gh-pages
+# publish of verifier reports exists there yet — docs/oidf-conformance.md
+# tracks the follow-up. This side's contract is a well-formed, authorized
+# dispatch carrying the tag and the run URL. A PR's results stay in the
+# run's artifacts either way: a PR is a conversation, not a release.
+#
+# A GREEN CHECK MEANS THE PLAN RAN AND PASSED: the readiness waits hard-fail
+# a stack that never comes up, the harness's own self-skip is caught by a
+# post-run verdict gate (a fresh summary, modules executed, none failed), and
+# module failures error the test step itself.
+#
+# The blacklist (conformance/blacklist.json) is the intended skip interface
+# (module name → reason), seeded empty. NOTE: the pinned verifier harness
+# does not read it yet — only the wallet specs honor CONFORMANCE_BLACKLIST
+# — so entries are INERT until the conformance-ref pin bumps to a revision
+# whose verifier harness implements the same filtering the wallet specs
+# have. docs/oidf-conformance.md carries the tracking note.
+
+on:
+  pull_request:
+    paths:
+      - "src/**"
+      - "service/**"
+      - "tunnelbana-plugin/**"
+      - "zkp/**"
+      - "ffi/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "Dockerfile"
+      - ".dockerignore"
+      - "conformance/**"
+      - ".github/workflows/conformance.yml"
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      conformance-ref:
+        description: "The conformance repo ref to run (default: the pinned conformance/conformance-ref)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  # The event name isolates manual experiments (workflow_dispatch) from
+  # push-triggered release runs: a manual run against a release tag must
+  # never cancel that tag's release run — the hand-off it performs is
+  # push-only, and the experiment may not destroy the record.
+  group: conformance-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  conformance:
+    name: OIDF verifier conformance
+    # PINNED, not ubuntu-latest: the conformance repo's Playwright (1.60)
+    # ships browser builds only up to ubuntu24.04 — ubuntu-latest now rolls
+    # Ubuntu 26.04, where `playwright install` dies ("Playwright does not
+    # support ffmpeg on ubuntu26.04-x64") before any test runs. The suite
+    # itself runs in containers and never sees the host; only Playwright and
+    # the Chrome channel do. Unpin in the same PR that bumps the conformance
+    # repo's Playwright to a release with ubuntu26.04 builds, with its
+    # release notes — the same discipline as conformance/suite-version.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CONFORMANCE_URL: https://localhost.emobix.co.uk:8443/
+      VERIFIER_CONFORMANCE_URL: https://conformance.example.com:9443
+      SIROS_VERIFIER_CORE_URL: https://localhost:9443
+      # The OIDF suite's release, PINNED (never :latest) — read from
+      # conformance/suite-version, the checked-in single source; the step
+      # below exports it. Compose takes it as CONFORMANCE_SUITE_TAG for both
+      # suite images (server + nginx). Adopt a new release deliberately, with
+      # its release notes, in the same PR.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: The conformance repo ref (pinned)
+        run: |
+          REF="$(grep -oE '\b[0-9a-f]{40}\b' conformance/conformance-ref | head -1)"
+          if [ -z "$REF" ]; then
+            echo "::error::conformance/conformance-ref carries no commit SHA"
+            exit 1
+          fi
+          echo "CONFORMANCE_REPO_REF=$REF" >> "$GITHUB_ENV"
+          echo "The conformance repo (sirosfoundation/siros-conformance): $REF"
+
+      - name: Checkout the conformance repo (pinned ref)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: sirosfoundation/siros-conformance
+          # workflow_dispatch may override the pin to any ref (a branch
+          # under review on that repo, a newer commit); every other run
+          # uses the pinned, immutable commit.
+          ref: ${{ inputs.conformance-ref || env.CONFORMANCE_REPO_REF }}
+          path: conformance-repo
+
+      - name: Build the verifier image from this source
+        run: docker build -t siros-verifier-core:local .
+
+      - name: The suite's TLS hosts
+        run: |
+          echo "127.0.0.1 localhost.emobix.co.uk" | sudo tee -a /etc/hosts
+          echo "127.0.0.1 conformance.example.com" | sudo tee -a /etc/hosts
+
+      - name: The suite version (pinned, from conformance/suite-version)
+        run: |
+          TAG="$(grep -oE 'release-v[0-9.]+' conformance/suite-version | head -1)"
+          if [ -z "$TAG" ]; then
+            echo "::error::conformance/suite-version carries no release tag"
+            exit 1
+          fi
+          echo "CONFORMANCE_SUITE_TAG=$TAG" >> "$GITHUB_ENV"
+          echo "The OIDF conformance suite: $TAG"
+
+      - name: The go-trust image (pinned, from conformance/go-trust-image)
+        run: |
+          DIGEST="$(grep -oE 'ghcr\.io/sirosfoundation/go-trust@sha256:[0-9a-f]{64}' conformance/go-trust-image | head -1)"
+          if [ -z "$DIGEST" ]; then
+            echo "::error::conformance/go-trust-image carries no image digest"
+            exit 1
+          fi
+          echo "GO_TRUST_IMAGE=$DIGEST" >> "$GITHUB_ENV"
+          echo "The trust service: $DIGEST"
+
+      - name: The blacklist (module name → reason)
+        run: |
+          echo "The blacklist (entries are INERT until the pinned verifier harness reads CONFORMANCE_BLACKLIST — see docs/oidf-conformance.md):"
+          cat conformance/blacklist.json
+
+      - name: Bring up the verifier stack
+        working-directory: conformance-repo
+        run: |
+          npm ci --ignore-scripts
+          # NOTE: this installs the CURRENT google-chrome-stable (.deb) — a
+          # moving release the harness SHA and runner label do not fix
+          # (docs/oidf-conformance.md names the browser as an unpinned
+          # residual). Google publishes no versioned stable artifact; the
+          # pin is a harness-side change to the Playwright-managed chromium
+          # build, which the harness lockfile does fix.
+          node_modules/.bin/playwright install chrome --with-deps
+          CONFORMANCE_SUITE_TAG="$CONFORMANCE_SUITE_TAG" \
+            SIROS_VERIFIER_CORE_IMAGE=siros-verifier-core:local \
+            docker compose \
+              -f compose/siros-verifier-core.yml \
+              -f compose/go-trust.yml \
+              -f compose/conformance-suite.yml \
+              up -d --remove-orphans
+          # The suite's server takes its time on first boot (the Mongo seed,
+          # the Spring context); the nginx 302 is the readiness signal.
+          # BOTH WAITS ARE HARD GATES: the spec self-skips every module when
+          # either service is unavailable, so a stack that never comes up
+          # would otherwise finish green having verified nothing. Each probe
+          # is bounded by --max-time so a HUNG connection cannot stall the
+          # loop past the job budget — the wait always reaches its verdict,
+          # and the failure path (stack logs + artifacts) is always captured.
+          # If a wait expires, the step fails here — with the stack's logs as
+          # the breadcrumb — and the artifact upload (if: always()) still
+          # runs.
+          suite_up=""
+          for i in $(seq 1 60); do
+            if curl -sk --max-time 10 -o /dev/null -w '%{http_code}' "${CONFORMANCE_URL%/}/" | grep -q 302; then
+              echo "The suite is up (attempt $i)"
+              suite_up=1
+              break
+            fi
+            sleep 5
+          done
+          if [ -z "$suite_up" ]; then
+            echo "::error::The conformance suite never became ready; failing instead of running nothing."
+            docker compose \
+              -f compose/siros-verifier-core.yml \
+              -f compose/go-trust.yml \
+              -f compose/conformance-suite.yml \
+              logs --tail 80
+            exit 1
+          fi
+          # The verifier's own health endpoint gates the spec's core mode.
+          # --fail: a 4xx/5xx health response is NOT readiness.
+          verifier_up=""
+          for i in $(seq 1 30); do
+            if curl -skf --max-time 10 -o /dev/null "${SIROS_VERIFIER_CORE_URL%/}/health"; then
+              echo "The verifier is up (attempt $i)"
+              verifier_up=1
+              break
+            fi
+            sleep 5
+          done
+          if [ -z "$verifier_up" ]; then
+            echo "::error::The verifier never reported healthy; failing instead of running nothing."
+            docker compose \
+              -f compose/siros-verifier-core.yml \
+              -f compose/go-trust.yml \
+              -f compose/conformance-suite.yml \
+              logs --tail 80
+            exit 1
+          fi
+
+      - name: Run the OID4VP verifier plan (core mode)
+        working-directory: conformance-repo
+        env:
+          NODE_TLS_REJECT_UNAUTHORIZED: "0"
+          VERIFIER_IMPL: core
+        run: |
+          # Any summary a previous attempt or retry left behind must not
+          # survive: the verdict step below demands a summary from THIS run,
+          # and the certification packages of earlier runs must not be
+          # mistakable for this one's evidence.
+          rm -f conformance-results/verifier-summary.json
+          rm -f conformance-results/conformance-report-*.zip
+          echo "CONFORMANCE_PLAN_STARTED=$(date +%s)" >> "$GITHUB_ENV"
+          # Exported for the harness's skip interface. The pinned verifier
+          # spec does not read CONFORMANCE_BLACKLIST yet (the wallet specs
+          # do); entries stay inert until the conformance-ref pin bumps to
+          # a harness revision that honors them.
+          export CONFORMANCE_BLACKLIST="$(cat "$GITHUB_WORKSPACE/conformance/blacklist.json" 2>/dev/null || echo '{}')"
+          node_modules/.bin/playwright test specs/conformance/oid4vp-verifier.spec.ts
+
+      - name: "The verdict: green means modules ran and passed"
+        working-directory: conformance-repo
+        run: |
+          # The spec self-skips every module when ITS OWN readiness checks
+          # fail, and Playwright exits 0 on skips — so a green test step
+          # alone does not prove anything executed. This gate is what makes
+          # the check's meaning: a fresh summary from this run, at least one
+          # module passed, none skipped, none failed.
+          SUMMARY=conformance-results/verifier-summary.json
+          if [ ! -f "$SUMMARY" ]; then
+            echo "::error::No conformance summary was produced — the plan executed nothing."
+            exit 1
+          fi
+          if [ "$(stat -c %Y "$SUMMARY")" -lt "$CONFORMANCE_PLAN_STARTED" ]; then
+            echo "::error::The conformance summary predates this run — the plan executed nothing this time."
+            exit 1
+          fi
+          # The counters must fail closed: `jq -r` yields `null` for a
+          # missing field, and a numeric comparison on null errors out of
+          # the `if` as a no-op, letting a malformed summary pass. Validate
+          # types, integrality, and consistency up front — anything else is
+          # not a verdict this gate is willing to read.
+          if ! jq -e '
+                ([.total, .passed, .failed, .skipped]
+                  | all((. | type) == "number" and (. | floor) == .))
+                and .total == (.passed + .failed + .skipped)
+              ' "$SUMMARY" > /dev/null; then
+            echo "::error::The conformance summary's counters are missing, non-integral, or inconsistent."
+            exit 1
+          fi
+          TOTAL=$(jq -r '.total' "$SUMMARY")
+          PASSED=$(jq -r '.passed' "$SUMMARY")
+          FAILED=$(jq -r '.failed' "$SUMMARY")
+          SKIPPED=$(jq -r '.skipped' "$SUMMARY")
+          if [ "$PASSED" -lt 1 ]; then
+            echo "::error::passed=$PASSED — no module passed; the plan cannot certify anything."
+            exit 1
+          fi
+          if [ "$SKIPPED" -ne 0 ]; then
+            echo "::error::skipped=$SKIPPED — a green run means every module of the plan executed."
+            exit 1
+          fi
+          if [ "$FAILED" -ne 0 ]; then
+            echo "::error::failed=$FAILED — the plan's own exit should have caught this; the summary disagrees."
+            exit 1
+          fi
+          echo "The plan: $TOTAL modules, $PASSED passed, $FAILED failed, $SKIPPED skipped."
+          # The EVIDENCE SET must exist too, and it must be THIS attempt's:
+          # the certification package is named for the planId the summary
+          # describes, so a failed attempt's export (Playwright retries leave
+          # one behind) can never stand in for the passing retry's evidence.
+          # The Playwright HTML report is required alongside it — together
+          # they are what a human reviewing the REVIEW-completed evidence
+          # modules reads.
+          PLAN_ID=$(jq -r '.planId' "$SUMMARY")
+          if [ ! -f "conformance-results/conformance-report-${PLAN_ID}.zip" ]; then
+            echo "::error::No certification-package export for plan ${PLAN_ID} — the passing attempt's per-module logs are missing."
+            exit 1
+          fi
+          if [ ! -f playwright-report/index.html ]; then
+            echo "::error::No Playwright HTML report — the report set is incomplete."
+            exit 1
+          fi
+
+      # The archive is a HARD prerequisite of the release hand-off below: a
+      # missing file set fails this step (not a warning), so the dispatch can
+      # never fire for a run whose reports never made it to the artifact
+      # store. On failed runs the step still uploads whatever exists — a
+      # missing-file failure there only adds one more red step to a run that
+      # is already red, and "nothing was produced" is itself a diagnosis.
+      - name: The results, as artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verifier-conformance-results
+          path: |
+            conformance-repo/conformance-results/
+            conformance-repo/test-results/
+            conformance-repo/playwright-report/
+          if-no-files-found: error
+
+      # RELEASE TAG PUSHES ONLY: hand the report set to the conformance repo
+      # via a repository_dispatch — event_type: conformance-verifier, the
+      # trigger its verifier workflow listens for. Push-event-only on
+      # purpose: workflow_dispatch against a tag ref would otherwise satisfy
+      # the tag check, sending the release hand-off from a manual run whose
+      # harness pin may be overridden — manual runs are experiments, never
+      # the release record. The chain PUBLISHES NOTHING yet: that repo must
+      # first honor verifier-impl=core and add the gh-pages publish for
+      # verifier reports (tracked in docs/oidf-conformance.md); until then
+      # this dispatch lands as a (currently red) run on its side. The
+      # dispatch endpoint requires Contents: write — see
+      # docs/conformance-dispatch-token.md for the token, its exact
+      # permission, and why that grant is what it is.
+      - name: Hand the results to the conformance repo (release tags only)
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ secrets.CONFORMANCE_DISPATCH_TOKEN }}
+        run: |
+          gh api -X POST \
+            "/repos/sirosfoundation/siros-conformance/dispatches" \
+            -f event_type=conformance-verifier \
+            -f "client_payload[verifier-impl]=core" \
+            -f "client_payload[release-tag]=${GITHUB_REF_NAME}" \
+            -f "client_payload[run-url]=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"

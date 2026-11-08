@@ -10,6 +10,7 @@ This directory is for users and integrators.
 - [Examples index](../examples/README.md): explained TOML configurations for common setups and native-reader snippets.
 - [Release guide](RELEASING.md): versioned Docker images, native artifacts, SBOM, provenance, and post-release verification.
 - [Release record](../CHANGELOG.md): published testing and production releases, validation evidence, deployment notes, and rollback history.
+- [OIDF conformance](oidf-conformance.md): the OpenID Foundation OID4VP verifier plan in CI — what runs, the pinned suite, skips and evidence, and when reports publish.
 
 Additional integration-specific guides:
 
