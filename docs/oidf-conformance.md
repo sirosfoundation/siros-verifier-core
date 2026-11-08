@@ -22,28 +22,40 @@ core stack from that repo's compose files:
 | `go-trust-allow` | The suite's local allow-all go-trust stand-in (conformance fixtures only; never a real trust decision) |
 | `siros-verifier-core` | This repository's verifier, built from the PR's source, on MongoDB, behind the suite-facing nginx at `https://conformance.example.com:9443` |
 
-The verdict is judged against a **fully pinned reference** — three pins,
+The verdict is judged against a **fully pinned reference** — four pins,
 each bumped deliberately in its own PR, never left to drift:
 
 | Pin | File | What it fixes |
 | --- | --- | --- |
 | The OIDF suite release | `conformance/suite-version` | The suite's server + nginx images (never `latest`) |
 | The harness revision | `conformance/conformance-ref` | The conformance repo's exact commit — its specs, compose fixtures, and assertions define what "conformant" means here |
+| The trust service image | `conformance/go-trust-image` | go-trust by immutable digest — the PDP whose answers the trust gate receipts (compose defaults to `:latest`, which drifts) |
 | The runner image | `runs-on` in the workflow | `ubuntu-24.04`, the newest host platform the pinned Playwright (1.60) ships browser builds for; unpinned when that bumps |
 
-An invisible change to any of the three would change the verdict when the
-same verifier commit is rerun. Adopt a new suite release or harness
-revision in one PR that reads the diff and the release notes.
+An invisible change to any of the four would change the verdict when the
+same verifier commit is rerun. Adopt a new suite release, harness revision,
+or trust-service digest in one PR that reads the diff and the release
+notes.
 
-## Readiness is a hard gate
+## What a green check means
 
-The spec self-skips every module when either the suite or the verifier is
-unavailable — a stack that never comes up would otherwise finish green
-having verified nothing. The workflow therefore **fails the job** when
-either readiness wait expires (the suite's nginx 302; the verifier's
-`/health` with a success status), leaving the stack's logs and the run's
-artifacts as the diagnosis. A green `OIDF verifier conformance` check means
-modules actually executed.
+Nothing in this check is green by accident. The spec self-skips every
+module when its own readiness checks fail, and Playwright exits 0 on skips
+— so the workflow makes "green" mean something:
+
+- **Before the plan**: both readiness waits are hard gates (the suite's
+  nginx 302; the verifier's `/health` with a success status) — a stack that
+  never comes up fails the job with the stack's logs.
+- **After the plan**: the verdict gate requires a summary **fresh from this
+  run** (any stale one is deleted first), with at least one module passed,
+  none skipped, none failed. A self-skipped plan leaves no summary and the
+  job goes red.
+- **During the plan**: module failures error the test step itself.
+
+So a green `OIDF verifier conformance` check certifies that every module of
+the plan executed against this exact code, suite, harness, trust service,
+and runner image — and every applicable module passed (REVIEW-completed
+evidence modules count as passed; see below).
 
 ## Skips and evidence
 
@@ -89,6 +101,7 @@ The conformance repo owns the stack; from its checkout:
 docker build -t siros-verifier-core:local /path/to/siros-verifier-core
 npm ci --ignore-scripts && node_modules/.bin/playwright install chrome --with-deps
 echo '127.0.0.1 localhost.emobix.co.uk conformance.example.com' | sudo tee -a /etc/hosts
+GO_TRUST_IMAGE="$(grep -oE 'ghcr\.io/sirosfoundation/go-trust@sha256:[0-9a-f]{64}' /path/to/siros-verifier-core/conformance/go-trust-image)" \
 CONFORMANCE_SUITE_TAG=release-v5.3.4 SIROS_VERIFIER_CORE_IMAGE=siros-verifier-core:local \
   docker compose -f compose/siros-verifier-core.yml -f compose/go-trust.yml \
     -f compose/conformance-suite.yml up -d --remove-orphans

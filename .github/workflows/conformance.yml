@@ -18,6 +18,11 @@ name: OIDF conformance (verifier)
 # dispatch carrying the tag and the run URL. A PR's results stay in the
 # run's artifacts either way: a PR is a conversation, not a release.
 #
+# A GREEN CHECK MEANS THE PLAN RAN AND PASSED: the readiness waits hard-fail
+# a stack that never comes up, the harness's own self-skip is caught by a
+# post-run verdict gate (a fresh summary, modules executed, none failed), and
+# module failures error the test step itself.
+#
 # The blacklist (conformance/blacklist.json) is the intended skip interface
 # (module name → reason), seeded empty. NOTE: the pinned verifier harness
 # does not read it yet — only the wallet specs honor CONFORMANCE_BLACKLIST
@@ -34,7 +39,9 @@ on:
       - "zkp/**"
       - "ffi/**"
       - "Cargo.lock"
+      - "Cargo.toml"
       - "Dockerfile"
+      - ".dockerignore"
       - "conformance/**"
       - ".github/workflows/conformance.yml"
   push:
@@ -119,6 +126,16 @@ jobs:
           echo "CONFORMANCE_SUITE_TAG=$TAG" >> "$GITHUB_ENV"
           echo "The OIDF conformance suite: $TAG"
 
+      - name: The go-trust image (pinned, from conformance/go-trust-image)
+        run: |
+          DIGEST="$(grep -oE 'ghcr\.io/sirosfoundation/go-trust@sha256:[0-9a-f]{64}' conformance/go-trust-image | head -1)"
+          if [ -z "$DIGEST" ]; then
+            echo "::error::conformance/go-trust-image carries no image digest"
+            exit 1
+          fi
+          echo "GO_TRUST_IMAGE=$DIGEST" >> "$GITHUB_ENV"
+          echo "The trust service: $DIGEST"
+
       - name: The blacklist (module name → reason)
         run: |
           echo "The blacklist (entries are INERT until the pinned verifier harness reads CONFORMANCE_BLACKLIST — see docs/oidf-conformance.md):"
@@ -188,12 +205,51 @@ jobs:
           NODE_TLS_REJECT_UNAUTHORIZED: "0"
           VERIFIER_IMPL: core
         run: |
+          # Any summary a previous attempt or retry left behind must not
+          # survive: the verdict step below demands a summary from THIS run.
+          rm -f conformance-results/verifier-summary.json
+          echo "CONFORMANCE_PLAN_STARTED=$(date +%s)" >> "$GITHUB_ENV"
           # Exported for the harness's skip interface. The pinned verifier
           # spec does not read CONFORMANCE_BLACKLIST yet (the wallet specs
           # do); entries stay inert until the conformance-ref pin bumps to
           # a harness revision that honors them.
           export CONFORMANCE_BLACKLIST="$(cat "$GITHUB_WORKSPACE/conformance/blacklist.json" 2>/dev/null || echo '{}')"
           node_modules/.bin/playwright test specs/conformance/oid4vp-verifier.spec.ts
+
+      - name: "The verdict: green means modules ran and passed"
+        working-directory: conformance-repo
+        run: |
+          # The spec self-skips every module when ITS OWN readiness checks
+          # fail, and Playwright exits 0 on skips — so a green test step
+          # alone does not prove anything executed. This gate is what makes
+          # the check's meaning: a fresh summary from this run, at least one
+          # module passed, none skipped, none failed.
+          SUMMARY=conformance-results/verifier-summary.json
+          if [ ! -f "$SUMMARY" ]; then
+            echo "::error::No conformance summary was produced — the plan executed nothing."
+            exit 1
+          fi
+          if [ "$(stat -c %Y "$SUMMARY")" -lt "$CONFORMANCE_PLAN_STARTED" ]; then
+            echo "::error::The conformance summary predates this run — the plan executed nothing this time."
+            exit 1
+          fi
+          TOTAL=$(jq -r '.total' "$SUMMARY")
+          PASSED=$(jq -r '.passed' "$SUMMARY")
+          FAILED=$(jq -r '.failed' "$SUMMARY")
+          SKIPPED=$(jq -r '.skipped' "$SUMMARY")
+          if [ "$PASSED" -lt 1 ]; then
+            echo "::error::passed=$PASSED — no module passed; the plan cannot certify anything."
+            exit 1
+          fi
+          if [ "$SKIPPED" -ne 0 ]; then
+            echo "::error::skipped=$SKIPPED — a green run means every module of the plan executed."
+            exit 1
+          fi
+          if [ "$FAILED" -ne 0 ]; then
+            echo "::error::failed=$FAILED — the plan's own exit should have caught this; the summary disagrees."
+            exit 1
+          fi
+          echo "The plan: $TOTAL modules, $PASSED passed, $FAILED failed, $SKIPPED skipped."
 
       - name: The results, as artifacts
         if: always()
@@ -206,17 +262,21 @@ jobs:
             conformance-repo/playwright-report/
           if-no-files-found: warn
 
-      # RELEASE TAGS ONLY: hand the report set to the conformance repo via a
-      # repository_dispatch — event_type: conformance-verifier, the trigger
-      # its verifier workflow listens for. The chain PUBLISHES NOTHING yet:
-      # that repo must first honor verifier-impl=core and add the gh-pages
-      # publish for verifier reports (tracked in docs/oidf-conformance.md);
-      # until then this dispatch lands as a (currently red) run on its side.
-      # The dispatch endpoint requires Contents: write — see
+      # RELEASE TAG PUSHES ONLY: hand the report set to the conformance repo
+      # via a repository_dispatch — event_type: conformance-verifier, the
+      # trigger its verifier workflow listens for. Push-event-only on
+      # purpose: workflow_dispatch against a tag ref would otherwise satisfy
+      # the tag check, sending the release hand-off from a manual run whose
+      # harness pin may be overridden — manual runs are experiments, never
+      # the release record. The chain PUBLISHES NOTHING yet: that repo must
+      # first honor verifier-impl=core and add the gh-pages publish for
+      # verifier reports (tracked in docs/oidf-conformance.md); until then
+      # this dispatch lands as a (currently red) run on its side. The
+      # dispatch endpoint requires Contents: write — see
       # docs/conformance-dispatch-token.md for the token, its exact
       # permission, and why that grant is what it is.
       - name: Hand the results to the conformance repo (release tags only)
-        if: github.ref_type == 'tag'
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ secrets.CONFORMANCE_DISPATCH_TOKEN }}
         run: |
