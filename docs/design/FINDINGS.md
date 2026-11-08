@@ -336,15 +336,16 @@ The status list token's claims are now held to Token Status List **draft-ietf-oa
 (§5.1, §8.3) exactly, with the OIDF suite's own live tokens as the compatibility oracle (decoded from
 the first green conformance run's artifact):
 
-- **`sub` ↔ reference-URI binding, enforced at both boundaries.** The binding existed at the
-  lookup (`status_at`) — after the signer trust query had already approved the token. It is now
-  added at the token-validation boundary too (`verify_token`, in §8.3's processing order), so a
-  mismatched list is rejected before signer trust is even asked, fail-closed for every
-  `verify_token` consumer. The `status_at` guard stays: it is not a duplicate but the public
-  lookup's own contract — the bit read for a reference must come from the list that reference
-  names, whichever boundary the caller came from. The security property: a signer operating many
-  lists must not have a different list — one where a credential's index reads `0` — speak for a
-  credential that referenced another.
+- **`sub` ↔ reference-URI binding, extended to every `verify_token` consumer.** The binding
+  existed only at the lookup (`status_at`), which on the plugin's pipeline already ran before the
+  signer trust query — so the plugin path was covered. The change adds the binding to the
+  `verify_token` boundary itself (§8.3's processing order at token validation), so every consumer
+  — not only ones that go on to call `status_at` with the matched reference — rejects a
+  mismatched list by default, fail-closed at the API boundary. The `status_at` guard stays: it is
+  not a duplicate but the public lookup's own contract — the bit read for a reference must come
+  from the list that reference names, whichever boundary the caller came from. The security
+  property: a signer operating many lists must not have a different list — one where a
+  credential's index reads `0` — speak for a credential that referenced another.
 - **`iat` is required.** §5.1 marks it REQUIRED; the verifier previously accepted lists with no
   issuance instant at all. Present-but-malformed values were already rejected; absence now is too.
   The future bound (`> now + 60`) stays.
