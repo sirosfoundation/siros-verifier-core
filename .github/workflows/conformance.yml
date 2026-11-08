@@ -55,7 +55,15 @@ env:
 jobs:
   conformance:
     name: OIDF verifier conformance
-    runs-on: ubuntu-latest
+    # PINNED, not ubuntu-latest: the conformance repo's Playwright (1.60)
+    # ships browser builds only up to ubuntu24.04 — ubuntu-latest now rolls
+    # Ubuntu 26.04, where `playwright install` dies ("Playwright does not
+    # support ffmpeg on ubuntu26.04-x64") before any test runs. The suite
+    # itself runs in containers and never sees the host; only Playwright and
+    # the Chrome channel do. Unpin in the same PR that bumps the conformance
+    # repo's Playwright to a release with ubuntu26.04 builds, with its
+    # release notes — the same discipline as conformance/suite-version.
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
       CONFORMANCE_URL: https://localhost.emobix.co.uk:8443/
