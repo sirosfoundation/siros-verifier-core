@@ -149,6 +149,12 @@ jobs:
         working-directory: conformance-repo
         run: |
           npm ci --ignore-scripts
+          # NOTE: this installs the CURRENT google-chrome-stable (.deb) — a
+          # moving release the harness SHA and runner label do not fix
+          # (docs/oidf-conformance.md names the browser as an unpinned
+          # residual). Google publishes no versioned stable artifact; the
+          # pin is a harness-side change to the Playwright-managed chromium
+          # build, which the harness lockfile does fix.
           node_modules/.bin/playwright install chrome --with-deps
           CONFORMANCE_SUITE_TAG="$CONFORMANCE_SUITE_TAG" \
             SIROS_VERIFIER_CORE_IMAGE=siros-verifier-core:local \

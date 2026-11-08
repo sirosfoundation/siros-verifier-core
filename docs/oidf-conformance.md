@@ -22,8 +22,9 @@ core stack from that repo's compose files:
 | `go-trust-allow` | The suite's local allow-all go-trust stand-in (conformance fixtures only; never a real trust decision) |
 | `siros-verifier-core` | This repository's verifier, built from the PR's source, on MongoDB, behind the suite-facing nginx at `https://conformance.example.com:9443` |
 
-The verdict is judged against a **fully pinned reference** — four pins,
-each bumped deliberately in its own PR, never left to drift:
+The verdict is judged against a **pinned reference** — four pins, each
+bumped deliberately in its own PR, never left to drift, with the two
+residual inputs named below it:
 
 | Pin | File | What it fixes |
 | --- | --- | --- |
@@ -37,10 +38,20 @@ same verifier commit is rerun. Adopt a new suite release, harness revision,
 or trust-service digest in one PR that reads the diff and the release
 notes.
 
-One residual rides inside the harness pin: the compose files it pins
-declare the stack's auxiliary images by tag (`mongo:7.0`,
-`nginx:1.29-alpine`), so those can drift within their tag. Digest-pinning
+Two residuals ride inside the harness pin. First, the compose files it
+pins declare the stack's auxiliary images by tag (`mongo:7.0`,
+`nginx:1.29-alpine`), so those can drift within their tag; digest-pinning
 them belongs to the conformance repo, where the compose files live.
+Second, the browser: the harness launches `channel: 'chrome'`, and
+Playwright's chrome-channel installer fetches
+`google-chrome-stable_current_amd64.deb` — a moving release that neither
+the harness SHA nor the runner label fixes (in one observed run the
+installer upgraded the runner's Chrome 156 to 157 mid-job). Google
+publishes no versioned stable artifact to pin against; the fix is a
+harness-side change (launching the Playwright-managed chromium build,
+which IS fixed by the harness's lockfile) or a versioned browser source.
+Until then, the browser is a documented, unpinned input — the four pins
+above fix everything else.
 
 ## What a green check means
 
@@ -82,14 +93,16 @@ When that lands, a blacklisted module is absent from the run, not
 run-and-ignored, and the summary records the skip with its reason. Until
 then: do not add entries expecting them to work.
 
-Some modules ask for evidence the suite cannot generate itself (a
-screenshot, a policy statement); the spec uploads the suite's placeholder
-evidence for those and they complete as REVIEW rather than PASS — the same
-placeholder regardless of whether the outcome was acceptance or refusal,
-so REVIEW completion is a request for human review, not evidence of
-anything by itself. The verdict to read is "every applicable module PASSED
-or REVIEW with its refusal verified" — and the verifying is the human
-part: read the report set the gate guarantees exists.
+Some modules ask for evidence the suite cannot generate itself. In this
+harness's core mode the spec does not upload a placeholder: it waits for
+the verifier's flow to reach its terminal state, opens the verifier's own
+completion page (`/vp/complete`), and uploads a full-page screenshot of
+what that page actually shows as the module's image evidence. Those
+modules complete as REVIEW rather than PASS — the real screenshot and the
+per-module logs are exactly what a human reviews to confirm the expected
+acceptance or refusal. The verdict to read is "every applicable module
+PASSED or REVIEW with its refusal verified" — and the verifying is the
+human part: read the report set the gate guarantees exists.
 
 ## When reports publish
 
