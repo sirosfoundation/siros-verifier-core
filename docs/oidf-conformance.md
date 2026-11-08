@@ -84,9 +84,12 @@ then: do not add entries expecting them to work.
 
 Some modules ask for evidence the suite cannot generate itself (a
 screenshot, a policy statement); the spec uploads the suite's placeholder
-evidence for those and they complete as REVIEW rather than PASS. The
-verdict to read is "every applicable module PASSED or REVIEW with its
-refusal verified".
+evidence for those and they complete as REVIEW rather than PASS — the same
+placeholder regardless of whether the outcome was acceptance or refusal,
+so REVIEW completion is a request for human review, not evidence of
+anything by itself. The verdict to read is "every applicable module PASSED
+or REVIEW with its refusal verified" — and the verifying is the human
+part: read the report set the gate guarantees exists.
 
 ## When reports publish
 
