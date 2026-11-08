@@ -154,6 +154,8 @@ M = [
  ("tb", 'Some(Value::String(s)) if !s.is_empty() => s.clone(),', 'Some(Value::String(s)) => s.clone(),', "plugin empty decision id"),
  ("tb", 'Some(_) => return Err("pdp_context_id_invalid".into()),', 'Some(_) => "x".into(),', "plugin invalid decision id"),
  ("tb", 'as_of: ts("as_of")?,', 'as_of: Some(ts("as_of")?.ok_or("trust_data_as_of_missing")?),', "plugin trust data as_of optional"),
+ ("tb", 'let Value::Object(fields) = entry else {\n                return Err("trust_data_entry_not_object".into());\n            };', 'let Value::Object(fields) = entry else {\n                continue;\n            };', "plugin trust data entry is object"),
+ ("tb", 'Some(_) => Err("trust_data_timestamp_not_string".into()),', 'Some(_) => Ok(None),', "plugin trust data timestamp is string"),
  ("tb", 'max_ttl: if answer.trust_data.is_empty() {\n                self.max_ttl.min(self.no_freshness_ttl)\n            } else {\n                self.max_ttl\n            },', 'max_ttl: self.max_ttl,', "plugin no-freshness lifetime cap"),
  ("tb", 'if url.scheme() != "https" && !(url.scheme() == "http" && (loopback || allow_http)) {', 'if false {', "plugin pdp scheme"),
  ("tb", 'let loopback = matches!(\n            url.host_str(),\n            Some("127.0.0.1") | Some("localhost") | Some("[::1]")\n        );', 'let loopback = true;', "plugin pdp loopback only"),

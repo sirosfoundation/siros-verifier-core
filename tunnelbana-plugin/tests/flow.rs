@@ -1566,6 +1566,21 @@ fn authzen_response_parsing_is_strict() {
         &json!({"decision": true, "context": {"id": "d", "trust_data": [{"as_of": "garbage"}]}})
     )
     .is_err());
+    assert!(
+        parse_authzen_response(&json!({"decision": true, "context": {"id": "d", "trust_data": [{"as_of": 1790000000}]}})).is_err(),
+        "a non-string timestamp is malformed, not absent"
+    );
+    assert!(
+        parse_authzen_response(&json!({"decision": true, "context": {"id": "d", "trust_data": [{"next_update": 1790000000}]}})).is_err(),
+        "the same rule holds for next_update"
+    );
+    assert!(
+        parse_authzen_response(
+            &json!({"decision": true, "context": {"id": "d", "trust_data": [null]}})
+        )
+        .is_err(),
+        "a non-object trust_data entry is malformed, not empty evidence"
+    );
 }
 
 #[tokio::test]
