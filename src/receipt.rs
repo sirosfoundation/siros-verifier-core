@@ -106,7 +106,10 @@ pub fn req_sha256(request: &Value) -> Result<String> {
 #[derive(Clone, Debug)]
 pub struct TrustData {
     pub registry: String,
-    pub as_of: i64,
+    /// When the registry's answer was current, when the registry states one.
+    /// go-trust's always-trusted registry carries no timestamps at all, so the
+    /// instant is recorded in the receipt as `null`, exactly as received.
+    pub as_of: Option<i64>,
     pub next_update: Option<i64>,
 }
 

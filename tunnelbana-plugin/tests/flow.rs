@@ -23,14 +23,23 @@ const T0: i64 = 1_800_000_000;
 /// A permit as a real go-trust (b0ec45c, whitelist registry) returned it on 2026-10-26.
 const REAL_PERMIT: &str = r#"{"decision":true,"context":{"reason":{"matched_list":"pid","registry":"wl","requested_credential_types":["urn:eudi:pid:1"],"resolution_ms":7,"role":"pid-provider","trust_path":"system_ca_pinned_hash","type":"whitelist","user":"trusted via whitelist (pid, pinned certificate hash, no chain validation)"},"trust_metadata":{"matched_list":"pid","registry":"wl","trust_framework":"whitelist","trust_path":"system_ca_pinned_hash"}}}"#;
 const REAL_DENY: &str = r#"{"decision":false,"context":{"reason":{"error":"no registry returned positive match","registries_queried":1,"registry_results":[{"decision":false,"duration_ms":0,"reason":{"admin":"subject not in whitelist for action 'other-role'","error":"subject not in whitelist for action 'other-role'","registry":"wl","type":"whitelist","user":"subject not in whitelist for action 'other-role'"},"registry":"wl"}]}}}"#;
+/// go-trust's always-trusted registry (`--registry always-trusted`), captured
+/// live: an id, a reason object, and a `trust_data` entry WITHOUT timestamps —
+/// the shape the conformance stack's PDP answers with. The whitelist's
+/// REAL_PERMIT above predates it and carries neither id nor trust_data.
+const REAL_ALWAYS_TRUSTED: &str = r#"{"decision":true,"context":{"id":"56e68ce4-6af0-45a0-a426-e4af9068fcc2","reason":{"registry":"always-trusted","resolution_ms":0,"type":"always_trusted","warning":"This registry always returns trusted - do not use in production"},"trust_data":[{"registry":"always-trusted"}]}}"#;
 
 struct MockPdp {
     permit: AtomicBool,
     down: AtomicBool,
     calls: AtomicUsize,
     next_update_in: i64,
-    /// Answer exactly as go-trust does today: no context.id, no trust_data.
+    /// Answer as go-trust's whitelist does (captured REAL_PERMIT): no
+    /// context.id, no trust_data.
     go_trust_today: AtomicBool,
+    /// Answer as go-trust's always-trusted registry does (captured
+    /// REAL_ALWAYS_TRUSTED): id, reason, and timestamp-less trust_data.
+    go_trust_always_trusted: AtomicBool,
     /// Accept the request and never answer, like a stalled endpoint.
     stall: AtomicBool,
 }
@@ -53,6 +62,9 @@ impl PdpClient for MockPdp {
         );
         if self.go_trust_today.load(Ordering::SeqCst) {
             return Ok(serde_json::from_str(REAL_PERMIT).unwrap());
+        }
+        if self.go_trust_always_trusted.load(Ordering::SeqCst) {
+            return Ok(serde_json::from_str(REAL_ALWAYS_TRUSTED).unwrap());
         }
         assert_eq!(req["resource"]["type"], "x5c");
         Ok(json!({"decision": self.permit.load(Ordering::SeqCst),
@@ -230,6 +242,7 @@ fn mock_pdp(next_update_in: i64, stall: bool) -> Arc<MockPdp> {
         calls: AtomicUsize::new(0),
         next_update_in,
         go_trust_today: AtomicBool::new(false),
+        go_trust_always_trusted: AtomicBool::new(false),
         stall: AtomicBool::new(stall),
     })
 }
@@ -1528,7 +1541,7 @@ fn authzen_response_parsing_is_strict() {
     let a = parse_authzen_response(&ok).unwrap();
     assert!(a.decision);
     assert_eq!(
-        a.trust_data[0].next_update.unwrap() - a.trust_data[0].as_of,
+        a.trust_data[0].next_update.unwrap() - a.trust_data[0].as_of.unwrap(),
         86400
     );
     assert!(
@@ -1543,11 +1556,31 @@ fn authzen_response_parsing_is_strict() {
         parse_authzen_response(&json!({"decision": true, "context": {"id": ""}})).is_err(),
         "an empty id is malformed, not absent"
     );
-    assert!(parse_authzen_response(&json!({"decision": true, "context": {"id": "d", "trust_data": [{"next_update": "2027-01-16T00:00:00Z"}]}})).is_err());
+    let bounded = parse_authzen_response(&json!({"decision": true, "context": {"id": "d", "trust_data": [{"next_update": "2027-01-16T00:00:00Z"}]}})).unwrap();
+    assert_eq!(bounded.trust_data[0].as_of, None);
+    assert_eq!(
+        bounded.trust_data[0].next_update, a.trust_data[0].next_update,
+        "a registry may bound validity without stating when its data was taken"
+    );
     assert!(parse_authzen_response(
         &json!({"decision": true, "context": {"id": "d", "trust_data": [{"as_of": "garbage"}]}})
     )
     .is_err());
+    assert!(
+        parse_authzen_response(&json!({"decision": true, "context": {"id": "d", "trust_data": [{"as_of": 1790000000}]}})).is_err(),
+        "a non-string timestamp is malformed, not absent"
+    );
+    assert!(
+        parse_authzen_response(&json!({"decision": true, "context": {"id": "d", "trust_data": [{"next_update": 1790000000}]}})).is_err(),
+        "the same rule holds for next_update"
+    );
+    assert!(
+        parse_authzen_response(
+            &json!({"decision": true, "context": {"id": "d", "trust_data": [null]}})
+        )
+        .is_err(),
+        "a non-object trust_data entry is malformed, not empty evidence"
+    );
 }
 
 #[tokio::test]
@@ -1617,6 +1650,25 @@ fn real_go_trust_answers_parse_without_id_or_freshness() {
     // local ids are unique per answer
     let again = parse_authzen_response(&serde_json::from_str(REAL_PERMIT).unwrap()).unwrap();
     assert_ne!(p.id, again.id);
+}
+
+#[test]
+fn real_always_trusted_answers_parse_with_timestampless_trust_data() {
+    // Captured live from the conformance stack's PDP. The first live run of
+    // the OIDF plan 503'd every crypto-valid presentation because the parser
+    // demanded an `as_of` per trust_data entry; this body must parse, with
+    // the absent timestamps recorded as `None` rather than rejected.
+    let a = parse_authzen_response(&serde_json::from_str(REAL_ALWAYS_TRUSTED).unwrap()).unwrap();
+    assert!(a.decision);
+    assert_eq!(a.id, "56e68ce4-6af0-45a0-a426-e4af9068fcc2");
+    assert_eq!(a.trust_data.len(), 1);
+    assert_eq!(a.trust_data[0].registry, "always-trusted");
+    assert_eq!(a.trust_data[0].as_of, None);
+    assert_eq!(a.trust_data[0].next_update, None);
+    assert!(
+        !a.reasons.is_empty(),
+        "the reason object's keys are the reasons"
+    );
 }
 
 #[tokio::test]
@@ -1715,6 +1767,40 @@ async fn without_freshness_data_the_receipt_is_capped_at_the_default_lifetime() 
     let (_s, id) = start(&f).await;
     let jar = fetch_jar(&f, &id).await;
     assert_eq!(post(&f, &id, &wallet(&f, &jar)).await.0, 503);
+}
+
+#[tokio::test]
+async fn a_permit_over_timestampless_trust_data_still_completes_the_flow() {
+    // go-trust's always-trusted registry reports trust_data without any
+    // timestamps. That is trust data with no freshness bound, so the permit
+    // must parse, the receipt must record the absent instants as null, and
+    // the receipt lives the tenant ceiling — unlike the no-trust_data case
+    // above, which the conservative default lifetime caps.
+    let f = fx();
+    f.pdp.go_trust_always_trusted.store(true, Ordering::SeqCst);
+    let (s, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    assert_eq!(post(&f, &id, &wallet(&f, &jar)).await.0, 200);
+    assert!(matches!(
+        complete(&f, &s).await.unwrap(),
+        BackendAction::AuthResponse(_)
+    ));
+    // The receipt (tenant ceiling 3600, not the 300 default) covers a second
+    // login while the PDP is down.
+    f.pdp.down.store(true, Ordering::SeqCst);
+    f.clock.store(T0 + 400, Ordering::SeqCst);
+    let (s, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    assert_eq!(post(&f, &id, &wallet(&f, &jar)).await.0, 200);
+    assert!(matches!(
+        complete(&f, &s).await.unwrap(),
+        BackendAction::AuthResponse(_)
+    ));
+    assert_eq!(
+        f.pdp.calls.load(Ordering::SeqCst),
+        1,
+        "the second login rides the receipt, not the (down) PDP"
+    );
 }
 
 /// Against a real go-trust. Skipped unless GT_URL (evaluation endpoint) and GT_REQUEST_DIR are set:

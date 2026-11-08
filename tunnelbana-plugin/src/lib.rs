@@ -568,7 +568,7 @@ pub struct TrustGate {
     aud: String,
     pdp_id: String,
     max_ttl: i64,
-    /// Lifetime cap when the PDP reports no `trust_data` (today's go-trust): nothing bounds the receipt except this.
+    /// Lifetime cap when the PDP reports no `trust_data`: nothing bounds the receipt except this.
     no_freshness_ttl: i64,
     cache: Mutex<Cache>,
 }
@@ -663,9 +663,14 @@ impl TrustGate {
     }
 }
 
-/// AuthZEN response -> [`PdpAnswer`]. `decision` must be a boolean. Everything in `context` is optional, because
-/// go-trust today returns neither `context.id` nor `trust_data`: a missing id gets a local one (`local-...`), and
-/// missing freshness data is handled by the gate's conservative default lifetime, not by guessing here.
+/// AuthZEN response -> [`PdpAnswer`]. `decision` must be a boolean. Everything in `context` is optional, and so is
+/// every timestamp inside `trust_data`: go-trust registries differ — its whitelist answers with no `context.id` and
+/// no `trust_data`, and its always-trusted registry answers with an id, a reason, and a `trust_data` entry that
+/// carries no timestamps. What is present must be well-formed: an id must be a non-empty string, a `trust_data`
+/// entry must be an object, and a timestamp must be a string that parses — a present value of the wrong type is
+/// malformed, never silently absent. Lifetime is the gate's call, not this parser's: an answer with no `trust_data`
+/// at all gets the gate's conservative default lifetime, while timestamp-less entries are still trust data and the
+/// receipt lives the tenant ceiling, clamped by any `next_update` that is present.
 pub fn parse_authzen_response(v: &Value) -> std::result::Result<PdpAnswer, String> {
     let decision = v
         .get("decision")
@@ -682,21 +687,33 @@ pub fn parse_authzen_response(v: &Value) -> std::result::Result<PdpAnswer, Strin
         .and_then(|c| c.get("trust_data"))
         .and_then(Value::as_array)
     {
-        for t in a {
-            let ts = |k: &str| {
-                t.get(k)
-                    .and_then(Value::as_str)
-                    .map(siros_verifier_core::mdoc::parse_utc)
-                    .transpose()
-                    .map_err(|e| e.to_string())
+        for entry in a {
+            // An entry that is not an object is malformed evidence, not empty
+            // evidence: reject the whole answer rather than receipt a
+            // placeholder entry.
+            let Value::Object(fields) = entry else {
+                return Err("trust_data_entry_not_object".into());
+            };
+            // A timestamp may be omitted (go-trust's always-trusted registry
+            // carries none), but one that is present must be a string that
+            // parses — a present non-string value is malformed, not absent,
+            // the same distinction the context.id check makes.
+            let ts = |k: &str| -> std::result::Result<Option<i64>, String> {
+                match fields.get(k) {
+                    None | Some(Value::Null) => Ok(None),
+                    Some(Value::String(s)) => siros_verifier_core::mdoc::parse_utc(s)
+                        .map(Some)
+                        .map_err(|e| e.to_string()),
+                    Some(_) => Err("trust_data_timestamp_not_string".into()),
+                }
             };
             trust_data.push(TrustData {
-                registry: t
+                registry: fields
                     .get("registry")
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_owned(),
-                as_of: ts("as_of")?.ok_or("trust_data_as_of_missing")?,
+                as_of: ts("as_of")?,
                 next_update: ts("next_update")?,
             });
         }
