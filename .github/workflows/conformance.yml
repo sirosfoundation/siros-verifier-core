@@ -161,12 +161,16 @@ jobs:
           # the Spring context); the nginx 302 is the readiness signal.
           # BOTH WAITS ARE HARD GATES: the spec self-skips every module when
           # either service is unavailable, so a stack that never comes up
-          # would otherwise finish green having verified nothing. If a wait
-          # expires, the step fails here — with the stack's logs as the
-          # breadcrumb — and the artifact upload (if: always()) still runs.
+          # would otherwise finish green having verified nothing. Each probe
+          # is bounded by --max-time so a HUNG connection cannot stall the
+          # loop past the job budget — the wait always reaches its verdict,
+          # and the failure path (stack logs + artifacts) is always captured.
+          # If a wait expires, the step fails here — with the stack's logs as
+          # the breadcrumb — and the artifact upload (if: always()) still
+          # runs.
           suite_up=""
           for i in $(seq 1 60); do
-            if curl -sk -o /dev/null -w '%{http_code}' "${CONFORMANCE_URL%/}/" | grep -q 302; then
+            if curl -sk --max-time 10 -o /dev/null -w '%{http_code}' "${CONFORMANCE_URL%/}/" | grep -q 302; then
               echo "The suite is up (attempt $i)"
               suite_up=1
               break
@@ -186,7 +190,7 @@ jobs:
           # --fail: a 4xx/5xx health response is NOT readiness.
           verifier_up=""
           for i in $(seq 1 30); do
-            if curl -skf -o /dev/null "${SIROS_VERIFIER_CORE_URL%/}/health"; then
+            if curl -skf --max-time 10 -o /dev/null "${SIROS_VERIFIER_CORE_URL%/}/health"; then
               echo "The verifier is up (attempt $i)"
               verifier_up=1
               break
@@ -268,6 +272,12 @@ jobs:
           fi
           echo "The plan: $TOTAL modules, $PASSED passed, $FAILED failed, $SKIPPED skipped."
 
+      # The archive is a HARD prerequisite of the release hand-off below: a
+      # missing file set fails this step (not a warning), so the dispatch can
+      # never fire for a run whose reports never made it to the artifact
+      # store. On failed runs the step still uploads whatever exists — a
+      # missing-file failure there only adds one more red step to a run that
+      # is already red, and "nothing was produced" is itself a diagnosis.
       - name: The results, as artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -277,7 +287,7 @@ jobs:
             conformance-repo/conformance-results/
             conformance-repo/test-results/
             conformance-repo/playwright-report/
-          if-no-files-found: warn
+          if-no-files-found: error
 
       # RELEASE TAG PUSHES ONLY: hand the report set to the conformance repo
       # via a repository_dispatch — event_type: conformance-verifier, the
