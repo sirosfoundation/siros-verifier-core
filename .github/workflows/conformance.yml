@@ -57,7 +57,11 @@ permissions:
   contents: read
 
 concurrency:
-  group: conformance-${{ github.ref }}
+  # The event name isolates manual experiments (workflow_dispatch) from
+  # push-triggered release runs: a manual run against a release tag must
+  # never cancel that tag's release run — the hand-off it performs is
+  # push-only, and the experiment may not destroy the record.
+  group: conformance-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -231,6 +235,19 @@ jobs:
           fi
           if [ "$(stat -c %Y "$SUMMARY")" -lt "$CONFORMANCE_PLAN_STARTED" ]; then
             echo "::error::The conformance summary predates this run — the plan executed nothing this time."
+            exit 1
+          fi
+          # The counters must fail closed: `jq -r` yields `null` for a
+          # missing field, and a numeric comparison on null errors out of
+          # the `if` as a no-op, letting a malformed summary pass. Validate
+          # types, integrality, and consistency up front — anything else is
+          # not a verdict this gate is willing to read.
+          if ! jq -e '
+                ([.total, .passed, .failed, .skipped]
+                  | all((. | type) == "number" and (. | floor) == .))
+                and .total == (.passed + .failed + .skipped)
+              ' "$SUMMARY" > /dev/null; then
+            echo "::error::The conformance summary's counters are missing, non-integral, or inconsistent."
             exit 1
           fi
           TOTAL=$(jq -r '.total' "$SUMMARY")
