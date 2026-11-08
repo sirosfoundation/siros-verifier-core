@@ -1,0 +1,173 @@
+name: OIDF conformance (verifier)
+
+# The OpenID Foundation OID4VP verifier plan against this repository's
+# verifier: the suite acts as the wallet and drives our service as the
+# relying party (the conformance repo's VERIFIER_IMPL=core mode,
+# docs/oidf-conformance.md). The image is built from the PR's own source,
+# so every run judges exactly the code under review.
+#
+# PRs only (not pushes to main) — the suite run costs minutes the merge
+# queue does not need twice; the tag path and workflow_dispatch cover main.
+#
+# Release tags (v*) publish: the run dispatches the conformance repo's own
+# workflow (repository_dispatch: conformance-verifier), which owns the
+# gh-pages publish to conformance.siros.org — one report set per release,
+# addressable from the release notes. A PR's results stay in the run's
+# artifacts: a PR is a conversation, not a release.
+#
+# The blacklist (conformance/blacklist.json) skips modules this repository
+# has chosen to ignore — a known upstream-suite quirk, or a not-yet
+# -implemented feature with its own tracking issue. A skipped module is
+# absent from the run, not run-and-ignored: the summary records the skip
+# with its reason.
+
+on:
+  pull_request:
+    paths:
+      - "src/**"
+      - "service/**"
+      - "tunnelbana-plugin/**"
+      - "zkp/**"
+      - "ffi/**"
+      - "Cargo.lock"
+      - "Dockerfile"
+      - "conformance/blacklist.json"
+      - ".github/workflows/conformance.yml"
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      conformance-ref:
+        description: "The conformance repo ref to run (default: main)"
+        required: false
+        default: "main"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: conformance-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  conformance:
+    name: OIDF verifier conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CONFORMANCE_URL: https://localhost.emobix.co.uk:8443/
+      VERIFIER_CONFORMANCE_URL: https://conformance.example.com:9443
+      SIROS_VERIFIER_CORE_URL: https://localhost:9443
+      # The OIDF suite's release, PINNED (never :latest) — read from
+      # conformance/suite-version, the checked-in single source; the step
+      # below exports it. Compose takes it as CONFORMANCE_SUITE_TAG for both
+      # suite images (server + nginx). Adopt a new release deliberately, with
+      # its release notes, in the same PR.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Checkout the conformance repo (pinned ref)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: sirosfoundation/siros-conformance
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.conformance-ref || 'main' }}
+          path: conformance-repo
+
+      - name: Build the verifier image from this source
+        run: docker build -t siros-verifier-core:local .
+
+      - name: The suite's TLS hosts
+        run: |
+          echo "127.0.0.1 localhost.emobix.co.uk" | sudo tee -a /etc/hosts
+          echo "127.0.0.1 conformance.example.com" | sudo tee -a /etc/hosts
+
+      - name: The suite version (pinned, from conformance/suite-version)
+        run: |
+          TAG="$(grep -oE 'release-v[0-9.]+' conformance/suite-version | head -1)"
+          if [ -z "$TAG" ]; then
+            echo "::error::conformance/suite-version carries no release tag"
+            exit 1
+          fi
+          echo "CONFORMANCE_SUITE_TAG=$TAG" >> "$GITHUB_ENV"
+          echo "The OIDF conformance suite: $TAG"
+
+      - name: The blacklist (module name → reason)
+        run: |
+          echo "The blacklist:"
+          cat conformance/blacklist.json
+
+      - name: Bring up the verifier stack
+        working-directory: conformance-repo
+        run: |
+          npm ci
+          npx playwright install chromium --with-deps
+          CONFORMANCE_SUITE_TAG="$CONFORMANCE_SUITE_TAG" \
+            SIROS_VERIFIER_CORE_IMAGE=siros-verifier-core:local \
+            docker compose \
+              -f compose/siros-verifier-core.yml \
+              -f compose/go-trust.yml \
+              -f compose/conformance-suite.yml \
+              up -d --remove-orphans
+          # The suite's server takes its time on first boot (the Mongo seed,
+          # the Spring context); the nginx 302 is the readiness signal.
+          for i in $(seq 1 60); do
+            if curl -sk -o /dev/null -w '%{http_code}' "${CONFORMANCE_URL%/}/" | grep -q 302; then
+              echo "The suite is up (attempt $i)"
+              break
+            fi
+            sleep 5
+          done
+          # The verifier's own health endpoint gates the spec's core mode.
+          for i in $(seq 1 30); do
+            if curl -sk -o /dev/null "${SIROS_VERIFIER_CORE_URL%/}/health"; then
+              echo "The verifier is up (attempt $i)"
+              break
+            fi
+            sleep 5
+          done
+          curl -sk -o /dev/null "${CONFORMANCE_URL%/}/" || true
+          curl -sk -o /dev/null "${SIROS_VERIFIER_CORE_URL%/}/health" || true
+
+      - name: Run the OID4VP verifier plan (core mode)
+        working-directory: conformance-repo
+        env:
+          NODE_TLS_REJECT_UNAUTHORIZED: "0"
+          VERIFIER_IMPL: core
+        run: |
+          export CONFORMANCE_BLACKLIST="$(cat "$GITHUB_WORKSPACE/conformance/blacklist.json" 2>/dev/null || echo '{}')"
+          npx playwright test specs/conformance/oid4vp-verifier.spec.ts
+
+      - name: The results, as artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verifier-conformance-results
+          path: |
+            conformance-repo/conformance-results/
+            conformance-repo/test-results/
+            conformance-repo/playwright-report/
+          if-no-files-found: warn
+
+      # The publish: RELEASE TAGS ONLY, via the conformance repo's own
+      # workflow (repository_dispatch: conformance-verifier — that repo owns
+      # the gh-pages publish, so this repository needs no write scope
+      # anywhere: CONFORMANCE_DISPATCH_TOKEN, a fine-grained PAT with the
+      # single dispatch permission on that repo, carries it; see
+      # docs/conformance-dispatch-token.md). The payload names the release
+      # so the site carries one report set per tag.
+      - name: Trigger the conformance repo's publish (release tags only)
+        if: github.ref_type == 'tag'
+        working-directory: conformance-repo
+        env:
+          GH_TOKEN: ${{ secrets.CONFORMANCE_DISPATCH_TOKEN }}
+        run: |
+          gh api -X POST \
+            "/repos/sirosfoundation/siros-conformance/dispatches" \
+            -f event=conformance-verifier \
+            -f 'client_payload[verifier-impl]=core' \
+            -f 'client_payload[golden-release]="${GITHUB_REF_NAME}"' \
+            -f 'client_payload[run-id]="${GITHUB_REF_NAME}"' \
+            -f 'client_payload[run-url]="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"'
