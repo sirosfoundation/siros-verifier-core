@@ -37,6 +37,11 @@ same verifier commit is rerun. Adopt a new suite release, harness revision,
 or trust-service digest in one PR that reads the diff and the release
 notes.
 
+One residual rides inside the harness pin: the compose files it pins
+declare the stack's auxiliary images by tag (`mongo:7.0`,
+`nginx:1.29-alpine`), so those can drift within their tag. Digest-pinning
+them belongs to the conformance repo, where the compose files live.
+
 ## What a green check means
 
 Nothing in this check is green by accident. The spec self-skips every
