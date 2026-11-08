@@ -19,7 +19,7 @@ fn answer() -> PdpAnswer {
         reasons: vec!["listed".into()],
         trust_data: vec![TrustData {
             registry: "etsi".into(),
-            as_of: NOW - 100,
+            as_of: Some(NOW - 100),
             next_update: Some(NOW + 100_000),
         }],
     }
@@ -215,7 +215,7 @@ fn ttl_is_clamped_by_trust_data_next_update() {
     let mut a = answer();
     a.trust_data.push(TrustData {
         registry: "lote".into(),
-        as_of: NOW,
+        as_of: Some(NOW),
         next_update: Some(NOW + 500),
     });
     let r = verifier()
@@ -227,6 +227,29 @@ fn ttl_is_clamped_by_trust_data_next_update() {
         .unwrap();
     assert_eq!(r.exp, NOW + 500);
     assert_eq!(r.refresh_after, NOW + 250);
+}
+#[test]
+fn timestampless_trust_data_records_null_and_keeps_the_tenant_ceiling() {
+    // go-trust's always-trusted registry reports an entry with no timestamps:
+    // the receipt records the absent instants as null and nothing clamps the
+    // lifetime, so it stays at the tenant ceiling.
+    let a = PdpAnswer {
+        decision: true,
+        id: "dec-9".into(),
+        reasons: vec![],
+        trust_data: vec![TrustData {
+            registry: "always-trusted".into(),
+            as_of: None,
+            next_update: None,
+        }],
+    };
+    let jws = issue(&key(1), &pol(), &req(), &a, NOW).unwrap();
+    let claims: Value = serde_json::from_slice(&b64(jws.split('.').nth(1).unwrap())).unwrap();
+    assert_eq!(claims["trust_data"][0]["registry"], "always-trusted");
+    assert_eq!(claims["trust_data"][0]["as_of"], Value::Null);
+    assert_eq!(claims["trust_data"][0]["next_update"], Value::Null);
+    let r = verifier().verify(&jws, &req(), NOW).unwrap();
+    assert_eq!(r.exp, NOW + pol().max_ttl);
 }
 #[test]
 fn stale_trust_data_is_refused_not_receipted() {

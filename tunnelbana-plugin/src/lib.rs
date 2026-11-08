@@ -568,7 +568,7 @@ pub struct TrustGate {
     aud: String,
     pdp_id: String,
     max_ttl: i64,
-    /// Lifetime cap when the PDP reports no `trust_data` (today's go-trust): nothing bounds the receipt except this.
+    /// Lifetime cap when the PDP reports no `trust_data`: nothing bounds the receipt except this.
     no_freshness_ttl: i64,
     cache: Mutex<Cache>,
 }
@@ -663,9 +663,12 @@ impl TrustGate {
     }
 }
 
-/// AuthZEN response -> [`PdpAnswer`]. `decision` must be a boolean. Everything in `context` is optional, because
-/// go-trust today returns neither `context.id` nor `trust_data`: a missing id gets a local one (`local-...`), and
-/// missing freshness data is handled by the gate's conservative default lifetime, not by guessing here.
+/// AuthZEN response -> [`PdpAnswer`]. `decision` must be a boolean. Everything in `context` is optional, and so is
+/// every timestamp inside `trust_data`: go-trust registries differ — its whitelist answers with no `context.id` and
+/// no `trust_data`, and its always-trusted registry answers with an id, a reason, and a `trust_data` entry that
+/// carries no timestamps. A missing id gets a local one (`local-...`); a timestamp that is present but malformed
+/// is an error; and absent freshness bounds the receipt by the gate's conservative default lifetime, not by
+/// guessing here.
 pub fn parse_authzen_response(v: &Value) -> std::result::Result<PdpAnswer, String> {
     let decision = v
         .get("decision")
@@ -696,7 +699,7 @@ pub fn parse_authzen_response(v: &Value) -> std::result::Result<PdpAnswer, Strin
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_owned(),
-                as_of: ts("as_of")?.ok_or("trust_data_as_of_missing")?,
+                as_of: ts("as_of")?,
                 next_update: ts("next_update")?,
             });
         }
