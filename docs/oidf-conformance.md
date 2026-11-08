@@ -60,7 +60,11 @@ module when its own readiness checks fail, and Playwright exits 0 on skips
 So a green `OIDF verifier conformance` check certifies that every module of
 the plan executed against this exact code, suite, harness, trust service,
 and runner image — and every applicable module passed (REVIEW-completed
-evidence modules count as passed; see below).
+evidence modules count as passed; see below). This is this repository's own
+automated acceptance: it is not the OpenID Foundation's certification, and
+the REVIEW-completed evidence modules are exactly the part a human must
+still read — the check says the reports exist, not that anyone has reviewed
+them.
 
 ## Skips and evidence
 
@@ -116,3 +120,9 @@ VERIFIER_IMPL=core NODE_TLS_REJECT_UNAUTHORIZED=0 \
 
 The suite's first boot is slow (its Mongo seed and Spring context); the
 nginx 302 on the suite URL is the readiness signal.
+
+The local path has **no verdict gate** — the workflow's fresh-summary check
+lives in CI, not in the harness — and Playwright exits 0 on a self-skipped
+plan. A local "success" only means something if
+`conformance-results/verifier-summary.json` exists, is fresh, and shows
+modules executed with none failed; when in doubt, read the summary.
