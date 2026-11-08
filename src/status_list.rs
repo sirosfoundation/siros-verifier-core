@@ -37,9 +37,17 @@ fn header(token: &str) -> Result<JoseHeader> {
     Ok(header)
 }
 
-/// Verify a compact `statuslist+jwt` and return its claims and signer evidence.
+/// Verify a compact `statuslist+jwt` against the URI the credential referenced
+/// and return its claims and signer evidence.
+///
+/// `expected_uri` is the `uri` from the credential's `status_list` object: per
+/// Token Status List (draft-ietf-oauth-status-list) §5.1 and §8.3, the token's
+/// `sub` MUST be the Status List Token's own URI and MUST equal that reference,
+/// and `iat` is REQUIRED. A different list — even one signed by the same
+/// trusted signer — must never speak for this credential.
 pub fn verify_token(
     token: &str,
+    expected_uri: &str,
     resolver: &dyn IssuerKeyResolver,
     now: i64,
 ) -> Result<StatusListToken> {
@@ -59,19 +67,30 @@ pub fn verify_token(
     if sub.is_empty() {
         return Err(malformed("status_list_missing_sub"));
     }
+    // §5.1/§8.3: the subject MUST equal the URI the credential's status
+    // reference named. A list is bound to the credentials that point at it;
+    // a signer operating many lists must not have one of them speak for a
+    // credential that referenced another.
+    if sub != expected_uri {
+        return Err(policy("status_list_uri_mismatch"));
+    }
     for name in ["iat", "exp"] {
         if claims_object.get(name).is_some_and(|value| !value.is_i64()) {
             return Err(malformed(format!("status_list_{name}_not_integer")));
         }
     }
+    // `iat` is REQUIRED (§5.1). The loop above rejects present-but-malformed
+    // values; this rejects the claim's absence.
+    let iat = claims_object
+        .get("iat")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| malformed("status_list_missing_iat"))?;
+    if iat > now + 60 {
+        return Err(policy("status_list_iat_future"));
+    }
     if let Some(exp) = claims_object.get("exp").and_then(Value::as_i64) {
         if now >= exp {
             return Err(policy("status_list_expired"));
-        }
-    }
-    if let Some(iat) = claims_object.get("iat").and_then(Value::as_i64) {
-        if iat > now + 60 {
-            return Err(policy("status_list_iat_future"));
         }
     }
     let evidence = IssuerEvidence {
@@ -109,9 +128,9 @@ pub fn index_parts(idx: u64, bits: u64) -> Result<(u64, u32)> {
 
 /// Return the integer status at `reference.idx` in the list.
 pub fn status_at(token: &StatusListToken, reference: &StatusRef) -> Result<u8> {
-    if token.claims["sub"] != Value::String(reference.uri.clone()) {
-        return Err(policy("status_list_subject_mismatch"));
-    }
+    // The subject/URI binding is enforced once, in verify_token — this lookup
+    // trusts the reference it was given, because only the reference that
+    // verified the token reaches here on every production path.
     let bits = bits(&token.claims)?;
     let compressed = token.claims["status_list"]["lst"]
         .as_str()

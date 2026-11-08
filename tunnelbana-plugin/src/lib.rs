@@ -1265,8 +1265,9 @@ impl VpBackend {
             .fetch(&reference.uri)
             .await
             .map_err(|_| ("status_list_unavailable".to_owned(), 503))?;
-        let token = siros_verifier_core::status_list::verify_token(&token, &X5cLeaf, now)
-            .map_err(|_| ("invalid_status_list".to_owned(), 400))?;
+        let token =
+            siros_verifier_core::status_list::verify_token(&token, &reference.uri, &X5cLeaf, now)
+                .map_err(|_| ("invalid_status_list".to_owned(), 400))?;
         let status = siros_verifier_core::status_list::status_at(&token, reference)
             .map_err(|_| ("invalid_status_list".to_owned(), 400))?;
         let query = TrustQuery::for_issuer(&token.issuer, "status-list-signer", "status-list");

@@ -329,3 +329,29 @@ vectors decrypt through jose-rs, and `scripts/interop.sh` verifies new jose-rs-p
 - **Mutation coverage.** New checks cover duplicate-JSON rejection and session-sealing policy, alongside the migrated
   OpenID4VP response checks. All 124 checks are killed, with no survivors or missing snippets. The gateway flow tests
   exercise sealing and unsealing on every login, and the Kotlin tests pass after the primitive upgrades.
+
+## TSL token strictness decision (2026-11-08)
+
+The status list token's claims are now held to Token Status List **draft-ietf-oauth-status-list-21**
+(§5.1, §8.3) exactly, with the OIDF suite's own live tokens as the compatibility oracle (decoded from
+the first green conformance run's artifact):
+
+- **`sub` ↔ reference-URI binding moves to `verify_token`.** The binding existed at the lookup
+  (`status_at`) — after the signer trust query had already approved the token. It now rejects a
+  mismatched list at the token-validation boundary, in §8.3's processing order, and the `status_at`
+  duplicate is deleted: one check, one home, fail-closed for every `verify_token` consumer. The
+  security property: a signer operating many lists must not have a different list — one where a
+  credential's index reads `0` — speak for a credential that referenced another.
+- **`iat` is required.** §5.1 marks it REQUIRED; the verifier previously accepted lists with no
+  issuance instant at all. Present-but-malformed values were already rejected; absence now is too.
+  The future bound (`> now + 60`) stays.
+- **`iss` stays unread, deliberately.** It is not a TSL claim — the JWT profile requires `sub`,
+  `iat`, `exp`/`ttl` and `status_list`, and the header `typ: statuslist+jwt` (already enforced) —
+  and the suite's own tokens carry no `iss`. Requiring it would reject spec-conformant lists.
+  Signer trust remains go-trust's decision over the token's x5c/JWK key evidence.
+- `exp` remains honored when present (§5.1 RECOMMENDED, MUST check when present).
+
+Three `sl` mutation anchors pin the decision (`status sub binds reference uri`, `status iat
+required`, `status iat future`), each killed by a regression built from the decision's own terms:
+a second same-signer list rejected against the reference it was not named by while verifying
+against its own URI, a list without `iat`, and a list issued in the future.
