@@ -336,12 +336,15 @@ The status list token's claims are now held to Token Status List **draft-ietf-oa
 (§5.1, §8.3) exactly, with the OIDF suite's own live tokens as the compatibility oracle (decoded from
 the first green conformance run's artifact):
 
-- **`sub` ↔ reference-URI binding moves to `verify_token`.** The binding existed at the lookup
-  (`status_at`) — after the signer trust query had already approved the token. It now rejects a
-  mismatched list at the token-validation boundary, in §8.3's processing order, and the `status_at`
-  duplicate is deleted: one check, one home, fail-closed for every `verify_token` consumer. The
-  security property: a signer operating many lists must not have a different list — one where a
-  credential's index reads `0` — speak for a credential that referenced another.
+- **`sub` ↔ reference-URI binding, enforced at both boundaries.** The binding existed at the
+  lookup (`status_at`) — after the signer trust query had already approved the token. It is now
+  added at the token-validation boundary too (`verify_token`, in §8.3's processing order), so a
+  mismatched list is rejected before signer trust is even asked, fail-closed for every
+  `verify_token` consumer. The `status_at` guard stays: it is not a duplicate but the public
+  lookup's own contract — the bit read for a reference must come from the list that reference
+  names, whichever boundary the caller came from. The security property: a signer operating many
+  lists must not have a different list — one where a credential's index reads `0` — speak for a
+  credential that referenced another.
 - **`iat` is required.** §5.1 marks it REQUIRED; the verifier previously accepted lists with no
   issuance instant at all. Present-but-malformed values were already rejected; absence now is too.
   The future bound (`> now + 60`) stays.
@@ -351,7 +354,8 @@ the first green conformance run's artifact):
   Signer trust remains go-trust's decision over the token's x5c/JWK key evidence.
 - `exp` remains honored when present (§5.1 RECOMMENDED, MUST check when present).
 
-Three `sl` mutation anchors pin the decision (`status sub binds reference uri`, `status iat
-required`, `status iat future`), each killed by a regression built from the decision's own terms:
-a second same-signer list rejected against the reference it was not named by while verifying
-against its own URI, a list without `iat`, and a list issued in the future.
+Four `sl` mutation anchors pin the decision (`status sub binds reference uri`, `status lookup
+binds reference uri`, `status iat required`, `status iat future`), each killed by a regression
+built from the decision's own terms: a second same-signer list rejected against the reference it
+was not named by at both boundaries while verifying and reading against its own URI, a list
+without `iat`, and a list issued in the future.

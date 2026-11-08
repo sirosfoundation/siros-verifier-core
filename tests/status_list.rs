@@ -79,6 +79,7 @@ fn a_list_whose_subject_is_not_the_referenced_uri_never_speaks_for_the_credentia
     let mut claims = valid_claims();
     claims["sub"] = json!("https://status.example/other-list");
     let token = sign_raw(&key, "statuslist+jwt", &claims, std::slice::from_ref(&cert));
+    // Rejected at validation: the token does not speak for the reference.
     let error = verify_token(&token, LIST_URI, &X5cLeaf, NOW).unwrap_err();
     assert_eq!(error.code(), "policy");
     assert!(error.to_string().contains("status_list_uri_mismatch"));
@@ -86,7 +87,19 @@ fn a_list_whose_subject_is_not_the_referenced_uri_never_speaks_for_the_credentia
     // signature, is what rejected it.
     let token = verify_token(&token, "https://status.example/other-list", &X5cLeaf, NOW)
         .unwrap_or_else(|e| panic!("the same list must verify against its own URI: {e}"));
-    assert_eq!(status_at(&token, &reference(4)).unwrap(), 0);
+    // And the public lookup enforces its own contract even then: reading a
+    // bit for a reference through a list that reference does not name is
+    // refused, whichever boundary the caller came from.
+    let mut foreign = reference(4);
+    foreign.uri = LIST_URI.into();
+    let error = status_at(&token, &foreign).unwrap_err();
+    assert_eq!(error.code(), "policy");
+    assert!(error.to_string().contains("status_list_subject_mismatch"));
+    let own = StatusRef {
+        idx: 4,
+        uri: "https://status.example/other-list".into(),
+    };
+    assert_eq!(status_at(&token, &own).unwrap(), 0);
 }
 
 #[test]

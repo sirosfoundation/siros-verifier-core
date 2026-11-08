@@ -128,6 +128,7 @@ M = [
  ("tb", 'if ctx.request.method != "POST" {', 'if false {', "plugin POST only"),
  ("sl", 'if claims_object.get(name).is_some_and(|value| !value.is_i64()) {', 'if false {', "status time types"),
  ("sl", 'if sub != expected_uri {', 'if false {', "status sub binds reference uri"),
+ ("sl", 'if token.claims["sub"] != Value::String(reference.uri.clone()) {', 'if false {', "status lookup binds reference uri"),
  ("sl", '.ok_or_else(|| malformed("status_list_missing_iat"))?;', '.unwrap_or(0);', "status iat required"),
  ("sl", 'if iat > now + 60 {', 'if false {', "status iat future"),
  ("tb", 'if status != 0 {', 'if false {', "status revoked enforcement"),

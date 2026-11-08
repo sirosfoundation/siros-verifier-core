@@ -128,9 +128,15 @@ pub fn index_parts(idx: u64, bits: u64) -> Result<(u64, u32)> {
 
 /// Return the integer status at `reference.idx` in the list.
 pub fn status_at(token: &StatusListToken, reference: &StatusRef) -> Result<u8> {
-    // The subject/URI binding is enforced once, in verify_token — this lookup
-    // trusts the reference it was given, because only the reference that
-    // verified the token reaches here on every production path.
+    // The lookup's own contract, independent of how the caller verified the
+    // token: the bit read for a reference must come from the list that
+    // reference names. `verify_token` binds the token to the reference at
+    // validation time (§8.3 order, before signer trust is even asked); this
+    // guard keeps the PUBLIC lookup safe for callers that did not pass the
+    // same URI — a mismatched list must never answer for the reference.
+    if token.claims["sub"] != Value::String(reference.uri.clone()) {
+        return Err(policy("status_list_subject_mismatch"));
+    }
     let bits = bits(&token.claims)?;
     let compressed = token.claims["status_list"]["lst"]
         .as_str()
