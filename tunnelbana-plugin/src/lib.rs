@@ -668,8 +668,9 @@ impl TrustGate {
 /// no `trust_data`, and its always-trusted registry answers with an id, a reason, and a `trust_data` entry that
 /// carries no timestamps. What is present must be well-formed: an id must be a non-empty string, a `trust_data`
 /// entry must be an object, and a timestamp must be a string that parses — a present value of the wrong type is
-/// malformed, never silently absent. Absent freshness bounds the receipt by the gate's conservative default
-/// lifetime, not by guessing here.
+/// malformed, never silently absent. Lifetime is the gate's call, not this parser's: an answer with no `trust_data`
+/// at all gets the gate's conservative default lifetime, while timestamp-less entries are still trust data and the
+/// receipt lives the tenant ceiling, clamped by any `next_update` that is present.
 pub fn parse_authzen_response(v: &Value) -> std::result::Result<PdpAnswer, String> {
     let decision = v
         .get("decision")
