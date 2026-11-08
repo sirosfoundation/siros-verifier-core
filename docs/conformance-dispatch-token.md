@@ -1,21 +1,35 @@
 # CONFORMANCE_DISPATCH_TOKEN — creation and setup
 
 The verifier's conformance workflow (`.github/workflows/conformance.yml`)
-publishes release-tag conformance reports to **conformance.siros.org** by
-dispatching the conformance repo's own publish workflow
-(`repository_dispatch`, event `conformance-verifier`). The dispatch needs a
-token — this one. (The same pattern and token policy as siros-wallet-core's
-`docs/conformance-dispatch-token.md`.)
+hands release-tag results to the conformance repo by dispatching its
+verifier workflow (`repository_dispatch`, event `conformance-verifier`). The
+dispatch needs a token — this one.
 
 ## What it is
 
 A **GitHub fine-grained personal access token (PAT)** with exactly one
-permission: **Actions: write** (the repository-dispatch right) on
-**`sirosfoundation/siros-conformance`** — nothing else. It cannot read code,
-cannot merge, cannot touch anything outside that one repo's dispatch
-endpoint. (A classic PAT with the full `repo` scope would also work but
-grants far more than the job needs; the fine-grained form is the least
-privilege.)
+repository permission: **Contents — Read and write** on
+**`sirosfoundation/siros-conformance`** — nothing else.
+
+Why Contents and not Actions: GitHub's fine-grained token permission table
+puts the repository-dispatch endpoint (`POST /repos/{owner}/{repo}/dispatches`)
+under **Contents: write** — "Actions: write" covers the *workflow* dispatch
+endpoint instead. A token with only Actions: write is rejected with 403 on
+this call.
+
+Be clear-eyed about what this grant is: Contents: write on that repository
+can read and modify its code. That is broader than the single dispatch the
+job performs, and it is the narrowest credential GitHub offers for this
+endpoint — a classic PAT with the `repo` scope is strictly wider, and a
+GitHub App installation token with the same Contents permission is heavier
+machinery for the same right. The compensating controls:
+
+- **Scope**: the token is restricted to `sirosfoundation/siros-conformance`
+  alone — it cannot touch any other repository.
+- **Lifetime**: 90 days (GitHub's cap for fine-grained tokens), with a
+  calendar reminder to rotate.
+- **Use**: the workflow reads it only in the release-tag dispatch step; PR
+  and manual runs never touch it.
 
 ## Creating it
 
@@ -30,12 +44,13 @@ privilege.)
    | Field | Value |
    |---|---|
    | **Token name** | `conformance-dispatch-verifier` |
-   | **Expiration** | 90 days (GitHub's cap for fine-grained tokens; set a calendar reminder to rotate — the workflow starts failing with 401/403 when it expires, which is the rotation signal) |
+   | **Expiration** | 90 days |
    | **Resource owner** | `sirosfoundation` |
    | **Repository access** | Only select repositories → `sirosfoundation/siros-conformance` |
-   | **Permissions → Repository permissions → Actions** | **Read and write** |
+   | **Permissions → Repository permissions → Contents** | **Read and write** |
 
-   Everything else stays **No access**.
+   Everything else stays **No access** — including Actions, which is *not*
+   needed for this dispatch.
 
 3. Generate and copy the token (it is shown once).
 
@@ -51,11 +66,26 @@ Add it as a repository secret of **this** repository:
 | **Secret** | the token value |
 
 The workflow reads it as `secrets.CONFORMANCE_DISPATCH_TOKEN` only in the
-release-tag dispatch step; PR runs never touch it.
+release-tag dispatch step.
 
 ## Rotating it
 
 Repeat the creation steps and update the secret. The failure mode of an
-expired token is a 401/403 on the dispatch step of a release-tag run — the
-rest of the run is unaffected, and the report set can be re-published by
-re-running the workflow after rotation.
+expired or wrong-scoped token is a 403 on the dispatch step of a
+release-tag run — the rest of the run is unaffected, and the dispatch can
+be retried after rotation.
+
+## Verifying it before the first release tag
+
+From any machine with `gh` (not just CI):
+
+```sh
+GH_TOKEN=<the token> gh api -X POST \
+  /repos/sirosfoundation/siros-conformance/dispatches \
+  -f event_type=conformance-verifier \
+  -f 'client_payload[probe]=token-check'
+```
+
+Expect HTTP 204 (no content) and a run of the conformance repo's verifier
+workflow. A 403 means the token's permission or repository scope is wrong;
+401 means it expired or was revoked.

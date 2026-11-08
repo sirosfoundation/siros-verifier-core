@@ -22,20 +22,39 @@ core stack from that repo's compose files:
 | `go-trust-allow` | The suite's local allow-all go-trust stand-in (conformance fixtures only; never a real trust decision) |
 | `siros-verifier-core` | This repository's verifier, built from the PR's source, on MongoDB, behind the suite-facing nginx at `https://conformance.example.com:9443` |
 
-The suite version is **pinned** in `conformance/suite-version` (never
-`latest`): an invisible upstream bump would change the verdict without a
-change here. Adopt a new release deliberately, in one PR with its release
-notes.
+The verdict is judged against a **fully pinned reference** — three pins,
+each bumped deliberately in its own PR, never left to drift:
 
-The variant exercised is the one this verifier documents and supports:
-`sd_jwt_vc / x509_hash / direct_post.jwt / request_uri_signed / plain_vp`.
+| Pin | File | What it fixes |
+| --- | --- | --- |
+| The OIDF suite release | `conformance/suite-version` | The suite's server + nginx images (never `latest`) |
+| The harness revision | `conformance/conformance-ref` | The conformance repo's exact commit — its specs, compose fixtures, and assertions define what "conformant" means here |
+| The runner image | `runs-on` in the workflow | `ubuntu-24.04`, the newest host platform the pinned Playwright (1.60) ships browser builds for; unpinned when that bumps |
+
+An invisible change to any of the three would change the verdict when the
+same verifier commit is rerun. Adopt a new suite release or harness
+revision in one PR that reads the diff and the release notes.
+
+## Readiness is a hard gate
+
+The spec self-skips every module when either the suite or the verifier is
+unavailable — a stack that never comes up would otherwise finish green
+having verified nothing. The workflow therefore **fails the job** when
+either readiness wait expires (the suite's nginx 302; the verifier's
+`/health` with a success status), leaving the stack's logs and the run's
+artifacts as the diagnosis. A green `OIDF verifier conformance` check means
+modules actually executed.
 
 ## Skips and evidence
 
-`conformance/blacklist.json` maps module names to skip reasons — a
-blacklisted module is absent from the run, not run-and-ignored, and the
-summary records the skip with its reason. Remove entries as the work they
-track lands.
+`conformance/blacklist.json` is the intended skip interface (module name →
+reason), seeded empty. **It is inert today**: the pinned verifier harness
+does not read `CONFORMANCE_BLACKLIST` — only the conformance repo's wallet
+specs do — so an entry cannot skip a module until the harness grows that
+support and the `conformance-ref` pin bumps to the revision that has it.
+When that lands, a blacklisted module is absent from the run, not
+run-and-ignored, and the summary records the skip with its reason. Until
+then: do not add entries expecting them to work.
 
 Some modules ask for evidence the suite cannot generate itself (a
 screenshot, a policy statement); the spec uploads the suite's placeholder
@@ -47,14 +66,20 @@ refusal verified".
 
 - **Pull requests**: the results ride the run's artifacts (the Checks tab),
   never the site — a PR is a conversation, not a release.
-- **Release tags (`v*`)**: the run dispatches the conformance repo's own
-  publish workflow (`repository_dispatch: conformance-verifier`), which owns
-  the gh-pages push to **conformance.siros.org** — one report set per
-  release, addressable from the release notes and diffable against the
-  previous release. The dispatch token is documented in
+- **Release tags (`v*`)**: the run hands the report set to the conformance
+  repo via a `repository_dispatch` (`event_type: conformance-verifier`)
+  carrying the tag and the run URL, authenticated by the token in
   [conformance-dispatch-token.md](conformance-dispatch-token.md).
-- **Manual**: `workflow_dispatch` runs the same path against any conformance
-  repo ref.
+  **PENDING on the conformance repo's side**: its verifier workflow accepts
+  the dispatch but does not yet honor `verifier-impl=core`, and it has no
+  gh-pages publish for verifier reports yet — so a release's reports reach
+  **conformance.siros.org** only after that repo lands its core-mode
+  publish chain (one report set per release, addressable from the release
+  notes and diffable against the previous release, is the target design).
+  Until then the tag's results live in the tag run's artifacts.
+- **Manual**: `workflow_dispatch` runs the same path, optionally overriding
+  the harness pin with its `conformance-ref` input (a branch or commit on
+  the conformance repo — the override never persists into PR or tag runs).
 
 ## Running locally
 
