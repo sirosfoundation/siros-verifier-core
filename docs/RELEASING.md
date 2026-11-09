@@ -27,4 +27,17 @@ For the initial full release the tag is `v0.1.0`; do not create it locally as pa
 
 After the workflow succeeds, verify the GHCR digest, native artifacts, release checksums and attestations, SBOM artifacts, and vulnerability results. Deploy the image by digest and repeat the live Longfellow and Vega smoke tests before updating production provenance.
 
+## Testing images
+
+Between tagged releases, a versioned testing image can be built and validated locally from merged `main`:
+
+1. Build from the merged source and lockfiles (the build sandbox needs `--network host` for package and Git-dependency fetches):
+
+   ```sh
+   docker build --network host -t siros-verifier-core:<version>-testing .
+   ```
+
+2. Validate before recording: startup through the Compose profile (`SIROS_VERIFIER_IMAGE=<tag> docker compose up -d`, then `curl --fail http://localhost:9001/health`); one complete presentation and one explicit PDP denial through the `docs/design/SOAK.md` driver tools; an SBOM and vulnerability scan (for example trivy CycloneDX); and SHA-256 checksums of the binary and the packaged circuit artifact, with the artifact checked against the pinned `artifact_sha256`.
+3. Record the testing release in [`CHANGELOG.md`](../CHANGELOG.md) with the image ID digest as its immutable identity, noting that GHCR publication and signed provenance follow at the tag. Testing images stay local; the GHCR image and its digest are tag-workflow outputs.
+
 Immediately after every testing or production release, add its publication and verification details to [`CHANGELOG.md`](../CHANGELOG.md), including source/artifact identities, deployment and rollback evidence, known limitations, and the corresponding documentation updates.
