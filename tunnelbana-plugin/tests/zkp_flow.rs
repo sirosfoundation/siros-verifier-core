@@ -5,6 +5,7 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 mod common;
 use common::ClockBumpingClaimStore;
@@ -16,9 +17,12 @@ use serde_json::{json, Value};
 use siros_verifier_core::issuer_set::IssuerSetPolicy;
 use siros_verifier_core::testutil::*;
 use siros_verifier_core_tunnelbana::*;
+use siros_verifier_zkp::backend::{BackendError, BackendRegistry, ProofBackend, SystemProfile};
 use siros_verifier_zkp::circuits::*;
 use siros_verifier_zkp::functions::FunctionRegistry;
 use siros_verifier_zkp::nym_auth::*;
+use siros_verifier_zkp::refusal::ZkpResult;
+use siros_verifier_zkp::request::Request;
 use siros_verifier_zkp::testutil as zk;
 use siros_verifier_zkp::verify::{Channel, Tolerance, VerifierPolicy, ZkpVerifier};
 use tunnelbana_core::context::Context;
@@ -202,6 +206,29 @@ fn build_with_clock_store(
     store: Option<Arc<dyn Fn(Arc<AtomicI64>) -> Arc<dyn FlowStore>>>,
     fallback: Option<Value>,
 ) -> Result<Fx, String> {
+    build_full(
+        zcfg,
+        verifier_id,
+        store,
+        fallback,
+        (60, 45, 16),
+        Arc::new(|loads| zk::model_registry(loads, 1)),
+    )
+}
+
+/// The full fixture: the admission limits of the base configuration
+/// (`lease, deadline, max_concurrent_verifications`) and the backend
+/// registry factory, both injectable so the scheduling regressions can
+/// observe where native verification runs and how it is admitted.
+#[allow(clippy::type_complexity)]
+fn build_full(
+    zcfg: Value,
+    verifier_id: Option<&str>,
+    store: Option<Arc<dyn Fn(Arc<AtomicI64>) -> Arc<dyn FlowStore>>>,
+    fallback: Option<Value>,
+    limits: (i64, i64, usize),
+    registry: Arc<dyn Fn(Arc<AtomicUsize>) -> BackendRegistry>,
+) -> Result<Fx, String> {
     let store_factory = store;
     let (v_cert, v_key) = self_signed_ec("verifier.example", "ES256");
     let (artifact, circuit) = zk::artifact(b"a model circuit artifact");
@@ -215,7 +242,7 @@ fn build_with_clock_store(
         allow,
         Box::new(FsArtifactSource),
         FunctionRegistry::with_builtins(),
-        zk::model_registry(loads.clone(), 1),
+        registry(loads.clone()),
         VerifierPolicy {
             role: "nym-attestation-provider".into(),
             issuer_set: IssuerSetPolicy::AllTrusted,
@@ -257,9 +284,9 @@ fn build_with_clock_store(
         request_ttl_secs: cfg.request_ttl_secs,
         request_uri_method: "get".into(),
         auth_class_ref: cfg.auth_class_ref.clone(),
-        processing_lease_secs: 60,
-        processing_deadline_secs: 45,
-        max_concurrent_verifications: 16,
+        processing_lease_secs: limits.0,
+        processing_deadline_secs: limits.1,
+        max_concurrent_verifications: limits.2,
     };
     let mut backend = VpBackend::new_with_zkp(
         "vp",
@@ -291,6 +318,70 @@ fn build_with_clock_store(
 
 fn fx() -> Fx {
     build(zcfg(), None).unwrap()
+}
+
+/// A backend that holds its FIRST verify for a bounded span before answering
+/// like the model; every later verify passes straight through. The hold is
+/// what makes native verification's *scheduling* observable — and it is
+/// time-bounded so no regression can hang a test waiting for a release.
+/// Proof correctness itself is pinned by the native vector tests.
+struct Gated {
+    model: zk::Model,
+    hold: Duration,
+    held: AtomicBool,
+    entered: Arc<AtomicUsize>,
+    inflight: Arc<AtomicUsize>,
+    peak: Arc<AtomicUsize>,
+}
+
+impl ProofBackend for Gated {
+    fn verify(&self, req: &Request, claimed: &[u8], proof: &[u8]) -> Result<Vec<u8>, BackendError> {
+        let running = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(running, Ordering::SeqCst);
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        if !self.held.swap(true, Ordering::SeqCst) {
+            std::thread::sleep(self.hold);
+        }
+        let revealed = self.model.verify(req, claimed, proof)?;
+        self.inflight.fetch_sub(1, Ordering::SeqCst);
+        Ok(revealed)
+    }
+}
+
+fn gated_registry(
+    hold: Duration,
+    entered: Arc<AtomicUsize>,
+    inflight: Arc<AtomicUsize>,
+    peak: Arc<AtomicUsize>,
+) -> Arc<dyn Fn(Arc<AtomicUsize>) -> BackendRegistry> {
+    Arc::new(move |loads| {
+        let hold = hold;
+        let entered = entered.clone();
+        let inflight = inflight.clone();
+        let peak = peak.clone();
+        let mut reg = BackendRegistry::new();
+        let mut profile = SystemProfile::single_issuer_age_check();
+        profile.issuer_key_set_max = 1;
+        reg.register(
+            SYSTEM_LONGFELLOW,
+            profile,
+            move |entry, _bytes| -> ZkpResult<Box<dyn ProofBackend>> {
+                loads.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::new(Gated {
+                    model: zk::Model {
+                        config: entry.config.clone(),
+                    },
+                    hold,
+                    held: AtomicBool::new(false),
+                    entered: entered.clone(),
+                    inflight: inflight.clone(),
+                    peak: peak.clone(),
+                }))
+            },
+        )
+        .expect("register the gated model");
+        reg
+    })
 }
 
 fn req(path: &str, method: &str) -> HttpRequestData {
@@ -539,6 +630,142 @@ async fn an_exhausted_budget_starts_no_zkp_verification() {
     assert_eq!(
         complete(&f, &state).await.err().unwrap(),
         "authentication error: processing_deadline"
+    );
+}
+
+#[tokio::test]
+async fn a_stalled_native_proof_does_not_stall_the_async_workers() {
+    // Native proof verification is synchronous work: it runs on the blocking
+    // pool, so a slow proof leaves the async workers free to serve every
+    // other request. The probe — the completion endpoint of a second,
+    // independent flow — answers while the first proof is still holding only
+    // if the runtime was never blocked. If the native call ran inline on the
+    // async worker, the probe would be starved for the whole hold.
+    let entered = Arc::new(AtomicUsize::new(0));
+    let inflight = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let f = build_full(
+        zcfg(),
+        None,
+        None,
+        None,
+        (60, 45, 16),
+        gated_registry(
+            Duration::from_millis(800),
+            entered.clone(),
+            inflight.clone(),
+            peak.clone(),
+        ),
+    )
+    .unwrap();
+    let (state, id) = start(&f).await;
+    let payload = jar(&f, &id).await;
+    let (jwe, _pseudonym) =
+        wallet_body(&payload, T0, &f.issuer_cert, &key_of(&f.issuer_cert), None);
+    let (state2, _id2) = start(&f).await;
+    let started = std::time::Instant::now();
+    let mut posted = Box::pin(post(&f, &id, &jwe));
+    // Let the response reach the native verify; the first proof now holds.
+    while entered.load(Ordering::SeqCst) == 0 {
+        tokio::time::timeout(Duration::from_millis(50), posted.as_mut())
+            .await
+            .expect_err("the first native verify holds; the POST cannot finish yet");
+    }
+    // The probe: pure async work on another flow, schedulable only while the
+    // runtime's workers are free.
+    let BackendAction::Respond(_page) =
+        tokio::time::timeout(Duration::from_millis(300), complete(&f, &state2))
+            .await
+            .expect("the async workers stay free while a native proof is stalled")
+            .unwrap_or_else(|e| panic!("a pending flow's completion endpoint answers: {e}"))
+    else {
+        panic!("a pending flow shows its waiting page")
+    };
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "the probe answered only after the native verify finished: \
+         {:?} elapsed — the verify ran on the async worker",
+        started.elapsed()
+    );
+    let (status, body) = posted.await;
+    assert_eq!(status, 200, "{body}");
+    let BackendAction::AuthResponse(data) = complete(&f, &state).await.unwrap() else {
+        panic!("expected auth response")
+    };
+    assert!(data.subject_id.is_some(), "the held proof verifies");
+    assert_eq!(peak.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn an_abandoned_native_verify_keeps_its_crypto_slot() {
+    // With one verification slot, a caller whose budget expires while its
+    // native verify still runs is gone — but its job keeps the crypto slot.
+    // The next response may claim and pass trust, and its native verify must
+    // not start until the abandoned job finishes: never two at once.
+    let entered = Arc::new(AtomicUsize::new(0));
+    let inflight = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let f = build_full(
+        zcfg(),
+        None,
+        None,
+        None,
+        (10, 1, 1),
+        gated_registry(
+            Duration::from_millis(1800),
+            entered.clone(),
+            inflight.clone(),
+            peak.clone(),
+        ),
+    )
+    .unwrap();
+    let (state, id) = start(&f).await;
+    let payload = jar(&f, &id).await;
+    let (jwe, _pseudonym) =
+        wallet_body(&payload, T0, &f.issuer_cert, &key_of(&f.issuer_cert), None);
+    let mut posted = Box::pin(post(&f, &id, &jwe));
+    while entered.load(Ordering::SeqCst) == 0 {
+        tokio::time::timeout(Duration::from_millis(50), posted.as_mut())
+            .await
+            .expect_err("the first native verify holds; the POST cannot finish yet");
+    }
+    // The caller's one-second budget expires while the proof still holds;
+    // its decision is the deadline refusal.
+    let (status, body) = posted.await;
+    assert_eq!(status, 504, "{body}");
+    let error: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(error["error"], "processing_deadline");
+    // A second response on its own flow: the abandoned job still holds the
+    // only crypto slot, so this verify must not start while it runs.
+    let (state2, id2) = start(&f).await;
+    let payload2 = jar(&f, &id2).await;
+    let (jwe2, _p2) = wallet_body(&payload2, T0, &f.issuer_cert, &key_of(&f.issuer_cert), None);
+    let mut posted2 = Box::pin(post(&f, &id2, &jwe2));
+    tokio::time::timeout(Duration::from_millis(250), posted2.as_mut())
+        .await
+        .expect_err("the second verify must wait for the abandoned job's slot");
+    assert_eq!(
+        inflight.load(Ordering::SeqCst),
+        1,
+        "the abandoned job still holds the only crypto slot"
+    );
+    // The hold ends: the abandoned job finishes (its late decision is
+    // discarded), the second acquires the freed slot and completes.
+    let (status2, body2) = posted2.await;
+    assert_eq!(status2, 200, "{body2}");
+    assert_eq!(
+        peak.load(Ordering::SeqCst),
+        1,
+        "never two native verifies at once"
+    );
+    let BackendAction::AuthResponse(data) = complete(&f, &state2).await.unwrap() else {
+        panic!("expected auth response")
+    };
+    assert!(data.subject_id.is_some());
+    assert_eq!(
+        complete(&f, &state).await.err().unwrap(),
+        "authentication error: processing_deadline",
+        "the abandoned flow stays refused"
     );
 }
 

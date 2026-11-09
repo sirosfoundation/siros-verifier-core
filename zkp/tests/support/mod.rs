@@ -19,7 +19,7 @@ pub use siros_verifier_zkp::testutil::*;
 
 /// A fixture: the holder's statement, a verifier with the model registered, and counters.
 pub struct Fx {
-    pub verifier: ZkpVerifier,
+    pub verifier: Arc<ZkpVerifier>,
     pub plan: Plan,
     pub loads: Arc<AtomicUsize>,
     pub cert: Vec<u8>,
@@ -84,7 +84,7 @@ pub fn fx(opts: Opts) -> Fx {
     .p256_key()
     .unwrap();
     Fx {
-        verifier,
+        verifier: Arc::new(verifier),
         plan: make_plan(&query(None, false), &[SYSTEM_LONGFELLOW]),
         loads,
         cert,

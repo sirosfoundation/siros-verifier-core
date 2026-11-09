@@ -396,3 +396,32 @@ The service crate is now a **library plus a thin binary**: `src/lib.rs` exposes
   `deny_unknown_fields` is removed from `DeploymentConfig` (the effective
   guard on this path; the flattened `VpBackendConfig`'s own deny is a
   separate, redundant layer).
+
+## Native ZKP verification moved off the async workers (2026-11-09)
+
+The worker-isolation follow-up tracked since the processing-deadline work is closed:
+native ZKP proof verification — the heaviest cryptographic work this adapter does —
+now runs on the blocking pool under the same crypto admission as the SD-JWT/mdoc
+core, instead of inline on the async worker. The driver's thread choice is why
+`zkp::verify::Pending` now owns an `Arc<ZkpVerifier>` and `begin` is an `Arc`
+method: the witness must carry the verifier's lifetime onto the blocking worker;
+the core stays sans-I/O and thread-agnostic. The ZKP response's parse and decrypt
+(phase one) stay inline — no native calls, bounded by the response limits.
+
+Two regressions pin the design, both built on a first-verify-holds backend (the
+hold is time-bounded so no mutant can hang a suite):
+
+- `a_stalled_native_proof_does_not_stall_the_async_workers` — while a proof holds,
+  the completion endpoint of an independent flow must still answer: pure async
+  work that is only schedulable while the runtime is free. Hand-verified: with
+  the spawn_blocking removed (verify inline), the probe is starved for the whole
+  hold and the elapsed assertion fails.
+- `an_abandoned_native_verify_keeps_its_crypto_slot` — with
+  `max_concurrent_verifications = 1` and a one-second deadline, a caller that
+  expires while its proof still holds is gone, but its job keeps the crypto slot;
+  the next response's verify must not start until the abandoned job finishes.
+  Hand-verified: with the permit released at job start instead of held, the
+  second verify runs immediately and the test fails.
+
+Both anchors are in the mutation harness (`plugin zkp blocking verify`,
+`plugin zkp crypto admission`), each killed cleanly and without a hang.

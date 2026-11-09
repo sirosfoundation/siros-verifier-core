@@ -106,8 +106,14 @@ struct Item {
 }
 
 /// A response that passed every check that needs no trust answer.
-pub struct Pending<'v> {
-    verifier: &'v ZkpVerifier,
+///
+/// The verifier is held by `Arc` because the driver owns the choice of thread
+/// for phase two: native proof verification is synchronous, so a driver runs
+/// `finish` wherever synchronous work belongs (a blocking worker), and the
+/// witness must carry the verifier's lifetime there. The core itself stays
+/// sans-I/O and thread-agnostic.
+pub struct Pending {
+    verifier: Arc<ZkpVerifier>,
     plan: Plan,
     transcript: Vec<u8>,
     verifier_input: [u8; 32],
@@ -171,7 +177,10 @@ impl ZkpVerifier {
     }
 
     /// Phase one. See the module documentation.
-    pub fn begin(&self, ex: &Exchange, vp_token_json: &str) -> ZkpResult<Pending<'_>> {
+    ///
+    /// Called on the `Arc` because the returned [`Pending`] carries the
+    /// verifier's lifetime to wherever the driver runs phase two.
+    pub fn begin(self: &Arc<Self>, ex: &Exchange, vp_token_json: &str) -> ZkpResult<Pending> {
         // The request this verifier sent must itself be satisfiable; a request that cannot be is a fault here, not a
         // wallet's defect.
         unsatisfiable(ex.plan).map_err(|e| {
@@ -277,7 +286,7 @@ impl ZkpVerifier {
             });
         }
         Ok(Pending {
-            verifier: self,
+            verifier: Arc::clone(self),
             plan: ex.plan.clone(),
             transcript,
             verifier_input,
@@ -307,7 +316,7 @@ impl ZkpVerifier {
     }
 }
 
-impl<'v> Pending<'v> {
+impl Pending {
     /// The questions to put to the trust layer, per presentation, in order.
     pub fn trust_queries(&self) -> Vec<&[MemberQueries]> {
         self.items.iter().map(|i| i.queries.as_slice()).collect()
@@ -315,7 +324,7 @@ impl<'v> Pending<'v> {
 
     /// Phase two. `verdicts[i][j]` is the answer for element `j` of presentation `i`.
     pub fn finish(self, verdicts: &[Vec<MemberVerdict>]) -> ZkpResult<Vec<VerifiedPresentation>> {
-        let v = self.verifier;
+        let v = self.verifier.as_ref();
         if verdicts.len() != self.items.len() {
             return Err(ZkpError::fault(
                 "one set of trust answers per presentation is required",

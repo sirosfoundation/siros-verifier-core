@@ -760,7 +760,7 @@ pub struct VpBackend {
 
 struct ZkpMode {
     cfg: ZkpBackendConfig,
-    verifier: ZkpVerifier,
+    verifier: std::sync::Arc<ZkpVerifier>,
     profiles: Vec<ZkpProfile>,
     vp_formats: Value,
 }
@@ -833,7 +833,7 @@ impl ZkpMode {
         }
         Ok(Self {
             cfg: zcfg,
-            verifier,
+            verifier: std::sync::Arc::new(verifier),
             profiles,
             vp_formats,
         })
@@ -1605,9 +1605,33 @@ impl VpBackend {
             }
             verdicts.push(per);
         }
-        let verified = match pending.finish(&verdicts) {
-            Ok(v) => v,
-            Err(e) => return self.zkp_failure(&e),
+        // Native proof verification is the heaviest cryptographic work this
+        // adapter does (a Longfellow proof is hundreds of KiB). It runs on
+        // the blocking pool under the same crypto admission as the
+        // SD-JWT/mdoc core below, so it cannot stall the async workers
+        // polling other requests; the permit moves into the job and is held
+        // until the job finishes, so even a caller-abandoned job keeps its
+        // slot and neither the running set nor the pool's queue can exceed
+        // the cap. The bounded parse and decrypt of phase one stay inline:
+        // they make no native calls and are already bounded by the body
+        // limits.
+        let crypto_permit = match self.crypto_permits.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                return Decision::failed("verifier_error", Response::text(500, "verifier error"));
+            }
+        };
+        let verified = match tokio::task::spawn_blocking(move || {
+            let _held_zkp_crypto = crypto_permit;
+            pending.finish(&verdicts)
+        })
+        .await
+        {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return self.zkp_failure(&e),
+            Err(_) => {
+                return Decision::failed("verifier_error", Response::text(500, "verifier error"));
+            }
         };
         let Some(first) = verified.first() else {
             return Decision::failed("no_presentation", Response::text(400, "no presentation"));

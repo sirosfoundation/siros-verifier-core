@@ -147,18 +147,20 @@ fn what_leaves_the_dispatch_equals_what_was_claimed_even_if_a_backend_forgets_to
         |_, _| Ok(Box::new(Careless) as Box<dyn ProofBackend>),
     )
     .unwrap();
-    let v = siros_verifier_zkp::verify::ZkpVerifier::new(
-        allow,
-        Box::new(FsArtifactSource),
-        siros_verifier_zkp::functions::FunctionRegistry::with_builtins(),
-        reg,
-        siros_verifier_zkp::verify::VerifierPolicy {
-            role: "r".into(),
-            issuer_set: siros_verifier_core::issuer_set::IssuerSetPolicy::AllTrusted,
-            tolerance: Default::default(),
-        },
-    )
-    .unwrap();
+    let v = std::sync::Arc::new(
+        siros_verifier_zkp::verify::ZkpVerifier::new(
+            allow,
+            Box::new(FsArtifactSource),
+            siros_verifier_zkp::functions::FunctionRegistry::with_builtins(),
+            reg,
+            siros_verifier_zkp::verify::VerifierPolicy {
+                role: "r".into(),
+                issuer_set: siros_verifier_core::issuer_set::IssuerSetPolicy::AllTrusted,
+                tolerance: Default::default(),
+            },
+        )
+        .unwrap(),
+    );
     let f = fx(Opts::default());
     let ch = dc_channel();
     let ex = siros_verifier_zkp::verify::Exchange {
