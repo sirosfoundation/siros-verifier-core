@@ -1,0 +1,66 @@
+# The HA soak's service configuration (docs/design/SOAK.md): two replicas of
+# the real binary run this same file against the shared MongoDB replica set,
+# with the soak driver's loopback go-trust stand-in as the PDP. Local HTTP
+# only — the soak is a local operational rehearsal, not a TLS profile.
+#
+# Before starting: export SIROS_VERIFIER_STATE_KEY and SIROS_VERIFIER_MONGODB_URI
+# as SOAK.md directs, and generate the two key files it names at the paths
+# below.
+base_url = "http://127.0.0.1:9001"
+state_encryption_key = "${SIROS_VERIFIER_STATE_KEY}"
+cookie_name = "SIROS_VERIFIER_STATE"
+cookie_secure = false
+cookie_same_site = "Lax"
+state_cookie_max_age = 900
+
+[logging]
+level = "info"
+format = "json"
+
+[[frontend]]
+type = "ui"
+name = "ui"
+  [frontend.config]
+  invocations = ["qr", "dc-api", "link"]
+  schemes = ["openid4vp"]
+
+  [[frontend.config.presets]]
+  id = "eudi_pid"
+  label = "EUDI PID (SD-JWT)"
+  dcql = { credentials = [{
+    id = "pid", format = "dc+sd-jwt",
+    meta = { vct_values = ["urn:eudi:pid:1"] },
+    claims = [{ path = ["given_name"] }, { path = ["family_name"] }],
+  }] }
+
+[[backend]]
+type = "openid4vp"
+name = "vp"
+  [backend.config]
+  request_signing_key_path = "/tmp/opencode/soak-keys/verifier.key"
+  request_certificate_chain_path = "/tmp/opencode/soak-keys/verifier.pem"
+  pdp_endpoint = "http://127.0.0.1:6001/evaluation"
+  pdp_id = "local-go-trust"
+  receipt_key_id = "soak-receipt"
+  receipt_issuer = "siros-verifier-core"
+  receipt_audience = "vp"
+  max_receipt_ttl_secs = 300
+  role = "pid-provider"
+  request_ttl_secs = 300
+  subject_pointer = "/family_name"
+  max_concurrent_verifications = 16
+  dcql = { credentials = [{
+    id = "pid", format = "dc+sd-jwt",
+    meta = { vct_values = ["urn:eudi:pid:1"] },
+    claims = [{ path = ["given_name"] }, { path = ["family_name"] }],
+  }] }
+  attribute_map = {
+    givenName = "/given_name",
+    sn = "/family_name",
+  }
+
+  [backend.config.storage]
+  backend = "mongodb"
+  uri = "${SIROS_VERIFIER_MONGODB_URI}"
+  database = "siros_verifier_soak"
+  collection = "presentation_flows"

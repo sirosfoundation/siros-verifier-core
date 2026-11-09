@@ -33,3 +33,10 @@ testutil = ["dep:rcgen", "siros-verifier-core/testutil"]
 [dev-dependencies]
 siros-verifier-core = { path = "..", version = "0.1.0", features = ["testutil"] }
 siros-verifier-zkp = { path = ".", features = ["testutil"] }
+
+# The native-verification soak: sustained genuine proof verification through
+# the same blocking-pool and admission shape the service uses. Sources live
+# with the other developer-only tools under docs/design/examples/.
+[[example]]
+name = "soak_native"
+path = "../docs/design/examples/soak_native.rs"
