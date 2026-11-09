@@ -88,6 +88,10 @@ struct Stats {
     /// created or never served a request object.
     not_accepted: AtomicU64,
     duplicate_completions: AtomicU64,
+    /// Exactly-once re-collections actually performed (the sample is every
+    /// 10th completed flow). The PASS gate requires at least one performed
+    /// check: a run whose every sample errored must not report success.
+    duplicate_checks: AtomicU64,
     /// Flows whose result WAS delivered exactly once, but whose delivering
     /// response was severed by the killed replica between the store's
     /// one-time Collected transition and the HTTP response leaving. The
@@ -509,9 +513,13 @@ async fn one_flow(
                                 if sampled {
                                     // Exactly-once, sampled: collecting again
                                     // must NOT show the result a second time.
+                                    // A transiently failing re-collect skips
+                                    // the check — it is counted as performed
+                                    // only when it actually ran.
                                     if let Ok((_, again)) =
                                         get_complete(client, &base, &cookie).await
                                     {
+                                        stats.duplicate_checks.fetch_add(1, Ordering::SeqCst);
                                         if again.contains("Credential verified") {
                                             stats
                                                 .duplicate_completions
@@ -775,7 +783,8 @@ fn report(
     println!("abandoned:          {abandoned}");
     println!("never accepted:     {not_accepted}");
     let duplicates = stats.duplicate_completions.load(Ordering::SeqCst);
-    println!("duplicate results:  {duplicates}");
+    let checks = stats.duplicate_checks.load(Ordering::SeqCst);
+    println!("duplicate results:  {duplicates} (of {checks} sampled re-collections)");
     let recovered =
         last_completion.load(Ordering::SeqCst) >= last_connect_failure.load(Ordering::SeqCst);
     println!("completions resumed after the last connect failure: {recovered}");
@@ -787,7 +796,12 @@ fn report(
     for detail in stats.details.lock().unwrap().iter() {
         println!("  why: {detail}");
     }
-    let pass = duplicates == 0 && completed > 0 && recovered && abandoned == 0 && all_terminal;
+    let pass = duplicates == 0
+        && completed > 0
+        && checks > 0
+        && recovered
+        && abandoned == 0
+        && all_terminal;
     println!("VERDICT: {}", if pass { "PASS" } else { "FAIL" });
     if !pass {
         std::process::exit(1);
