@@ -1,25 +1,22 @@
-//! The SIROS verifier gateway: an actix HTTP server, a real tunnelbana OIDC
-//! frontend, and the OpenID4VP backend from `siros-verifier-core-tunnelbana`.
+//! The SIROS verifier gateway binary: an actix HTTP server around a real
+//! tunnelbana OIDC frontend and the OpenID4VP backend from
+//! `siros-verifier-core-tunnelbana`, assembled from the library modules in
+//! this package (`siros_verifier_service`).
 
-mod config;
-mod http;
-mod mongo_store;
-
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer};
+use actix_web::{web, App, HttpServer};
 use anyhow::{anyhow, bail, Context as _};
-use config::{DeploymentConfig, FlowStorageConfig, ZkpDeploymentConfig};
 use grindvakt::provider::TokenUseStore;
-use http::ReqwestClient;
-use mongo_store::{MongoFlowStore, MongoTokenUseStore};
 use siros_verifier_core::oid4vp;
 use siros_verifier_core::session_seal::SessionSealer;
 use siros_verifier_core_tunnelbana::{
     system_clock, ui::UiFrontend, FlowStore, HttpPdp, MemoryFlowStore, PdpClient,
     ReqwestStatusListClient, TrustGate, VpBackend,
 };
+use siros_verifier_service::config::{DeploymentConfig, FlowStorageConfig, ZkpDeploymentConfig};
+use siros_verifier_service::http::{self, ReqwestClient};
+use siros_verifier_service::mongo_store::{MongoFlowStore, MongoTokenUseStore};
 use siros_verifier_zkp::backend::{BackendRegistry, ProofBackend, SystemProfile};
 use siros_verifier_zkp::catalog::CatalogArtifactSource;
 use siros_verifier_zkp::circuits::Allowlist;
@@ -30,14 +27,10 @@ use siros_verifier_zkp::vega::VegaBackend;
 use siros_verifier_zkp::verify::{VerifierPolicy, ZkpVerifier};
 use tunnelbana_core::attributes::AttributeMapper;
 use tunnelbana_core::config::ProxyConfig;
-use tunnelbana_core::http::{HttpClient, HttpRequestData, Response};
+use tunnelbana_core::http::HttpClient;
 use tunnelbana_core::plugin::{BuildContext, Registry};
 use tunnelbana_core::proxy::Proxy;
 use tunnelbana_core::state::StateSealer;
-
-// A real Longfellow nym_auth proof is about 344 KiB before CBOR and JWE
-// base64 expansion. Keep a hard limit, but allow those genuine presentations.
-const MAX_HTTP_BODY_BYTES: usize = 2 * 1024 * 1024;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -68,9 +61,9 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new()
             .app_data(proxy.clone())
-            .app_data(web::PayloadConfig::new(MAX_HTTP_BODY_BYTES))
-            .route("/health", web::get().to(health))
-            .default_service(web::to(handle))
+            .app_data(web::PayloadConfig::new(http::MAX_HTTP_BODY_BYTES))
+            .route("/health", web::get().to(http::health))
+            .default_service(web::to(http::handle))
     })
     .bind(&bind)?
     .run()
@@ -395,135 +388,4 @@ fn resolve_sibling(config_path: &str, rel: &str) -> std::path::PathBuf {
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .join(p)
-}
-
-async fn health() -> HttpResponse {
-    HttpResponse::Ok().json(serde_json::json!({ "status": "ok" }))
-}
-
-async fn handle(req: HttpRequest, body: web::Bytes, proxy: web::Data<Arc<Proxy>>) -> HttpResponse {
-    let request = build_request_data(&req, &body);
-    let response = proxy.run(request).await;
-    to_actix(response)
-}
-
-fn build_request_data(req: &HttpRequest, body: &web::Bytes) -> HttpRequestData {
-    let path = req.path().trim_start_matches('/').to_string();
-    let method = req.method().as_str().to_uppercase();
-    let query_pairs = form_urlencoded::parse(req.query_string().as_bytes())
-        .map(|(k, v)| (k.into_owned(), v.into_owned()))
-        .collect::<Vec<_>>();
-    let query = query_pairs.iter().cloned().collect();
-
-    let mut headers = BTreeMap::new();
-    for (name, value) in req.headers() {
-        if let Ok(v) = value.to_str() {
-            headers.insert(name.as_str().to_lowercase(), v.to_string());
-        }
-    }
-    let is_form = headers
-        .get("content-type")
-        .map(|c| c.starts_with("application/x-www-form-urlencoded"))
-        .unwrap_or(false);
-    let form_pairs = if is_form {
-        form_urlencoded::parse(std::str::from_utf8(body).unwrap_or("").as_bytes())
-            .map(|(k, v)| (k.into_owned(), v.into_owned()))
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-    let form = form_pairs.iter().cloned().collect();
-    let cookies = parse_cookies(headers.get("cookie").map(|s| s.as_str()).unwrap_or(""));
-    let uri = format!(
-        "{}://{}{}",
-        req.connection_info().scheme(),
-        req.connection_info().host(),
-        req.uri()
-    );
-
-    HttpRequestData {
-        path,
-        method,
-        uri,
-        query_pairs,
-        query,
-        form_pairs,
-        form,
-        body: body.to_vec(),
-        headers,
-        cookies,
-    }
-}
-
-fn parse_cookies(header: &str) -> BTreeMap<String, String> {
-    let mut map = BTreeMap::new();
-    for part in header.split(';') {
-        let part = part.trim();
-        if let Some((k, v)) = part.split_once('=') {
-            map.insert(k.trim().to_string(), v.trim().to_string());
-        }
-    }
-    map
-}
-
-fn to_actix(resp: Response) -> HttpResponse {
-    let status = actix_web::http::StatusCode::from_u16(resp.status)
-        .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
-    let mut builder = HttpResponse::build(status);
-    for (k, v) in &resp.headers {
-        builder.append_header((k.clone(), v.clone()));
-    }
-    builder.body(resp.body)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use actix_web::{http::StatusCode, test};
-
-    #[actix_web::test]
-    async fn health_returns_status_ok() {
-        let app = test::init_service(App::new().route("/health", web::get().to(health))).await;
-        let req = test::TestRequest::get().uri("/health").to_request();
-        let resp = test::call_service(&app, req).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body: serde_json::Value = test::read_body_json(resp).await;
-        assert_eq!(body, serde_json::json!({ "status": "ok" }));
-    }
-
-    #[actix_web::test]
-    async fn genuine_longfellow_response_size_fits_the_http_body_limit() {
-        let app = test::init_service(
-            App::new()
-                .app_data(web::PayloadConfig::new(MAX_HTTP_BODY_BYTES))
-                .default_service(web::to(|_body: web::Bytes| async {
-                    HttpResponse::Ok().finish()
-                })),
-        )
-        .await;
-        // Measured from a genuine Pixel Longfellow direct_post.jwt response.
-        let req = test::TestRequest::post()
-            .uri("/vp/response/id")
-            .set_payload(vec![0u8; 1_102_937])
-            .to_request();
-        let response = test::call_service(&app, req).await;
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[actix_web::test]
-    async fn request_adapter_preserves_duplicate_protocol_parameters() {
-        let request = test::TestRequest::post()
-            .uri("/vp/response/id?resource=first&resource=second&state=one&state=two")
-            .insert_header(("content-type", "application/x-www-form-urlencoded"))
-            .to_http_request();
-        let body = web::Bytes::from_static(b"response=first&response=second");
-        let data = build_request_data(&request, &body);
-        assert_eq!(data.query_pairs.len(), 4);
-        assert_eq!(data.form_pairs.len(), 2);
-        assert_eq!(data.query.get("state").map(String::as_str), Some("two"));
-        assert_eq!(
-            data.form.get("response").map(String::as_str),
-            Some("second")
-        );
-    }
 }

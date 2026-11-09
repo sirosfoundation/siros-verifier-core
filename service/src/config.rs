@@ -85,23 +85,3 @@ impl DeploymentConfig {
         self.max_receipt_ttl_secs.unwrap_or(300)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unknown_deployment_fields_are_refused() {
-        let value = serde_json::json!({
-            "request_signing_key_path": "/k",
-            "request_certificate_chain_path": "/c",
-            "pdp_endpoint": "https://pdp.example/evaluation",
-            "dcql": {"credentials": []},
-            "attribute_map": {},
-            "subject_pointer": "/sub",
-            "role": "pid-provider",
-            "unexpected": true
-        });
-        assert!(serde_json::from_value::<DeploymentConfig>(value).is_err());
-    }
-}

@@ -360,3 +360,39 @@ binds reference uri`, `status iat required`, `status iat future`), each killed b
 built from the decision's own terms: a second same-signer list rejected against the reference it
 was not named by at both boundaries while verifying and reading against its own URI, a list
 without `iat`, and a list issued in the future.
+
+## Service lib/bin split (2026-11-09)
+
+The service crate is now a **library plus a thin binary**: `src/lib.rs` exposes
+`config`, `http`, and `mongo_store`; `src/main.rs` keeps only the assembly
+(config load, tracing, backend factories, server startup). Two consequences:
+
+- **The inbound actix adapter lives in `http.rs`**: `MAX_HTTP_BODY_BYTES`, the
+  health endpoint, the request/response translators, and the default handler
+  are now library items — the binary's server setup just wires them.
+- **No test lives under `src/` anymore.** The Mongo store's inline test
+  module moved to `tests/mongo_store.rs` behind the public API, which also
+  let the private-only tests become stronger public ones. The serialization
+  guarantee is now an exact raw-document key-set check against what MongoDB
+  actually stored — for a pending flow and again after a completed outcome,
+  whose sealed result must appear under `outcome.value` and nowhere else.
+  The outer operation bound has two regressions: a dead-port connect that
+  must fail closed (the driver's own connection and server-selection bounds
+  end that one, as review correctly noted), and a handshake-only relay in
+  front of the real MongoDB that forwards exactly the server's first reply
+  on every connection — so the handshake, server selection, and any
+  authentication all succeed — and then holds every later reply: a healthy
+  server whose commands never return. Only the store's own bound may end the
+  operation, and the test asserts that exact failure ("operation timed
+  out"); hand-verified both ways — with the outer timeout removed the
+  dead-port test still passes while the relay test fails. `bounded_with_timeout`
+  — which existed only so the inline test could inject a shorter timeout —
+  collapsed back into `bounded`. The one other inline test — the deployment
+  config's unknown-field refusal — moved to `tests/config.rs` and gained the
+  positive control its old fixture lacked: the fixture had omitted the
+  required `storage` field, so the old assertion passed for that reason even
+  without the refusal. It now proves the document parses without the extra
+  field, is refused with the unknown field named, and fails when
+  `deny_unknown_fields` is removed from `DeploymentConfig` (the effective
+  guard on this path; the flattened `VpBackendConfig`'s own deny is a
+  separate, redundant layer).
