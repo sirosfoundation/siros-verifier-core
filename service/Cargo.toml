@@ -37,5 +37,13 @@ tunnelbana-plugins = { git = "https://github.com/sirosfoundation/tunnelbana.git"
 [dev-dependencies]
 futures-util = "0.3"
 rcgen = "0.14"
+siros-verifier-core = { path = "..", features = ["testutil"] }
 tokio = { version = "1", features = ["full"] }
 zstd = "0.14.3"
+
+# The HA/overload soak driver: a dev-only wallet-and-load harness that drives
+# the real running service over HTTP. Sources live with the other developer-only
+# tools under docs/design/examples/, per the repo's layout rule.
+[[example]]
+name = "soak_driver"
+path = "../docs/design/examples/soak_driver.rs"
