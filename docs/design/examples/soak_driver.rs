@@ -355,9 +355,13 @@ async fn one_flow(
             Err(Step::Network) => {
                 mark_suspect(&suspect_until[*replica], last_connect_failure);
                 stats.connect_failovers.fetch_add(1, Ordering::SeqCst);
-                if replicas.len() < 2 || !switch_replica(replicas, replica, &mut base) {
+                if replicas.len() < 2
+                    || !switch_replica(replicas, replica, &mut base)
+                    || flow_began.elapsed() > STORE_RETRY
+                {
                     return Outcome::NotAccepted;
                 }
+                tokio::time::sleep(Duration::from_millis(250)).await;
             }
             Err(Step::Gone) => return Outcome::NotAccepted,
         }
@@ -379,9 +383,13 @@ async fn one_flow(
             Err(Step::Network) => {
                 mark_suspect(&suspect_until[*replica], last_connect_failure);
                 stats.connect_failovers.fetch_add(1, Ordering::SeqCst);
-                if replicas.len() < 2 || !switch_replica(replicas, replica, &mut base) {
+                if replicas.len() < 2
+                    || !switch_replica(replicas, replica, &mut base)
+                    || Instant::now() > store_deadline
+                {
                     return Outcome::NotAccepted;
                 }
+                tokio::time::sleep(Duration::from_millis(250)).await;
             }
             Err(Step::Gone) => return Outcome::NotAccepted,
         }
@@ -430,6 +438,13 @@ async fn one_flow(
                     continue;
                 }
                 Ok(status) => {
+                    // A definitive refusal (400, 504 deadline, ...) means the
+                    // response was received and processed to a terminal,
+                    // persisted failed outcome (the deadline regression proves
+                    // the refusal answers the collect). Count it as accepted
+                    // AND refused, so completed + refused == accepted holds.
+                    stats.accepted.fetch_add(1, Ordering::SeqCst);
+                    stats.refused.fetch_add(1, Ordering::SeqCst);
                     stats.note(format!("flow {flow_id}: POST refused {status}"));
                     return Outcome::Refused;
                 }
