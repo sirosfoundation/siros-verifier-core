@@ -9,13 +9,16 @@ name: OIDF conformance (verifier)
 # PRs only (not pushes to main) — the suite run costs minutes the merge
 # queue does not need twice; the tag path and workflow_dispatch cover main.
 #
-# Release tags (v*) hand the report set to the conformance repo via a
-# repository_dispatch (event_type: conformance-verifier). THE PUBLISH CHAIN
-# IS PENDING ON THAT REPO'S SIDE: its verifier workflow accepts the
-# dispatch but does not yet honor verifier-impl=core, and no gh-pages
-# publish of verifier reports exists there yet — docs/oidf-conformance.md
-# tracks the follow-up. This side's contract is a well-formed, authorized
-# dispatch carrying the tag and the run URL. A PR's results stay in the
+# Release tags (v*) carry the report set on the release itself: the
+# certification ZIPs PLUS the run summary upload with github.token (no
+# expiry, nothing to rotate), and the conformance repo's own
+# publish-releases.yml PULLS them from the public release assets on its
+# daily check (or immediately, via its workflow_dispatch) and publishes
+# the set to conformance.siros.org under releases/verifier-core/<tag>/.
+# No cross-repo credential exists anywhere - the earlier
+# repository_dispatch design needed a fine-grained PAT whose 90-day
+# expiry would silently break the publish each quarter, and it is gone.
+# A PR's results stay in the
 # run's artifacts either way: a PR is a conversation, not a release.
 #
 # A GREEN CHECK MEANS THE PLAN RAN AND PASSED: the readiness waits hard-fail
@@ -54,7 +57,13 @@ on:
         default: ""
 
 permissions:
-  contents: read
+  # Read everywhere; write ONLY on the release tags (the certification
+  # ZIPs and the run summary upload to the release). The
+  # conformance.siros.org publish is the conformance repo's own pull
+  # workflow (publish-releases.yml) reading these public assets — this
+  # repo hands nothing over, so it holds no cross-repo credential at
+  # all, and nothing here ever expires.
+  contents: ${{ github.ref_type == 'tag' && 'write' || 'read' }}
 
 concurrency:
   # The event name isolates manual experiments (workflow_dispatch) from
@@ -314,27 +323,22 @@ jobs:
             conformance-repo/playwright-report/
           if-no-files-found: error
 
-      # RELEASE TAG PUSHES ONLY: hand the report set to the conformance repo
-      # via a repository_dispatch — event_type: conformance-verifier, the
-      # trigger its verifier workflow listens for. Push-event-only on
-      # purpose: workflow_dispatch against a tag ref would otherwise satisfy
-      # the tag check, sending the release hand-off from a manual run whose
-      # harness pin may be overridden — manual runs are experiments, never
-      # the release record. The chain PUBLISHES NOTHING yet: that repo must
-      # first honor verifier-impl=core and add the gh-pages publish for
-      # verifier reports (tracked in docs/oidf-conformance.md); until then
-      # this dispatch lands as a (currently red) run on its side. The
-      # dispatch endpoint requires Contents: write — see
-      # docs/conformance-dispatch-token.md for the token, its exact
-      # permission, and why that grant is what it is.
-      - name: Hand the results to the conformance repo (release tags only)
+      # RELEASE TAG PUSHES ONLY: the release's conformance verdict rides the
+      # release itself — the certification ZIP (the verdict gate above proves
+      # it is the passing attempt's) plus the run summary. github.token
+      # carries the upload, and the conformance repo's pull workflow
+      # (publish-releases.yml) reads these public assets on its daily check
+      # and publishes the set to conformance.siros.org under
+      # releases/verifier-core/<tag>/. Push-event-only on purpose:
+      # workflow_dispatch against a tag ref would otherwise satisfy the tag
+      # check, sending the release record from a manual run whose harness pin
+      # may be overridden — manual runs are experiments, never the release
+      # record. No cross-repo secret, nothing to rotate.
+      - name: The certification ZIP and run summary, on the release
         if: github.event_name == 'push' && github.ref_type == 'tag'
+        working-directory: conformance-repo
         env:
-          GH_TOKEN: ${{ secrets.CONFORMANCE_DISPATCH_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          gh api -X POST \
-            "/repos/sirosfoundation/siros-conformance/dispatches" \
-            -f event_type=conformance-verifier \
-            -f "client_payload[verifier-impl]=core" \
-            -f "client_payload[release-tag]=${GITHUB_REF_NAME}" \
-            -f "client_payload[run-url]=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          ls conformance-results/*.zip conformance-results/*summary*.json 2>/dev/null || { echo "No exported plan ZIP or summary"; exit 0; }
+          gh release upload "${GITHUB_REF_NAME}" conformance-results/*.zip conformance-results/*summary*.json --clobber

@@ -108,16 +108,18 @@ human part: read the report set the gate guarantees exists.
 
 - **Pull requests**: the results ride the run's artifacts (the Checks tab),
   never the site — a PR is a conversation, not a release.
-- **Release tags (`v*`)**: the run hands the report set to the conformance
-  repo via a `repository_dispatch` (`event_type: conformance-verifier`)
-  carrying the tag and the run URL, authenticated by the token in
-  [conformance-dispatch-token.md](conformance-dispatch-token.md).
-  **PENDING on the conformance repo's side**: its verifier workflow accepts
-  the dispatch but does not yet honor `verifier-impl=core`, and it has no
-  gh-pages publish for verifier reports yet — so a release's reports reach
-  **conformance.siros.org** only after that repo lands its core-mode
-  publish chain (one report set per release, addressable from the release
-  notes and diffable against the previous release, is the target design).
+- **Release tags (`v*`)**: the run uploads the report set — the
+  certification ZIPs plus the run summary — to the release itself with
+  `github.token`, and the conformance repo's own
+  [`publish-releases.yml`](https://github.com/sirosfoundation/siros-conformance/blob/main/.github/workflows/publish-releases.yml)
+  **pulls** the public release assets on its daily check (or immediately,
+  via its workflow_dispatch) and publishes the set to
+  **conformance.siros.org** under `releases/verifier-core/<tag>/` — one
+  report set per release, addressable from the release notes and diffable
+  against the previous release. No cross-repo credential exists anywhere
+  (the earlier `repository_dispatch` design needed a fine-grained PAT whose
+  90-day expiry would silently break the publish each quarter; it is gone,
+  runbook and all).
   Until then the tag's results live in the tag run's artifacts.
 - **Manual**: `workflow_dispatch` runs the same path, optionally overriding
   the harness pin with its `conformance-ref` input (a branch or commit on
