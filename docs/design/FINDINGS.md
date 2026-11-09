@@ -387,4 +387,12 @@ The service crate is now a **library plus a thin binary**: `src/lib.rs` exposes
   out"); hand-verified both ways — with the outer timeout removed the
   dead-port test still passes while the relay test fails. `bounded_with_timeout`
   — which existed only so the inline test could inject a shorter timeout —
-  collapsed back into `bounded`.
+  collapsed back into `bounded`. The one other inline test — the deployment
+  config's unknown-field refusal — moved to `tests/config.rs` and gained the
+  positive control its old fixture lacked: the fixture had omitted the
+  required `storage` field, so the old assertion passed for that reason even
+  without the refusal. It now proves the document parses without the extra
+  field, is refused with the unknown field named, and fails when
+  `deny_unknown_fields` is removed from `DeploymentConfig` (the effective
+  guard on this path; the flattened `VpBackendConfig`'s own deny is a
+  separate, redundant layer).
