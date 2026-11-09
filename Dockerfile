@@ -1,17 +1,16 @@
 # Build the gateway with its locked dependency graph; no SSH credentials are needed.
-FROM rust:1.98-bookworm AS build
+# Alpine/musl end to end: the runtime image is Alpine, so the build stage
+# compiles against musl too — a glibc binary would not run on the Alpine base.
+FROM rust:1.98-alpine AS build
 WORKDIR /src
 COPY . .
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends zstd \
+RUN apk add --no-cache ca-certificates cmake g++ git make musl-dev perl zstd \
     && mkdir -p /etc/siros-verifier/circuits \
     && zstd -d -f /src/zkp/testdata/nymauth/mdoc-circuits.zst -o /etc/siros-verifier/circuits/nymauth-mdoc.bin \
     && cargo build --locked --release -p siros-verifier-service
 
-FROM debian:bookworm-slim
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
-    && rm -rf /var/lib/apt/lists/*
+FROM alpine:3.22
+RUN apk add --no-cache ca-certificates curl
 COPY --from=build /src/target/release/siros-verifier-service /usr/local/bin/siros-verifier-service
 COPY --from=build /etc/siros-verifier/circuits/nymauth-mdoc.bin /etc/siros-verifier/circuits/nymauth-mdoc.bin
 ENV TUNNELBANA_BIND=0.0.0.0:9001
