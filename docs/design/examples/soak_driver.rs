@@ -441,10 +441,11 @@ async fn one_flow(
                     // A definitive refusal (400, 504 deadline, ...) means the
                     // response was received and processed to a terminal,
                     // persisted failed outcome (the deadline regression proves
-                    // the refusal answers the collect). Count it as accepted
-                    // AND refused, so completed + refused == accepted holds.
+                    // the refusal answers the collect). Count the acceptance
+                    // here — the service answered the POST — and let
+                    // drive_user's Outcome::Refused arm count the refusal
+                    // exactly once, so completed + refused == accepted holds.
                     stats.accepted.fetch_add(1, Ordering::SeqCst);
-                    stats.refused.fetch_add(1, Ordering::SeqCst);
                     stats.note(format!("flow {flow_id}: POST refused {status}"));
                     return Outcome::Refused;
                 }
