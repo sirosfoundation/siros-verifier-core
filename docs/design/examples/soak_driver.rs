@@ -92,9 +92,12 @@ struct Stats {
     /// 10th completed flow). The PASS gate requires at least one performed
     /// check: a run whose every sample errored must not report success.
     duplicate_checks: AtomicU64,
-    /// Presentations in flight right now, and the deepest concurrency the
-    /// run actually offered — the measured evidence for the overload claim,
-    /// against the service's verification-slot budget.
+    /// Whole presentations in flight right now (initiation, verification,
+    /// and collection — not verification work alone), and the deepest such
+    /// concurrency the run offered. This is the offered presentation depth;
+    /// each replica admits at most its own configured number of
+    /// verification pipelines, so the verification-phase concurrency per
+    /// replica is at or below this.
     in_flight: AtomicU64,
     max_in_flight: AtomicU64,
     /// Flows whose result WAS delivered exactly once, but whose delivering
@@ -585,19 +588,27 @@ async fn one_flow(
                         stats.note(format!("flow {flow_id}: request expired before terminal"));
                         return Outcome::Refused;
                     }
-                    // The store is the authority on delivery: for an
-                    // ACCEPTED flow inside its recovery window, `unknown`
-                    // can only be the one-time Collected transition — the
-                    // only writer of that outcome — firing on the driver's
-                    // own collect (a response severed mid-flight, or an
-                    // error page that still consumed). Retention (20
-                    // minutes) dwarfs the recovery window, so a vanished
-                    // record is not a reading here. Delivered exactly once.
-                    "unknown" => {
+                    // `unknown` means the record is Collected or absent,
+                    // and /vp/status cannot tell the two apart. With the
+                    // interrupted-collect evidence, Collected is the only
+                    // reading: the one-time transition fired on the
+                    // driver's own collect and the response was severed
+                    // after the write — delivered exactly once, unseen.
+                    // WITHOUT that evidence, consumption the driver cannot
+                    // explain is an anomaly (a fully-received error page
+                    // that still consumed, or a record gone missing), and
+                    // it must fail the verdict rather than mask a bug.
+                    "unknown" if collect_disconnect => {
                         stats.note(format!(
-                            "flow {flow_id}: delivered exactly once (stored Collected); collect disconnect observed: {collect_disconnect}"
+                            "flow {flow_id}: delivered exactly once; the collect's response was severed after the Collected transition"
                         ));
                         return Outcome::DeliveredUnseen;
+                    }
+                    "unknown" => {
+                        stats.note(format!(
+                            "flow {flow_id}: stored outcome unknown without an interrupted collect — unexplained consumption"
+                        ));
+                        return Outcome::Abandoned;
                     }
                     other => {
                         stats.note(format!("flow {flow_id}: status {other}"));
@@ -796,7 +807,7 @@ fn report(
     println!("\n=== soak_driver summary ({:.0}s) ===", wall.as_secs_f64());
     println!("started:            {started}");
     println!(
-        "max presentations in flight: {} (offered concurrency, measured against the verifier's verification-slot budget)",
+        "max presentations in flight: {} (whole-flow depth; verification-phase concurrency per replica is at or below its slot budget)",
         stats.max_in_flight.load(Ordering::SeqCst)
     );
     println!(

@@ -128,7 +128,7 @@ non-destructive `/vp/status` first and only then collects):
 
 ```
 started:            38310
-max presentations in flight: 32   (offered concurrency; the verifier's
+max presentations in flight: 32   (whole-flow depth; each replica's
                                   budget is 16 verification slots)
 accepted:           38310  (200: 38305, 409: 5)
 re-driven after lease expiry: 4
@@ -147,11 +147,14 @@ every accepted flow reached a terminal state: true
 VERDICT: PASS
 ```
 
-~213 flows/second sustained across the two replicas at **twice the
-admission budget** (32 concurrent users, measured at 32 presentations in
-flight against the 16 verification slots), every flow a complete genuine
-SD-JWT presentation: nonce-bound KB-JWT and JWE response, a trust
-evaluation, a majority write, and one-time collection.
+~213 flows/second sustained across the two replicas. The offered
+presentation depth is measured at 32 whole flows in flight (initiation,
+verification, and collection; not verification work alone) — 16 per replica
+on average, which is **at** each replica's 16-slot verification budget, not
+above it; the recorded run demonstrates the budget holding at capacity, and
+the heavier rehearsal below is the above-capacity data point. Every flow is
+a complete genuine SD-JWT presentation: nonce-bound KB-JWT and JWE
+response, a trust evaluation, a majority write, and one-time collection.
 
 Every flow caught in the SIGKILL window resolved, each by its designed path:
 
@@ -170,10 +173,12 @@ Every flow caught in the SIGKILL window resolved, each by its designed path:
   connection never sees its result (measured at roughly 1 per 20k-40k flows
   at the kill boundary across rehearsals). The raw MongoDB record proves
   `outcome: collected` with the original claim's lease — no duplicate, no
-  loss. The driver classifies these as `delivered-unseen` (counted as
-  delivered, reported separately); the store's `Collected` outcome is the
-  authority: for an accepted flow inside its recovery window, status
-  `unknown` can only be that one-time transition firing.
+  loss. The driver classifies one of these as `delivered-unseen` **only with
+  the interrupted-collect evidence** (a disconnect on the very collect whose
+  store transition fired); an `unknown` status the driver cannot explain
+  that way — a fully-received error page that still consumed, or a record
+  gone missing — fails the verdict as an abandonment, so an anomalous
+  consumption can never quietly satisfy the gate.
 - **0 abandoned, 0 duplicates, 0 lost results.**
 
 A longer observation from an earlier rehearsal of the same stack: under a
