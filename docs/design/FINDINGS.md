@@ -329,3 +329,34 @@ vectors decrypt through jose-rs, and `scripts/interop.sh` verifies new jose-rs-p
 - **Mutation coverage.** New checks cover duplicate-JSON rejection and session-sealing policy, alongside the migrated
   OpenID4VP response checks. All 124 checks are killed, with no survivors or missing snippets. The gateway flow tests
   exercise sealing and unsealing on every login, and the Kotlin tests pass after the primitive upgrades.
+
+## TSL token strictness decision (2026-11-08)
+
+The status list token's claims are now held to Token Status List **draft-ietf-oauth-status-list-21**
+(§5.1, §8.3) exactly, with the OIDF suite's own live tokens as the compatibility oracle (decoded from
+the first green conformance run's artifact):
+
+- **`sub` ↔ reference-URI binding, extended to every `verify_token` consumer.** The binding
+  existed only at the lookup (`status_at`), which on the plugin's pipeline already ran before the
+  signer trust query — so the plugin path was covered. The change adds the binding to the
+  `verify_token` boundary itself (§8.3's processing order at token validation), so every consumer
+  — not only ones that go on to call `status_at` with the matched reference — rejects a
+  mismatched list by default, fail-closed at the API boundary. The `status_at` guard stays: it is
+  not a duplicate but the public lookup's own contract — the bit read for a reference must come
+  from the list that reference names, whichever boundary the caller came from. The security
+  property: a signer operating many lists must not have a different list — one where a
+  credential's index reads `0` — speak for a credential that referenced another.
+- **`iat` is required.** §5.1 marks it REQUIRED; the verifier previously accepted lists with no
+  issuance instant at all. Present-but-malformed values were already rejected; absence now is too.
+  The future bound (`> now + 60`) stays.
+- **`iss` stays unread, deliberately.** It is not a TSL claim — the JWT profile requires `sub`,
+  `iat`, `exp`/`ttl` and `status_list`, and the header `typ: statuslist+jwt` (already enforced) —
+  and the suite's own tokens carry no `iss`. Requiring it would reject spec-conformant lists.
+  Signer trust remains go-trust's decision over the token's x5c/JWK key evidence.
+- `exp` remains honored when present (§5.1 RECOMMENDED, MUST check when present).
+
+Four `sl` mutation anchors pin the decision (`status sub binds reference uri`, `status lookup
+binds reference uri`, `status iat required`, `status iat future`), each killed by a regression
+built from the decision's own terms: a second same-signer list rejected against the reference it
+was not named by at both boundaries while verifying and reading against its own URI, a list
+without `iat`, and a list issued in the future.
