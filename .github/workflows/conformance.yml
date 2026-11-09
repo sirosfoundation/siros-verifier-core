@@ -354,10 +354,17 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: verifier-conformance-results
-          path: conformance-results
+          # The artifact's common root is conformance-repo/ — the three
+          # uploaded paths share it — so it already carries
+          # conformance-results/ at its root. Download into the workspace
+          # to preserve those paths for the globs below.
+          path: .
       - name: The certification ZIP and run summary, on the release
         env:
           GH_TOKEN: ${{ github.token }}
+          # No checkout in this job: the token authenticates, GH_REPO
+          # selects the repository the release lives on.
+          GH_REPO: ${{ github.repository }}
         run: |
           ls conformance-results/*.zip conformance-results/*summary*.json 2>/dev/null || { echo "No exported plan ZIP or summary"; exit 0; }
           gh release upload "${GITHUB_REF_NAME}" conformance-results/*.zip conformance-results/*summary*.json --clobber
