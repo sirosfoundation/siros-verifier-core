@@ -8,12 +8,20 @@
 //! (the explicitly supported plain-HTTP loopback PDP mode): every evaluation
 //! is answered with the configured verdict.
 //!
-//! Invariants it holds the service to, reported at the end:
-//!   - a flow that was answered 200 completes exactly once (sampled);
-//!   - a connect failure on one replica is served by the other (shared flow
-//!     state — any replica can complete any flow);
-//!   - store-unavailable answers during a MongoDB failover are retried and
-//!     followed by resumed completions.
+//! Every transient failure is recovered, never abandoned, because the soak
+//! exists to prove recovery: a 503 (store unavailable, an election in
+//! progress) is counted and retried at every step; a connection failure
+//! fails over to the survivor mid-flow (any replica can complete any flow);
+//! and a 409 on the response POST does NOT assume a terminal result — the
+//! killed replica may still hold a live processing lease, so the JWE is kept
+//! and re-posted past the lease window until the flow is re-claimed and
+//! re-driven, or collected if it was already terminal.
+//!
+//! The end-of-run verdict holds the service to:
+//!   - every ACCEPTED flow (200 or 409 on the response POST) completes
+//!     exactly once — completed must equal accepted;
+//!   - no flow ever shows its verified result twice (sampled re-collection);
+//!   - completions resume after the last connect failure.
 //!
 //! Run against the soak stack (docs/design/SOAK.md):
 //!   cargo run -p siros-verifier-service --example soak_driver --release -- \
@@ -36,23 +44,60 @@ use siros_verifier_core::testutil::{
 /// soak backend's own query.
 const DCQL: &str = r#"{"credentials":[{"id":"pid","format":"dc+sd-jwt","meta":{"vct_values":["urn:eudi:pid:1"]},"claims":[{"path":["given_name"]},{"path":["family_name"]}]}]}"#;
 
-/// A step's failure kind: network-level (a replica worth failing over from)
-/// or an unexpected answer (the flow is dead, count it and move on).
+/// How long a step rides out a store-unavailable window (a MongoDB election
+/// finishes well inside the service's five-second write bound; this is the
+/// bounded patience, not a hang).
+const STORE_RETRY: Duration = Duration::from_secs(30);
+/// How long the response/collect phase allows a killed replica's processing
+/// lease to expire and the flow to be re-driven: the lease window plus the
+/// processing deadline, with margin.
+const RECOVERY: Duration = Duration::from_secs(150);
+/// How long a pending flow's processing lease can outlive a dead runner
+/// before the wallet's retry re-claims it: the configured lease plus margin.
+const LEASE_WINDOW: Duration = Duration::from_secs(65);
+
+/// A step's failure kind.
 enum Step {
+    /// Network-level: the replica may be worth failing over from.
     Network,
+    /// 503 from the service: the store is unavailable (an election); retry.
+    StoreUnavailable,
+    /// An unexpected answer: the flow is dead.
     Gone,
 }
 
 #[derive(Default)]
 struct Stats {
     started: AtomicU64,
+    accepted: AtomicU64,
     answered_200: AtomicU64,
     replay_409: AtomicU64,
+    re_driven: AtomicU64,
     store_503: AtomicU64,
     connect_failovers: AtomicU64,
     completed: AtomicU64,
-    failed: AtomicU64,
+    /// Flows the service terminally refused (fail-closed): reached an
+    /// explicit terminal refusal, not an abandonment.
+    refused: AtomicU64,
+    /// Accepted flows that never reached any terminal state inside the
+    /// recovery window. This is the violation the verdict exists to catch.
+    abandoned: AtomicU64,
+    /// Flows that never got their response accepted (start or request-object
+    /// phase failures). No HA guarantee applies to a flow that was never
+    /// created or never served a request object.
+    not_accepted: AtomicU64,
     duplicate_completions: AtomicU64,
+    /// Why the first few refused/abandoned flows failed, verbatim.
+    details: std::sync::Mutex<Vec<String>>,
+}
+
+impl Stats {
+    fn note(&self, detail: String) {
+        let mut details = self.details.lock().unwrap();
+        if details.len() < 20 {
+            details.push(detail);
+        }
+    }
 }
 
 fn main() {
@@ -153,12 +198,14 @@ fn main() {
                 loop {
                     tokio::time::sleep(report_every).await;
                     println!(
-                        "[{:>4}s] started={} answered={} completed={} failed={} 503={} failovers={} duplicates={}",
+                        "[{:>4}s] started={} accepted={} completed={} refused={} abandoned={} not-accepted={} 503={} failovers={} duplicates={}",
                         began.elapsed().as_secs(),
                         stats.started.load(Ordering::SeqCst),
-                        stats.answered_200.load(Ordering::SeqCst),
+                        stats.accepted.load(Ordering::SeqCst),
                         stats.completed.load(Ordering::SeqCst),
-                        stats.failed.load(Ordering::SeqCst),
+                        stats.refused.load(Ordering::SeqCst),
+                        stats.abandoned.load(Ordering::SeqCst),
+                        stats.not_accepted.load(Ordering::SeqCst),
                         stats.store_503.load(Ordering::SeqCst),
                         stats.connect_failovers.load(Ordering::SeqCst),
                         stats.duplicate_completions.load(Ordering::SeqCst),
@@ -217,17 +264,30 @@ async fn drive_user(
             Outcome::Completed => {
                 stats.completed.fetch_add(1, Ordering::SeqCst);
             }
-            Outcome::Failed | Outcome::Network => {
-                stats.failed.fetch_add(1, Ordering::SeqCst);
+            Outcome::Refused => {
+                stats.refused.fetch_add(1, Ordering::SeqCst);
+            }
+            Outcome::Abandoned => {
+                stats.abandoned.fetch_add(1, Ordering::SeqCst);
+            }
+            Outcome::NotAccepted => {
+                stats.not_accepted.fetch_add(1, Ordering::SeqCst);
             }
         }
     }
 }
 
 enum Outcome {
+    /// The verified result was delivered.
     Completed,
-    Failed,
-    Network,
+    /// The service terminally refused the flow (fail-closed): an explicit
+    /// refusal, recorded with its reason.
+    Refused,
+    /// An accepted flow that reached no terminal state inside the recovery
+    /// window — the violation the verdict exists to catch.
+    Abandoned,
+    /// The flow never got its response accepted (start or request phase).
+    NotAccepted,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -246,108 +306,207 @@ async fn one_flow(
     stats.started.fetch_add(1, Ordering::SeqCst);
     pick_replica(replicas, replica, suspect_until);
     let mut base = replicas[*replica].clone();
+    let flow_began = Instant::now();
 
-    // 1. Start: the thin UI entry, exactly as a browser does.
-    let (flow_id, cookie) = match start_flow(client, &base).await {
-        Ok(found) => found,
-        Err(Step::Network) => {
-            mark_suspect(&suspect_until[*replica], last_connect_failure);
-            stats.connect_failovers.fetch_add(1, Ordering::SeqCst);
-            return Outcome::Network;
+    // 1. Start: the thin UI entry, exactly as a browser does. A 503 here is
+    //    a store hiccup — the attempt created no flow — so count it and
+    //    start again.
+    let (flow_id, cookie) = loop {
+        match start_flow(client, &base).await {
+            Ok(found) => break found,
+            Err(Step::StoreUnavailable) => {
+                stats.store_503.fetch_add(1, Ordering::SeqCst);
+                if flow_began.elapsed() > STORE_RETRY {
+                    return Outcome::NotAccepted;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(Step::Network) => {
+                mark_suspect(&suspect_until[*replica], last_connect_failure);
+                stats.connect_failovers.fetch_add(1, Ordering::SeqCst);
+                if replicas.len() < 2 || !switch_replica(replicas, replica, &mut base) {
+                    return Outcome::NotAccepted;
+                }
+            }
+            Err(Step::Gone) => return Outcome::NotAccepted,
         }
-        Err(Step::Gone) => return Outcome::Failed,
     };
 
     // 2. The request object — any replica can serve it: shared flow state.
-    let request_object = match get_request_object(client, &base, &flow_id).await {
-        Ok(jar) => jar,
-        Err(Step::Network) => {
-            mark_suspect(&suspect_until[*replica], last_connect_failure);
-            stats.connect_failovers.fetch_add(1, Ordering::SeqCst);
-            if replicas.len() < 2 {
-                return Outcome::Network;
+    //    Same 503 patience, same flow id.
+    let store_deadline = Instant::now() + STORE_RETRY;
+    let request_object = loop {
+        match get_request_object(client, &base, &flow_id).await {
+            Ok(jar) => break jar,
+            Err(Step::StoreUnavailable) => {
+                stats.store_503.fetch_add(1, Ordering::SeqCst);
+                if Instant::now() > store_deadline {
+                    return Outcome::NotAccepted;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
             }
-            *replica = (*replica + 1) % replicas.len();
-            base = replicas[*replica].clone();
-            match get_request_object(client, &base, &flow_id).await {
-                Ok(jar) => jar,
-                Err(_) => return Outcome::Network,
+            Err(Step::Network) => {
+                mark_suspect(&suspect_until[*replica], last_connect_failure);
+                stats.connect_failovers.fetch_add(1, Ordering::SeqCst);
+                if replicas.len() < 2 || !switch_replica(replicas, replica, &mut base) {
+                    return Outcome::NotAccepted;
+                }
             }
+            Err(Step::Gone) => return Outcome::NotAccepted,
         }
-        Err(Step::Gone) => return Outcome::Failed,
     };
 
     // 3. The wallet answers, bound to this session's nonce.
     let jwe = match wallet_respond(&request_object, holder, &present(issued), now()) {
         Ok(jwe) => jwe,
-        Err(_) => return Outcome::Failed,
+        Err(_) => return Outcome::NotAccepted,
     };
 
-    // 4. Post the encrypted response, riding out a MongoDB failover.
-    let mut answered = false;
-    for attempt in 0..16 {
-        match post_response(client, &base, &flow_id, &jwe).await {
-            Ok(200) => {
-                stats.answered_200.fetch_add(1, Ordering::SeqCst);
-                answered = true;
-                break;
-            }
-            Ok(409) => {
-                // Already received — the flow stands; go collect.
-                stats.replay_409.fetch_add(1, Ordering::SeqCst);
-                answered = true;
-                break;
-            }
-            Ok(503) => {
-                stats.store_503.fetch_add(1, Ordering::SeqCst);
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-            Ok(_) => return Outcome::Failed,
-            Err(Step::Network) => {
-                mark_suspect(&suspect_until[*replica], last_connect_failure);
-                stats.connect_failovers.fetch_add(1, Ordering::SeqCst);
-                if attempt + 1 == 16 || replicas.len() < 2 {
-                    return Outcome::Network;
-                }
-                *replica = (*replica + 1) % replicas.len();
-                base = replicas[*replica].clone();
-            }
-            Err(Step::Gone) => return Outcome::Failed,
-        }
-    }
-    if !answered {
-        return Outcome::Network;
-    }
-
-    // 5. Collect: pending -> verified result, exactly once.
-    let deadline = Instant::now() + Duration::from_secs(45);
+    // 4. Post the encrypted response and collect the result. A 409 does NOT
+    //    mean a terminal result exists: a killed replica may still hold a
+    //    live processing lease. So the JWE is kept, and while collecting, the
+    //    POST is retried (throttled) past the lease window until the flow is
+    //    re-claimed and re-driven (200) or already terminal (the collection
+    //    delivers).
+    let mut accepted = false;
+    let mut saw_replay = false;
+    let mut pending_since: Option<Instant> = None;
+    let mut next_repost = Instant::now();
+    let recovery_deadline = Instant::now() + RECOVERY;
     loop {
-        match get_complete(client, &base, &cookie).await {
-            Ok((_status, body)) if body.contains("Credential verified") => {
-                last_completion.store(now_millis(), Ordering::SeqCst);
-                if sampled {
-                    // Exactly-once, sampled: collecting again must NOT show
-                    // the verified result a second time.
-                    if let Ok((_, again)) = get_complete(client, &base, &cookie).await {
-                        if again.contains("Credential verified") {
-                            stats.duplicate_completions.fetch_add(1, Ordering::SeqCst);
-                        }
+        if Instant::now() > recovery_deadline {
+            stats.note(format!("flow {flow_id}: recovery window expired"));
+            return Outcome::Abandoned;
+        }
+        if !accepted {
+            match post_response(client, &base, &flow_id, &jwe).await {
+                Ok(200) => {
+                    stats.answered_200.fetch_add(1, Ordering::SeqCst);
+                    stats.accepted.fetch_add(1, Ordering::SeqCst);
+                    accepted = true;
+                }
+                Ok(409) => {
+                    stats.replay_409.fetch_add(1, Ordering::SeqCst);
+                    stats.accepted.fetch_add(1, Ordering::SeqCst);
+                    accepted = true;
+                    saw_replay = true;
+                    next_repost = Instant::now() + Duration::from_secs(2);
+                }
+                Ok(503) => {
+                    stats.store_503.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+                Ok(status) => {
+                    stats.note(format!("flow {flow_id}: POST refused {status}"));
+                    return Outcome::Refused;
+                }
+                Err(Step::Network) => {
+                    mark_suspect(&suspect_until[*replica], last_connect_failure);
+                    stats.connect_failovers.fetch_add(1, Ordering::SeqCst);
+                    if replicas.len() < 2 || !switch_replica(replicas, replica, &mut base) {
+                        return Outcome::NotAccepted;
+                    }
+                    continue;
+                }
+                // post_response maps a 503 to its status, so these are
+                // unreachable here; exhaustiveness requires them.
+                Err(Step::StoreUnavailable) | Err(Step::Gone) => return Outcome::Refused,
+            }
+        } else if (saw_replay || pending_past_lease(&pending_since))
+            && Instant::now() >= next_repost
+        {
+            // A flow still pending past its processing lease — whether its
+            // POST was a 409 whose runner died, or a 200 whose processing
+            // was killed — is recovered by the WALLET'S RETRY: a re-POST
+            // past the lease window re-claims the slot and re-drives
+            // verification. Send it, throttled.
+            next_repost = Instant::now() + Duration::from_secs(2);
+            match post_response(client, &base, &flow_id, &jwe).await {
+                Ok(200) => {
+                    stats.re_driven.fetch_add(1, Ordering::SeqCst);
+                    saw_replay = false;
+                    pending_since = None;
+                }
+                Ok(409) => {}
+                Ok(503) => {
+                    stats.store_503.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(status) => {
+                    stats.note(format!("flow {flow_id}: re-POST refused {status}"));
+                    return Outcome::Refused;
+                }
+                Err(Step::Network) => {
+                    mark_suspect(&suspect_until[*replica], last_connect_failure);
+                    stats.connect_failovers.fetch_add(1, Ordering::SeqCst);
+                    if replicas.len() < 2 || !switch_replica(replicas, replica, &mut base) {
+                        stats.note(format!("flow {flow_id}: no survivor mid-recovery"));
+                        return Outcome::Abandoned;
                     }
                 }
-                return Outcome::Completed;
+                Err(Step::StoreUnavailable) | Err(Step::Gone) => return Outcome::Refused,
             }
-            Ok((_status, body)) if body.contains("Presentation failed") => {
-                return Outcome::Failed;
+        }
+
+        // 5. Collect whenever the flow has been accepted: pending -> verified
+        //    result, exactly once. 503s are ridden out; a connection failure
+        //    fails over with the same state cookie.
+        if accepted {
+            match get_complete(client, &base, &cookie).await {
+                Ok((_, body)) if body.contains("Credential verified") => {
+                    last_completion.store(now_millis(), Ordering::SeqCst);
+                    if sampled {
+                        // Exactly-once, sampled: collecting again must NOT
+                        // show the verified result a second time.
+                        if let Ok((_, again)) = get_complete(client, &base, &cookie).await {
+                            if again.contains("Credential verified") {
+                                stats.duplicate_completions.fetch_add(1, Ordering::SeqCst);
+                            }
+                        }
+                    }
+                    return Outcome::Completed;
+                }
+                Ok((status, body)) if body.contains("Presentation failed") => {
+                    stats.note(format!(
+                        "flow {flow_id}: refused at collect {status}: {}",
+                        snippet(&body)
+                    ));
+                    return Outcome::Refused;
+                }
+                Ok((503, _)) => {
+                    stats.store_503.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok((_, body)) if body.contains("Waiting for your wallet") => {
+                    // Still pending: remember since when, so the wallet's
+                    // lease-recovery re-post fires past the lease window.
+                    pending_since.get_or_insert(Instant::now());
+                }
+                Ok((status, body)) => {
+                    // A non-pending answer we cannot classify as terminal:
+                    // treat it as an abandonment so it is never silently
+                    // passed.
+                    stats.note(format!(
+                        "flow {flow_id}: collect {status} not pending, not terminal: {}",
+                        snippet(&body)
+                    ));
+                    return Outcome::Abandoned;
+                }
+                Err(Step::Network) => {
+                    mark_suspect(&suspect_until[*replica], last_connect_failure);
+                    stats.connect_failovers.fetch_add(1, Ordering::SeqCst);
+                    if replicas.len() < 2 || !switch_replica(replicas, replica, &mut base) {
+                        stats.note(format!("flow {flow_id}: no survivor at collect"));
+                        return Outcome::Abandoned;
+                    }
+                }
+                // get_complete maps a 503 to its status, so these are
+                // unreachable here; exhaustiveness requires them.
+                Err(Step::StoreUnavailable) | Err(Step::Gone) => return Outcome::Abandoned,
             }
-            Ok((status, _)) if status != 200 => return Outcome::Failed,
-            Ok(_) => {}
-            Err(Step::Network) => return Outcome::Network,
-            Err(Step::Gone) => return Outcome::Failed,
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        } else {
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        if Instant::now() > deadline {
-            return Outcome::Failed;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 
@@ -370,6 +529,9 @@ async fn start_flow(client: &reqwest::Client, base: &str) -> Result<(String, Str
         .map(str::to_owned)
         .collect();
     let page = response.text().await.map_err(network)?;
+    if status == 503 {
+        return Err(Step::StoreUnavailable);
+    }
     if status != 200 {
         return Err(Step::Gone);
     }
@@ -401,6 +563,9 @@ async fn get_request_object(
         .map_err(network)?;
     let status = response.status().as_u16();
     let body = response.text().await.map_err(network)?;
+    if status == 503 {
+        return Err(Step::StoreUnavailable);
+    }
     if status != 200 || body.split('.').count() != 3 {
         return Err(Step::Gone);
     }
@@ -449,6 +614,11 @@ fn network(_: reqwest::Error) -> Step {
     Step::Network
 }
 
+/// Has a pending flow been waiting longer than a processing lease lasts?
+fn pending_past_lease(pending_since: &Option<Instant>) -> bool {
+    pending_since.is_some_and(|since| since.elapsed() > LEASE_WINDOW)
+}
+
 fn pick_replica(replicas: &[String], current: &mut usize, suspect_until: &[Arc<AtomicU64>]) {
     if replicas.len() < 2 {
         return;
@@ -456,6 +626,17 @@ fn pick_replica(replicas: &[String], current: &mut usize, suspect_until: &[Arc<A
     if suspect_until[*current].load(Ordering::SeqCst) > now_millis() {
         *current = (*current + 1) % replicas.len();
     }
+}
+
+/// Switch to the other replica and update the base URL. Returns false when
+/// there is no survivor worth switching to.
+fn switch_replica(replicas: &[String], current: &mut usize, base: &mut String) -> bool {
+    if replicas.len() < 2 {
+        return false;
+    }
+    *current = (*current + 1) % replicas.len();
+    *base = replicas[*current].clone();
+    true
 }
 
 fn mark_suspect(slot: &AtomicU64, last_connect_failure: &AtomicU64) {
@@ -470,16 +651,21 @@ fn report(
     last_connect_failure: &AtomicU64,
 ) {
     let started = stats.started.load(Ordering::SeqCst);
+    let accepted = stats.accepted.load(Ordering::SeqCst);
     let completed = stats.completed.load(Ordering::SeqCst);
+    let refused = stats.refused.load(Ordering::SeqCst);
+    let abandoned = stats.abandoned.load(Ordering::SeqCst);
+    let not_accepted = stats.not_accepted.load(Ordering::SeqCst);
     println!("\n=== soak_driver summary ({:.0}s) ===", wall.as_secs_f64());
     println!("started:            {started}");
     println!(
-        "answered 200:       {}",
-        stats.answered_200.load(Ordering::SeqCst)
+        "accepted:           {accepted}  (200: {}, 409: {})",
+        stats.answered_200.load(Ordering::SeqCst),
+        stats.replay_409.load(Ordering::SeqCst)
     );
     println!(
-        "replay (409):       {}",
-        stats.replay_409.load(Ordering::SeqCst)
+        "re-driven after lease expiry: {}",
+        stats.re_driven.load(Ordering::SeqCst)
     );
     println!(
         "store 503 retried:  {}",
@@ -490,19 +676,39 @@ fn report(
         stats.connect_failovers.load(Ordering::SeqCst)
     );
     println!("completed:          {completed}");
-    println!(
-        "failed:             {}",
-        stats.failed.load(Ordering::SeqCst)
-    );
+    println!("refused (terminal): {refused}");
+    println!("abandoned:          {abandoned}");
+    println!("never accepted:     {not_accepted}");
     let duplicates = stats.duplicate_completions.load(Ordering::SeqCst);
     println!("duplicate results:  {duplicates}");
     let recovered =
         last_completion.load(Ordering::SeqCst) >= last_connect_failure.load(Ordering::SeqCst);
     println!("completions resumed after the last connect failure: {recovered}");
-    let pass = duplicates == 0 && completed > 0 && recovered;
+    // Every accepted flow must reach a terminal state exactly once — a
+    // verified result or an explicit refusal — and none may be abandoned:
+    // a PASS that masks an abandoned accepted flow is not a pass.
+    let all_terminal = completed + refused == accepted;
+    println!("every accepted flow reached a terminal state: {all_terminal}");
+    for detail in stats.details.lock().unwrap().iter() {
+        println!("  why: {detail}");
+    }
+    let pass = duplicates == 0 && completed > 0 && recovered && abandoned == 0 && all_terminal;
     println!("VERDICT: {}", if pass { "PASS" } else { "FAIL" });
     if !pass {
         std::process::exit(1);
+    }
+}
+
+/// The first heading of a page, for failure evidence. The pages are one
+/// long line, so this extracts the heading window instead of the line.
+fn snippet(body: &str) -> String {
+    match body.find("<h1>") {
+        Some(at) => {
+            let rest = &body[at..];
+            let end = rest.find("</h1>").map(|e| e + 5).unwrap_or(80);
+            rest.chars().take(end).collect()
+        }
+        None => body.chars().take(80).collect(),
     }
 }
 

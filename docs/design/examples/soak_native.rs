@@ -108,7 +108,12 @@ fn main() {
 
     let total = verified.load(Ordering::SeqCst);
     let refused = refused.load(Ordering::SeqCst);
-    let mut all: Vec<Duration> = Arc::try_unwrap(latencies).unwrap().into_inner().unwrap();
+    // The samples in arrival order: the drift must compare the run's first
+    // half against its second half chronologically, so the split happens
+    // BEFORE any sorting (sorting first would compare the fast half of the
+    // distribution with the slow half, which says nothing about time).
+    let chronological: Vec<Duration> = Arc::try_unwrap(latencies).unwrap().into_inner().unwrap();
+    let mut all = chronological.clone();
     all.sort_unstable();
     let at = |p: f64| -> u128 {
         all.get((all.len() as f64 * p) as usize)
@@ -116,17 +121,16 @@ fn main() {
             .as_millis()
     };
     let max = all.last().map(|d| d.as_millis()).unwrap_or(0);
-    // Drift: the first half against the last half's median, so a native
-    // library that degrades under sustained load shows up here.
-    let half = all.len() / 2;
-    let first_half = &all[..half];
-    let last_half = &all[half..];
-    let median = |v: &[Duration]| v[v.len() / 2];
-    let drift = if first_half.is_empty() || last_half.is_empty() {
+    let median_of = |mut half: Vec<Duration>| -> f64 {
+        half.sort_unstable();
+        half[half.len() / 2].as_secs_f64()
+    };
+    let half = chronological.len() / 2;
+    let drift = if half == 0 || chronological.len() == half {
         0.0
     } else {
-        let a = median(first_half).as_secs_f64();
-        let b = median(last_half).as_secs_f64();
+        let a = median_of(chronological[..half].to_vec());
+        let b = median_of(chronological[half..].to_vec());
         if a == 0.0 {
             0.0
         } else {

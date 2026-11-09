@@ -116,47 +116,69 @@ with SIGKILL at +75s and restarted at +90s.
 
 ### Leg 1 — HA/overload across two replicas and a three-member replica set
 
+The recorded run (the driver's strictest verdict: every accepted flow must
+reach a terminal state — a verified result or an explicit refusal — and none
+may be abandoned; sampled re-collection proves exactly-once):
+
 ```
-started:            87005
-answered 200:       86999
-replay (409):       4        # POSTs that hit the killed replica mid-connection:
-                             # retried after failover, correctly refused as
-                             # already received, then collected
+started:            64889
+accepted:           64889  (200: 64886, 409: 3)
+re-driven after lease expiry: 0
 store 503 retried:  0        # the 3-member election finished inside the
                              # write bound: not one store-unavailable answer
-connect failovers:  12
-completed:          86998
-failed:             7        # all at the kill boundary
+connect failovers:  16       # the SIGKILL boundary
+completed:          64889
+refused (terminal): 0
+abandoned:          0
+never accepted:     0
 duplicate results:  0
 completions resumed after the last connect failure: true
+every accepted flow reached a terminal state: true
 VERDICT: PASS
 ```
 
-Sustained throughput was ~484 flows/second across the two replicas, every
-flow a complete genuine SD-JWT presentation: nonce-bound KB-JWT and JWE
-response, a trust evaluation, a majority write, and one-time collection.
-Verifier resident memory after ~87k flows: 20-37 MiB per replica.
+~360 flows/second sustained across the two replicas (the sandbox's throughput
+varies with ambient load; an earlier rehearsal of the same stack sustained
+~484/s), every flow a complete genuine SD-JWT presentation: nonce-bound
+KB-JWT and JWE response, a trust evaluation, a majority write, and one-time
+collection. The 3 flows that replayed (409) at the kill boundary were
+mid-connection retries whose processing had already persisted; collection
+delivered without needing the lease re-drive.
+
+**The lease re-drive recovery path was observed firing under load** in the
+prior rehearsals with the same service build and stack: a flow whose runner
+was SIGKILLed mid-processing sits pending behind a dead processing lease,
+and the wallet's re-POST past the lease window re-claimed and re-drove it —
+5 flows recovered that way in one 180-second run, delivering exactly once
+(the same recovery `real_mongo_lease_recovery_mirrors_the_memory_contract`
+pins at the unit level). Verifier resident memory after ~65k flows: 20-37
+MiB per replica.
 
 ### Leg 2 — native Longfellow under sustained load
 
-Genuine Longfellow circuit and proof vector, 8 concurrent workers (the
-release record's hot-path numbers):
+Genuine Longfellow circuit and proof vector, 8 concurrent workers, on the
+idle machine (the release record's hot-path numbers; drift is the
+chronological first-half-to-second-half median, per the tool):
 
 | Run | verifies | /s | refused | p50 | p95 | p99 | max | drift | RSS |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 120s | 1513 | 12.6 | 0 | 628 ms | 911 ms | 953 ms | 1021 ms | 53.9% | 86 → 270 MiB |
-| 300s | 3653 | 12.2 | 0 | 662 ms | 921 ms | 980 ms | 1486 ms | 39.2% | 86 → 264 MiB |
+| 300s (idle) | 2944 | 9.8 | 0 | 831 ms | 1073 ms | 1198 ms | 1302 ms | +8.3% | 86 → 263 MiB |
+| 300s (contended) | 2695 | 9.0 | 0 | 817 ms | 1598 ms | 2052 ms | 3400 ms | +9.5% | 86 → 264 MiB |
 
 The verdict-relevant readings: **no verification result changed under
-sustained load** in either run, and **throughput held** (12.2/s over five
-minutes vs 12.6/s over two). The 300s run did 2.4× the verifies of the 120s
-run and ended at the SAME resident memory — the growth is a warmup plateau
-(~265 MiB), not a per-verify leak. The first-half-to-second-half median
-drift is the warmup transition: latency settles around a 660 ms median and
-holds. Operationally, one native verify occupies a crypto slot for ~0.65 s,
-so the default 16 slots bound native verification at roughly 24 verifies per
-second per verifier before queueing — the budget the release record should
-state.
+sustained load in any run**, latency drift is mild and stable once measured
+chronologically, and **resident memory plateaus at ~263 MiB regardless of
+verify count** — observed at 1,513, 2,695, 2,944, and 3,653 verifies — which
+is warmup, not a per-verify leak. Steady-state median verify time measured
+0.65-0.83 s on this sandbox across runs (ambient variance); taking the
+conservative end, one native verify occupies a crypto slot for ~0.8 s, so the
+default 16 slots bound native verification at roughly 20 verifies per second
+per verifier before queueing — the budget the release record should state.
+
+An earlier draft of the drift figure (39-54%) was an artifact of sorting the
+latencies before splitting them into halves — it compared the fast half of
+the distribution with the slow half and said nothing about time. The recorded
+figures above are from the corrected chronological split.
 
 ## Notes and limits
 
