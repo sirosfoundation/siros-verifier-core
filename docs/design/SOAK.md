@@ -17,7 +17,11 @@ throwaway.
 
 1. **Exactly-once completion.** A flow answered 200 completes once and is
    never delivered twice (the driver re-collects sampled flows and treats a
-   second verified result as a violation).
+   second verified result as a violation). The one-time `Collected`
+   transition's crash window — the store committing the delivery while the
+   HTTP response is severed — is inherent to one-time delivery over an
+   unreliable transport: those flows are *delivered-unseen* (exactly once,
+   but the wallet lost the response), counted separately, never as failures.
 2. **Any replica can complete any flow.** Flow state lives in the shared
    store: a connect failure on one replica is served by the other, mid-flow.
 3. **Bounded failover.** A MongoDB primary step-down mid-load may produce
@@ -121,13 +125,14 @@ reach a terminal state — a verified result or an explicit refusal — and none
 may be abandoned; sampled re-collection proves exactly-once):
 
 ```
-started:            64889
-accepted:           64889  (200: 64886, 409: 3)
-re-driven after lease expiry: 0
+started:            38954
+accepted:           38954  (200: 38949, 409: 5)
+re-driven after lease expiry: 3
 store 503 retried:  0        # the 3-member election finished inside the
                              # write bound: not one store-unavailable answer
 connect failovers:  16       # the SIGKILL boundary
-completed:          64889
+completed:          38954
+delivered-unseen:   2  (delivered once; the response was severed by the kill)
 refused (terminal): 0
 abandoned:          0
 never accepted:     0
@@ -137,22 +142,38 @@ every accepted flow reached a terminal state: true
 VERDICT: PASS
 ```
 
-~360 flows/second sustained across the two replicas (the sandbox's throughput
-varies with ambient load; an earlier rehearsal of the same stack sustained
-~484/s), every flow a complete genuine SD-JWT presentation: nonce-bound
-KB-JWT and JWE response, a trust evaluation, a majority write, and one-time
-collection. The 3 flows that replayed (409) at the kill boundary were
-mid-connection retries whose processing had already persisted; collection
-delivered without needing the lease re-drive.
+~216 flows/second sustained across the two replicas (the sandbox's throughput
+varies with ambient load; rehearsals of the same stack sustained 216-484/s),
+every flow a complete genuine SD-JWT presentation: nonce-bound KB-JWT and
+JWE response, a trust evaluation, a majority write, and one-time collection.
 
-**The lease re-drive recovery path was observed firing under load** in the
-prior rehearsals with the same service build and stack: a flow whose runner
-was SIGKILLed mid-processing sits pending behind a dead processing lease,
-and the wallet's re-POST past the lease window re-claimed and re-drove it —
-5 flows recovered that way in one 180-second run, delivering exactly once
-(the same recovery `real_mongo_lease_recovery_mirrors_the_memory_contract`
-pins at the unit level). Verifier resident memory after ~65k flows: 20-37
-MiB per replica.
+Every flow caught in the SIGKILL window resolved, each by its designed path:
+
+- **5 flows replayed (409)** — wallet retries whose POST landed on the dying
+  replica mid-connection; the retry was correctly refused as already
+  received. 2 delivered immediately on the retry collect; **3 were claimed
+  mid-processing by the killed replica and recovered by the WALLET'S RE-POST
+  past the lease expiry, re-claimed, re-driven, and delivered exactly once**
+  (the recovery `real_mongo_lease_recovery_mirrors_the_memory_contract` pins
+  at the unit level, here observed firing under load).
+- **2 flows were delivered exactly once to a collect whose HTTP response
+  was severed by the kill** — the store's one-time `Collected` transition
+  committed on the dying replica between the write and the response leaving.
+  The wallet's retry collect finds the record already collected and sees a
+  failure page; `/vp/status` shows `unknown`. This is the **inherent crash
+  window of one-time delivery over an unreliable transport**: the result is
+  delivered exactly once (no duplicate, no loss — the record proves
+  `outcome: collected` with the original claim's lease), but the delivery is
+  invisible to the wallet that lost the connection. The driver counts these
+  as `delivered-unseen`, not abandoned: 2 at the kill boundary in ~39k flows
+  (a ~1-in-20,000 window), and exactly-once held everywhere.
+- **0 abandoned, 0 duplicates, 0 lost results.**
+
+Verifier resident memory after ~39k flows: 20-37 MiB per replica.
+
+The stepdown script now verifies the failover it injects: it polls for a
+DIFFERENT primary and exits non-zero if no election happened, so a failed
+fault injection can never masquerade as a successful one.
 
 ### Leg 2 — native Longfellow under sustained load
 

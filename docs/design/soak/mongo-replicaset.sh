@@ -56,12 +56,21 @@ stepdown() {
   [ -n "$primary" ] || { echo "no primary found" >&2; exit 1; }
   port=${primary##*:}
   echo "stepping down $primary"
-  # The step-down itself; the primary may already be gone from the
-  # connection's view, so query the new primary on a fresh connection.
+  # The step-down severs the shell's connection by design, so a non-zero
+  # exit here is expected. What matters is that a DIFFERENT primary appears:
+  # poll for it and fail loudly if no failover happened, so a failed fault
+  # injection can never masquerade as a successful one.
   mongosh_eval "mongodb://127.0.0.1:$port" 'rs.stepDown(15)' >/dev/null 2>&1 || true
-  sleep 2
-  new_primary=$(mongosh_eval "mongodb://127.0.0.1:27017" 'db.hello().primary' || true)
-  echo "primary now: ${new_primary:-electing}"
+  for _ in $(seq 1 30); do
+    sleep 1
+    new_primary=$(mongosh_eval "mongodb://127.0.0.1:27017" 'db.hello().primary' || true)
+    if [ -n "$new_primary" ] && [ "$new_primary" != "$primary" ]; then
+      echo "primary now: $new_primary"
+      return 0
+    fi
+  done
+  echo "failover did NOT happen: primary is still ${primary:-unknown}" >&2
+  exit 1
 }
 
 teardown() {

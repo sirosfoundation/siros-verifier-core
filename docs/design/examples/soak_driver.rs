@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use jose_rs::jwk::Jwk;
-use serde_json::json;
+use serde_json::{json, Value};
 use siros_verifier_core::testutil::{
     issue, public_of, self_signed_ec, wallet_respond, IssueSpec, Issued, Seg, WalletCredential,
 };
@@ -57,6 +57,7 @@ const RECOVERY: Duration = Duration::from_secs(150);
 const LEASE_WINDOW: Duration = Duration::from_secs(65);
 
 /// A step's failure kind.
+#[derive(Debug)]
 enum Step {
     /// Network-level: the replica may be worth failing over from.
     Network,
@@ -87,6 +88,13 @@ struct Stats {
     /// created or never served a request object.
     not_accepted: AtomicU64,
     duplicate_completions: AtomicU64,
+    /// Flows whose result WAS delivered exactly once, but whose delivering
+    /// response was severed by the killed replica between the store's
+    /// one-time Collected transition and the HTTP response leaving. The
+    /// retry collect finds the record already collected. This is the
+    /// inherent crash window of one-time delivery over an unreliable
+    /// transport, not an HA violation — these count as delivered.
+    delivered_unseen: AtomicU64,
     /// Why the first few refused/abandoned flows failed, verbatim.
     details: std::sync::Mutex<Vec<String>>,
 }
@@ -264,6 +272,10 @@ async fn drive_user(
             Outcome::Completed => {
                 stats.completed.fetch_add(1, Ordering::SeqCst);
             }
+            Outcome::DeliveredUnseen => {
+                stats.completed.fetch_add(1, Ordering::SeqCst);
+                stats.delivered_unseen.fetch_add(1, Ordering::SeqCst);
+            }
             Outcome::Refused => {
                 stats.refused.fetch_add(1, Ordering::SeqCst);
             }
@@ -280,6 +292,10 @@ async fn drive_user(
 enum Outcome {
     /// The verified result was delivered.
     Completed,
+    /// The verified result was delivered exactly once, but the delivering
+    /// HTTP response was severed by a killed replica; the retry collect
+    /// found the record already collected. Delivered, not lost.
+    DeliveredUnseen,
     /// The service terminally refused the flow (fail-closed): an explicit
     /// refusal, recorded with its reason.
     Refused,
@@ -372,6 +388,7 @@ async fn one_flow(
     let mut saw_replay = false;
     let mut pending_since: Option<Instant> = None;
     let mut next_repost = Instant::now();
+    let mut collect_disconnect = false;
     let recovery_deadline = Instant::now() + RECOVERY;
     loop {
         if Instant::now() > recovery_deadline {
@@ -432,9 +449,19 @@ async fn one_flow(
                 Ok(503) => {
                     stats.store_503.fetch_add(1, Ordering::SeqCst);
                 }
-                Ok(status) => {
-                    stats.note(format!("flow {flow_id}: re-POST refused {status}"));
-                    return Outcome::Refused;
+                Ok(_) => {
+                    // An unexpected re-POST answer (a 404 unknown flow, say)
+                    // proves nothing by itself: confirm the stored outcome
+                    // before counting anything.
+                    return confirm_terminal(
+                        client,
+                        stats,
+                        &base,
+                        &cookie,
+                        &flow_id,
+                        collect_disconnect,
+                    )
+                    .await;
                 }
                 Err(Step::Network) => {
                     mark_suspect(&suspect_until[*replica], last_connect_failure);
@@ -467,11 +494,21 @@ async fn one_flow(
                     return Outcome::Completed;
                 }
                 Ok((status, body)) if body.contains("Presentation failed") => {
-                    stats.note(format!(
-                        "flow {flow_id}: refused at collect {status}: {}",
-                        snippet(&body)
-                    ));
-                    return Outcome::Refused;
+                    // The failure page covers stored refusals AND missing,
+                    // expired, or already-collected results. Confirm the
+                    // stored outcome through /vp/status before counting a
+                    // terminal refusal; anything unconfirmed is an
+                    // abandonment, never a quiet pass.
+                    let _ = (status, body);
+                    return confirm_terminal(
+                        client,
+                        stats,
+                        &base,
+                        &cookie,
+                        &flow_id,
+                        collect_disconnect,
+                    )
+                    .await;
                 }
                 Ok((503, _)) => {
                     stats.store_503.fetch_add(1, Ordering::SeqCst);
@@ -492,6 +529,11 @@ async fn one_flow(
                     return Outcome::Abandoned;
                 }
                 Err(Step::Network) => {
+                    // The collect's response may have been severed AFTER the
+                    // store's one-time delivery: remember the disconnect so
+                    // a later "already collected" answer can be classified
+                    // as the delivery it is.
+                    collect_disconnect = true;
                     mark_suspect(&suspect_until[*replica], last_connect_failure);
                     stats.connect_failovers.fetch_add(1, Ordering::SeqCst);
                     if replicas.len() < 2 || !switch_replica(replicas, replica, &mut base) {
@@ -587,6 +629,68 @@ async fn post_response(
     Ok(response.status().as_u16())
 }
 
+/// The machine-readable stored state of this browser session's flow, from
+/// `/vp/status`: `pending`, `failed`, `done`, `expired`, or `unknown`.
+async fn get_status(client: &reqwest::Client, base: &str, cookie: &str) -> Result<String, Step> {
+    let mut request = client.get(format!("{base}/vp/status"));
+    if !cookie.is_empty() {
+        request = request.header(reqwest::header::COOKIE, cookie);
+    }
+    let response = request.send().await.map_err(network)?;
+    let status = response.status().as_u16();
+    let body = response.text().await.map_err(network)?;
+    if status == 503 {
+        return Err(Step::StoreUnavailable);
+    }
+    if status != 200 {
+        return Err(Step::Gone);
+    }
+    serde_json::from_str::<Value>(&body)
+        .ok()
+        .and_then(|value| value["status"].as_str().map(str::to_owned))
+        .ok_or(Step::Gone)
+}
+
+/// Confirm a terminal state through `/vp/status` before counting it: the
+/// failure page and unexpected re-POST answers both cover states that are NOT
+/// a stored refusal (missing, expired, already-collected, pending). A stored
+/// `failed` is a terminal refusal; `unknown` after a severed collect is the
+/// one-time delivery whose response was lost — delivered exactly once, not
+/// abandoned; anything else is an abandonment, so it is never silently passed.
+async fn confirm_terminal(
+    client: &reqwest::Client,
+    stats: &Stats,
+    base: &str,
+    cookie: &str,
+    flow_id: &str,
+    collect_disconnect: bool,
+) -> Outcome {
+    match get_status(client, base, cookie).await {
+        Ok(state) if state == "failed" => {
+            stats.note(format!("flow {flow_id}: confirmed terminal refusal"));
+            Outcome::Refused
+        }
+        Ok(state) if state == "unknown" && collect_disconnect => {
+            stats.note(format!(
+                "flow {flow_id}: delivered exactly once; the collect's response was severed by the disconnect"
+            ));
+            Outcome::DeliveredUnseen
+        }
+        Ok(state) => {
+            stats.note(format!(
+                "flow {flow_id}: failure page but stored status={state}"
+            ));
+            Outcome::Abandoned
+        }
+        Err(step) => {
+            stats.note(format!(
+                "flow {flow_id}: stored outcome unconfirmable ({step:?})"
+            ));
+            Outcome::Abandoned
+        }
+    }
+}
+
 async fn get_complete(
     client: &reqwest::Client,
     base: &str,
@@ -676,6 +780,10 @@ fn report(
         stats.connect_failovers.load(Ordering::SeqCst)
     );
     println!("completed:          {completed}");
+    println!(
+        "delivered-unseen:   {}  (delivered once; the response was severed by the kill)",
+        stats.delivered_unseen.load(Ordering::SeqCst)
+    );
     println!("refused (terminal): {refused}");
     println!("abandoned:          {abandoned}");
     println!("never accepted:     {not_accepted}");
