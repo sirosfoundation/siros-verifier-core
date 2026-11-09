@@ -92,8 +92,13 @@ async fn build_proxy(cfg: ProxyConfig, config_path: &str) -> anyhow::Result<Prox
     let mapper = match &cfg.attributes {
         Some(path) => {
             let path = resolve_sibling(config_path, path);
-            let toml_str = std::fs::read_to_string(&path)
-                .with_context(|| format!("reading attribute map {}", path.display()))?;
+            // A startup-only read, kept off the async runtime's worker threads.
+            let read_path = path.clone();
+            let toml_str =
+                actix_web::rt::task::spawn_blocking(move || std::fs::read_to_string(read_path))
+                    .await
+                    .with_context(|| "joining the attribute-map read task")?
+                    .with_context(|| format!("reading attribute map {}", path.display()))?;
             AttributeMapper::from_toml(&toml_str)?
         }
         None => AttributeMapper::default(),
@@ -276,8 +281,13 @@ async fn build_openid4vp_backend(
 ) -> anyhow::Result<Box<dyn tunnelbana_core::plugin::Backend>> {
     let mut deployment: DeploymentConfig = serde_json::from_value(plugin.config_json())?;
     let key_path = resolve_sibling(config_path, &deployment.request_signing_key_path);
-    let key_pem = std::fs::read_to_string(&key_path)
-        .with_context(|| format!("reading request signing key {}", key_path.display()))?;
+    // Startup-only reads, kept off the async runtime's worker threads.
+    let key_read_path = key_path.clone();
+    let key_pem =
+        actix_web::rt::task::spawn_blocking(move || std::fs::read_to_string(key_read_path))
+            .await
+            .with_context(|| "joining the request signing key read task")?
+            .with_context(|| format!("reading request signing key {}", key_path.display()))?;
     let mut request_jwk = jose_rs::jwk::jwk_from_pkcs8_pem(&key_pem)?;
     request_jwk.alg = Some("ES256".into());
     let private_scalar = request_jwk
@@ -290,8 +300,14 @@ async fn build_openid4vp_backend(
     let request_signer = oid4vp::software_signer(&request_jwk)?;
 
     let chain_path = resolve_sibling(config_path, &deployment.request_certificate_chain_path);
-    let chain_pem = std::fs::read_to_string(&chain_path)
-        .with_context(|| format!("reading request certificate chain {}", chain_path.display()))?;
+    let chain_read_path = chain_path.clone();
+    let chain_pem =
+        actix_web::rt::task::spawn_blocking(move || std::fs::read_to_string(chain_read_path))
+            .await
+            .with_context(|| "joining the request certificate chain read task")?
+            .with_context(|| {
+                format!("reading request certificate chain {}", chain_path.display())
+            })?;
     let chain_der: Vec<Vec<u8>> = pem::parse_many(chain_pem)?
         .into_iter()
         .filter(|block| block.tag() == "CERTIFICATE")
