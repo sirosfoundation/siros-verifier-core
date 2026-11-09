@@ -14,7 +14,7 @@ use mongodb::bson::{doc, DateTime, Document};
 use mongodb::Client;
 use siros_verifier_core_tunnelbana::{
     ClaimResult, CollectResult, FinishResult, Flow, FlowStore, Outcome, TerminalOutcome,
-    FLOW_SCHEMA_VERSION,
+    FLOW_SCHEMA_VERSION, FLOW_STORE_WRITE_BOUND_SECS,
 };
 use siros_verifier_service::mongo_store::{MongoFlowStore, MongoTokenUseStore};
 
@@ -68,9 +68,12 @@ fn pending_flow(id: &str, now: i64) -> Flow {
 }
 
 #[tokio::test]
-async fn a_stalled_mongodb_endpoint_fails_closed_rather_than_hanging() {
+async fn an_unreachable_mongodb_endpoint_fails_closed_rather_than_hanging() {
     // Nothing listens on loopback port 1: connect must terminate with an
-    // error inside a bounded window — never hang, never report ready.
+    // error inside a bounded window — never hang, never report ready. The
+    // driver's own connection and server-selection bounds end this one; the
+    // outer operation bound, which no driver timeout can replace, has its
+    // own regression in the stalled-command test below.
     let connect = MongoFlowStore::connect("mongodb://127.0.0.1:1/", "unreachable", "flows");
     let store = match tokio::time::timeout(Duration::from_secs(30), connect)
         .await
@@ -80,6 +83,123 @@ async fn a_stalled_mongodb_endpoint_fails_closed_rather_than_hanging() {
         Err(store) => store,
     };
     assert!(!store.0.is_empty());
+}
+
+/// A relay in front of the real test MongoDB that lets every connection
+/// complete its handshake — forwarding exactly the server's first reply —
+/// and then holds every later reply on that connection. To the driver it is
+/// a healthy, known server whose commands never return: server selection,
+/// connection establishment, and any authentication all succeed, so none of
+/// the driver's own bounds can end the pending command. Only the store's
+/// outer operation bound can.
+async fn handshake_only_relay(
+    upstream: std::net::SocketAddr,
+) -> std::io::Result<std::net::SocketAddr> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let bound = listener.local_addr()?;
+    tokio::spawn(async move {
+        while let Ok((client, _)) = listener.accept().await {
+            let Ok(upstream) = tokio::net::TcpStream::connect(upstream).await else {
+                continue;
+            };
+            let (mut client_read, mut client_write) = client.into_split();
+            let (mut upstream_read, mut upstream_write) = upstream.into_split();
+            // The driver's bytes always reach the real server.
+            tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut client_read, &mut upstream_write).await;
+            });
+            // The server's first reply — the handshake — comes back...
+            tokio::spawn(async move {
+                if forward_first_message(&mut upstream_read, &mut client_write)
+                    .await
+                    .is_ok()
+                {
+                    // ...and every later reply is held on the connection:
+                    // a command in flight that never returns.
+                    std::future::pending::<()>().await;
+                }
+            });
+        }
+    });
+    Ok(bound)
+}
+
+/// Forward a single MongoDB wire message: every message starts with its
+/// total length as a little-endian int32, and a message header is 16 bytes.
+async fn forward_first_message(
+    upstream: &mut tokio::net::tcp::OwnedReadHalf,
+    client: &mut tokio::net::tcp::OwnedWriteHalf,
+) -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let mut header = [0u8; 4];
+    upstream.read_exact(&mut header).await?;
+    let length = u32::from_le_bytes(header) as usize;
+    if !(16..=48 * 1024 * 1024).contains(&length) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "relay saw a frame length outside the wire protocol",
+        ));
+    }
+    let mut frame = vec![0u8; length];
+    frame[..4].copy_from_slice(&header);
+    upstream.read_exact(&mut frame[4..]).await?;
+    client.write_all(&frame).await?;
+    Ok(())
+}
+
+/// The host:port the test MongoDB actually listens on, from the URI the
+/// environment handed us.
+fn upstream_socket_addr(uri: &str) -> std::net::SocketAddr {
+    let authority = uri
+        .strip_prefix("mongodb://")
+        .expect("the test MongoDB URI is a mongodb:// URI")
+        .split('/')
+        .next()
+        .expect("an authority")
+        .rsplit('@')
+        .next()
+        .expect("a host");
+    let host_port = if authority.contains(':') {
+        authority.to_owned()
+    } else {
+        format!("{authority}:27017")
+    };
+    use std::net::ToSocketAddrs as _;
+    host_port
+        .to_socket_addrs()
+        .expect("the test MongoDB resolves")
+        .next()
+        .expect("the test MongoDB has an address")
+}
+
+#[tokio::test]
+async fn a_command_that_never_returns_fails_closed_within_the_write_bound() {
+    let Ok(uri) = std::env::var("SIROS_VERIFIER_TEST_MONGODB_URI") else {
+        return;
+    };
+    let relay = handshake_only_relay(upstream_socket_addr(&uri))
+        .await
+        .unwrap();
+    // directConnection keeps the topology to the relayed host alone, so the
+    // driver can never route the ping around the stall.
+    let stall_uri = format!("mongodb://{relay}/?directConnection=true");
+    let bound = Duration::from_secs(FLOW_STORE_WRITE_BOUND_SECS as u64);
+    let window = bound * 4;
+    let connect = MongoFlowStore::connect(&stall_uri, "stall_test", "flows");
+    let error = match tokio::time::timeout(window, connect).await {
+        Err(_) => panic!(
+            "the stalled command did not resolve within {}s; without the \
+             outer operation bound a healthy server that never replies hangs \
+             the store forever",
+            window.as_secs()
+        ),
+        Ok(Err(error)) => error,
+        Ok(Ok(_)) => panic!("a server that never replies must not yield a store"),
+    };
+    assert!(
+        error.0.contains("operation timed out"),
+        "{error}: only the store's own bound may end a stalled command"
+    );
 }
 
 #[tokio::test]
@@ -573,6 +693,56 @@ async fn the_persisted_flow_document_carries_secrets_only_under_sealed_keys() {
             .get_str("given_name")
             .unwrap(),
         "Ada Lovelace"
+    );
+    // A pending flow carries no sealed result at all.
+    let outcome = stored.get_document("outcome").unwrap();
+    assert_eq!(outcome.get_str("state").unwrap(), "pending");
+    assert!(
+        outcome.get("value").is_none(),
+        "a pending flow carries no sealed result"
+    );
+
+    // Complete the flow and re-read what MongoDB holds: the sealed result
+    // must travel under `outcome.value` — the exact guarantee the inline
+    // serialization test pinned before the move — and nothing else may
+    // change shape.
+    assert!(matches!(
+        store
+            .claim("stored-shape", now, "shape-claim", 60)
+            .await
+            .unwrap(),
+        ClaimResult::Claimed(_)
+    ));
+    assert_eq!(
+        store
+            .finish(
+                "stored-shape",
+                now + 1,
+                "shape-claim",
+                TerminalOutcome::Done("v1.sealed-Lovelace-result".into())
+            )
+            .await
+            .unwrap(),
+        FinishResult::Finished
+    );
+    let stored_after = client
+        .database(&database)
+        .collection::<Document>("flows")
+        .find_one(doc! { "_id": "stored-shape" })
+        .await
+        .unwrap()
+        .expect("the completed flow is persisted");
+    let mut keys_after: Vec<&str> = stored_after.keys().map(String::as_str).collect();
+    keys_after.sort_unstable();
+    assert_eq!(keys_after, keys, "the terminal result adds no new field");
+    let outcome = stored_after.get_document("outcome").unwrap();
+    let mut outcome_keys: Vec<&str> = outcome.keys().map(String::as_str).collect();
+    outcome_keys.sort_unstable();
+    assert_eq!(outcome_keys, ["state", "value"]);
+    assert_eq!(outcome.get_str("state").unwrap(), "done");
+    assert_eq!(
+        outcome.get_str("value").unwrap(),
+        "v1.sealed-Lovelace-result"
     );
     client.database(&database).drop().await.unwrap();
 }

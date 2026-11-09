@@ -372,11 +372,19 @@ The service crate is now a **library plus a thin binary**: `src/lib.rs` exposes
   are now library items — the binary's server setup just wires them.
 - **No test lives under `src/` anymore.** The Mongo store's inline test
   module moved to `tests/mongo_store.rs` behind the public API, which also
-  let two private-only tests become stronger public ones: the serialization
+  let the private-only tests become stronger public ones. The serialization
   guarantee is now an exact raw-document key-set check against what MongoDB
-  actually stored (secrets only under `sealed_session` and the outcome value,
-  mapped attributes as data, no undeclared field for a secret to hide
-  behind), and the stall regression became a dead-port connect test proving
-  the public fail-closed bound (an unreachable endpoint never hangs and never
-  reports ready). `bounded_with_timeout` — which existed only so the inline
-  test could inject a shorter timeout — collapsed back into `bounded`.
+  actually stored — for a pending flow and again after a completed outcome,
+  whose sealed result must appear under `outcome.value` and nowhere else.
+  The outer operation bound has two regressions: a dead-port connect that
+  must fail closed (the driver's own connection and server-selection bounds
+  end that one, as review correctly noted), and a handshake-only relay in
+  front of the real MongoDB that forwards exactly the server's first reply
+  on every connection — so the handshake, server selection, and any
+  authentication all succeed — and then holds every later reply: a healthy
+  server whose commands never return. Only the store's own bound may end the
+  operation, and the test asserts that exact failure ("operation timed
+  out"); hand-verified both ways — with the outer timeout removed the
+  dead-port test still passes while the relay test fails. `bounded_with_timeout`
+  — which existed only so the inline test could inject a shorter timeout —
+  collapsed back into `bounded`.
