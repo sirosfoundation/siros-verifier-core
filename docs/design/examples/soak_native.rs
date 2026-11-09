@@ -28,6 +28,7 @@ fn main() {
     let mut duration = Duration::from_secs(60);
     let mut workers = 8;
     let mut it = std::env::args().skip(1);
+
     while let Some(flag) = it.next() {
         let mut value = || it.next().unwrap_or_else(|| usage(&flag));
         match flag.as_str() {
@@ -67,6 +68,8 @@ fn main() {
         "a tampered proof must be refused"
     );
 
+    assert!(workers >= 1, "at least one worker");
+    assert!(!duration.is_zero(), "a timed run of at least one second");
     println!(
         "soak_native: genuine Longfellow vector, {workers} concurrent workers, {}s",
         duration.as_secs()
@@ -154,6 +157,10 @@ fn main() {
     println!("rss: {} KiB -> {} KiB", rss_start, rss_kib());
     if refused > 0 {
         println!("FAIL: verification results changed under sustained load");
+        std::process::exit(1);
+    }
+    if total == 0 {
+        println!("FAIL: no verification was timed; an empty run is not a soak");
         std::process::exit(1);
     }
 }

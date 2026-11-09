@@ -449,19 +449,11 @@ async fn one_flow(
                 Ok(503) => {
                     stats.store_503.fetch_add(1, Ordering::SeqCst);
                 }
-                Ok(_) => {
+                Ok(status) => {
                     // An unexpected re-POST answer (a 404 unknown flow, say)
-                    // proves nothing by itself: confirm the stored outcome
-                    // before counting anything.
-                    return confirm_terminal(
-                        client,
-                        stats,
-                        &base,
-                        &cookie,
-                        &flow_id,
-                        collect_disconnect,
-                    )
-                    .await;
+                    // proves nothing by itself; the non-destructive status
+                    // poll below classifies the stored outcome.
+                    stats.note(format!("flow {flow_id}: re-POST answered {status}"));
                 }
                 Err(Step::Network) => {
                     mark_suspect(&suspect_until[*replica], last_connect_failure);
@@ -475,75 +467,110 @@ async fn one_flow(
             }
         }
 
-        // 5. Collect whenever the flow has been accepted: pending -> verified
-        //    result, exactly once. 503s are ridden out; a connection failure
-        //    fails over with the same state cookie.
+        // 5. Classify through the NON-DESTRUCTIVE /vp/status until a
+        //    terminal state, then collect (one-time) to consume a confirmed
+        //    done. Status first because collection CONSUMES the record: a
+        //    stored refusal collected before classification reads back as
+        //    unknown and would be miscounted. Transient errors retry with
+        //    the same failover and backoff as everywhere else, inside the
+        //    recovery deadline.
         if accepted {
-            match get_complete(client, &base, &cookie).await {
-                Ok((_, body)) if body.contains("Credential verified") => {
-                    last_completion.store(now_millis(), Ordering::SeqCst);
-                    if sampled {
-                        // Exactly-once, sampled: collecting again must NOT
-                        // show the verified result a second time.
-                        if let Ok((_, again)) = get_complete(client, &base, &cookie).await {
-                            if again.contains("Credential verified") {
-                                stats.duplicate_completions.fetch_add(1, Ordering::SeqCst);
-                            }
-                        }
-                    }
-                    return Outcome::Completed;
-                }
-                Ok((status, body)) if body.contains("Presentation failed") => {
-                    // The failure page covers stored refusals AND missing,
-                    // expired, or already-collected results. Confirm the
-                    // stored outcome through /vp/status before counting a
-                    // terminal refusal; anything unconfirmed is an
-                    // abandonment, never a quiet pass.
-                    let _ = (status, body);
-                    return confirm_terminal(
-                        client,
-                        stats,
-                        &base,
-                        &cookie,
-                        &flow_id,
-                        collect_disconnect,
-                    )
-                    .await;
-                }
-                Ok((503, _)) => {
+            match get_status(client, &base, &cookie).await {
+                Err(Step::StoreUnavailable) => {
                     stats.store_503.fetch_add(1, Ordering::SeqCst);
                 }
-                Ok((_, body)) if body.contains("Waiting for your wallet") => {
-                    // Still pending: remember since when, so the wallet's
-                    // lease-recovery re-post fires past the lease window.
-                    pending_since.get_or_insert(Instant::now());
-                }
-                Ok((status, body)) => {
-                    // A non-pending answer we cannot classify as terminal:
-                    // treat it as an abandonment so it is never silently
-                    // passed.
-                    stats.note(format!(
-                        "flow {flow_id}: collect {status} not pending, not terminal: {}",
-                        snippet(&body)
-                    ));
-                    return Outcome::Abandoned;
-                }
                 Err(Step::Network) => {
-                    // The collect's response may have been severed AFTER the
-                    // store's one-time delivery: remember the disconnect so
-                    // a later "already collected" answer can be classified
-                    // as the delivery it is.
-                    collect_disconnect = true;
                     mark_suspect(&suspect_until[*replica], last_connect_failure);
                     stats.connect_failovers.fetch_add(1, Ordering::SeqCst);
                     if replicas.len() < 2 || !switch_replica(replicas, replica, &mut base) {
-                        stats.note(format!("flow {flow_id}: no survivor at collect"));
+                        stats.note(format!("flow {flow_id}: no survivor at status"));
                         return Outcome::Abandoned;
                     }
                 }
-                // get_complete maps a 503 to its status, so these are
-                // unreachable here; exhaustiveness requires them.
-                Err(Step::StoreUnavailable) | Err(Step::Gone) => return Outcome::Abandoned,
+                Err(Step::Gone) => {
+                    stats.note(format!("flow {flow_id}: status unanswerable"));
+                    return Outcome::Abandoned;
+                }
+                Ok(state) => match state.as_str() {
+                    "pending" => {
+                        // Still pending: remember since when, so the wallet's
+                        // lease-recovery re-post fires past the lease window.
+                        pending_since.get_or_insert(Instant::now());
+                    }
+                    "done" => {
+                        // Consume the one-time result. A response severed
+                        // here may have been lost AFTER the store's
+                        // Collected transition: remember it, and let the
+                        // next status poll tell delivered-unseen apart from
+                        // not-yet-collected.
+                        match get_complete(client, &base, &cookie).await {
+                            Ok((_, body)) if body.contains("Credential verified") => {
+                                last_completion.store(now_millis(), Ordering::SeqCst);
+                                if sampled {
+                                    // Exactly-once, sampled: collecting again
+                                    // must NOT show the result a second time.
+                                    if let Ok((_, again)) =
+                                        get_complete(client, &base, &cookie).await
+                                    {
+                                        if again.contains("Credential verified") {
+                                            stats
+                                                .duplicate_completions
+                                                .fetch_add(1, Ordering::SeqCst);
+                                        }
+                                    }
+                                }
+                                return Outcome::Completed;
+                            }
+                            Ok(_) => {
+                                // Not the verified page: keep polling; the
+                                // next status re-classifies.
+                            }
+                            Err(Step::Network) => {
+                                collect_disconnect = true;
+                                mark_suspect(&suspect_until[*replica], last_connect_failure);
+                                stats.connect_failovers.fetch_add(1, Ordering::SeqCst);
+                                if replicas.len() < 2
+                                    || !switch_replica(replicas, replica, &mut base)
+                                {
+                                    stats.note(format!("flow {flow_id}: no survivor at collect"));
+                                    return Outcome::Abandoned;
+                                }
+                            }
+                            // get_complete maps transient errors to its
+                            // status; these are unreachable, required for
+                            // exhaustiveness.
+                            Err(Step::StoreUnavailable) | Err(Step::Gone) => {}
+                        }
+                    }
+                    "failed" => {
+                        // A stored, terminal refusal — confirmed without
+                        // consuming it.
+                        stats.note(format!("flow {flow_id}: confirmed terminal refusal"));
+                        return Outcome::Refused;
+                    }
+                    "expired" => {
+                        // The request expired: terminal, no re-drive could
+                        // succeed.
+                        stats.note(format!("flow {flow_id}: request expired before terminal"));
+                        return Outcome::Refused;
+                    }
+                    "unknown" if collect_disconnect => {
+                        stats.note(format!(
+                            "flow {flow_id}: delivered exactly once; the collect's response was severed by the disconnect"
+                        ));
+                        return Outcome::DeliveredUnseen;
+                    }
+                    "unknown" => {
+                        stats.note(format!(
+                            "flow {flow_id}: stored outcome unknown without a severed collect"
+                        ));
+                        return Outcome::Abandoned;
+                    }
+                    other => {
+                        stats.note(format!("flow {flow_id}: status {other}"));
+                        return Outcome::Abandoned;
+                    }
+                },
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         } else {
@@ -649,46 +676,6 @@ async fn get_status(client: &reqwest::Client, base: &str, cookie: &str) -> Resul
         .ok()
         .and_then(|value| value["status"].as_str().map(str::to_owned))
         .ok_or(Step::Gone)
-}
-
-/// Confirm a terminal state through `/vp/status` before counting it: the
-/// failure page and unexpected re-POST answers both cover states that are NOT
-/// a stored refusal (missing, expired, already-collected, pending). A stored
-/// `failed` is a terminal refusal; `unknown` after a severed collect is the
-/// one-time delivery whose response was lost — delivered exactly once, not
-/// abandoned; anything else is an abandonment, so it is never silently passed.
-async fn confirm_terminal(
-    client: &reqwest::Client,
-    stats: &Stats,
-    base: &str,
-    cookie: &str,
-    flow_id: &str,
-    collect_disconnect: bool,
-) -> Outcome {
-    match get_status(client, base, cookie).await {
-        Ok(state) if state == "failed" => {
-            stats.note(format!("flow {flow_id}: confirmed terminal refusal"));
-            Outcome::Refused
-        }
-        Ok(state) if state == "unknown" && collect_disconnect => {
-            stats.note(format!(
-                "flow {flow_id}: delivered exactly once; the collect's response was severed by the disconnect"
-            ));
-            Outcome::DeliveredUnseen
-        }
-        Ok(state) => {
-            stats.note(format!(
-                "flow {flow_id}: failure page but stored status={state}"
-            ));
-            Outcome::Abandoned
-        }
-        Err(step) => {
-            stats.note(format!(
-                "flow {flow_id}: stored outcome unconfirmable ({step:?})"
-            ));
-            Outcome::Abandoned
-        }
-    }
 }
 
 async fn get_complete(
@@ -804,19 +791,6 @@ fn report(
     println!("VERDICT: {}", if pass { "PASS" } else { "FAIL" });
     if !pass {
         std::process::exit(1);
-    }
-}
-
-/// The first heading of a page, for failure evidence. The pages are one
-/// long line, so this extracts the heading window instead of the line.
-fn snippet(body: &str) -> String {
-    match body.find("<h1>") {
-        Some(at) => {
-            let rest = &body[at..];
-            let end = rest.find("</h1>").map(|e| e + 5).unwrap_or(80);
-            rest.chars().take(end).collect()
-        }
-        None => body.chars().take(80).collect(),
     }
 }
 

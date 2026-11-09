@@ -122,17 +122,18 @@ with SIGKILL at +75s and restarted at +90s.
 
 The recorded run (the driver's strictest verdict: every accepted flow must
 reach a terminal state — a verified result or an explicit refusal — and none
-may be abandoned; sampled re-collection proves exactly-once):
+may be abandoned; sampled re-collection proves exactly-once; classification
+polls the non-destructive `/vp/status` first and only then collects):
 
 ```
-started:            38954
-accepted:           38954  (200: 38949, 409: 5)
-re-driven after lease expiry: 3
+started:            39520
+accepted:           39520  (200: 39514, 409: 6)
+re-driven after lease expiry: 4
 store 503 retried:  0        # the 3-member election finished inside the
                              # write bound: not one store-unavailable answer
 connect failovers:  16       # the SIGKILL boundary
-completed:          38954
-delivered-unseen:   2  (delivered once; the response was severed by the kill)
+completed:          39520
+delivered-unseen:   0
 refused (terminal): 0
 abandoned:          0
 never accepted:     0
@@ -142,38 +143,42 @@ every accepted flow reached a terminal state: true
 VERDICT: PASS
 ```
 
-~216 flows/second sustained across the two replicas (the sandbox's throughput
+~219 flows/second sustained across the two replicas (the sandbox's throughput
 varies with ambient load; rehearsals of the same stack sustained 216-484/s),
 every flow a complete genuine SD-JWT presentation: nonce-bound KB-JWT and
 JWE response, a trust evaluation, a majority write, and one-time collection.
 
 Every flow caught in the SIGKILL window resolved, each by its designed path:
 
-- **5 flows replayed (409)** — wallet retries whose POST landed on the dying
+- **6 flows replayed (409)** — wallet retries whose POST landed on the dying
   replica mid-connection; the retry was correctly refused as already
-  received. 2 delivered immediately on the retry collect; **3 were claimed
+  received. 2 delivered immediately on the retry; **4 were claimed
   mid-processing by the killed replica and recovered by the WALLET'S RE-POST
   past the lease expiry, re-claimed, re-driven, and delivered exactly once**
   (the recovery `real_mongo_lease_recovery_mirrors_the_memory_contract` pins
   at the unit level, here observed firing under load).
-- **2 flows were delivered exactly once to a collect whose HTTP response
-  was severed by the kill** — the store's one-time `Collected` transition
-  committed on the dying replica between the write and the response leaving.
-  The wallet's retry collect finds the record already collected and sees a
-  failure page; `/vp/status` shows `unknown`. This is the **inherent crash
-  window of one-time delivery over an unreliable transport**: the result is
-  delivered exactly once (no duplicate, no loss — the record proves
-  `outcome: collected` with the original claim's lease), but the delivery is
-  invisible to the wallet that lost the connection. The driver counts these
-  as `delivered-unseen`, not abandoned: 2 at the kill boundary in ~39k flows
-  (a ~1-in-20,000 window), and exactly-once held everywhere.
+- **The one-time delivery crash window was observed and quantified in an
+  earlier rehearsal of the same stack**: flows whose collect response was
+  severed by the kill between the store's one-time `Collected` transition
+  and the HTTP response leaving — 2 in ~39k flows at the kill boundary
+  (a ~1-in-20,000 window). The raw record (queried from MongoDB during
+  reproduction) proves `outcome: collected` with the original claim's lease:
+  delivered exactly once, no duplicate, no loss — but invisible to the
+  wallet that lost the connection. This is inherent to one-time delivery
+  over an unreliable transport. The driver classifies these as
+  `delivered-unseen` (counted as delivered, reported separately); an
+  `unknown` status *without* a severed collect remains an abandonment and
+  fails the verdict. This run's kill drew zero such windows (the lottery);
+  the classification is demonstrated by the earlier rehearsal.
 - **0 abandoned, 0 duplicates, 0 lost results.**
 
 Verifier resident memory after ~39k flows: 20-37 MiB per replica.
 
-The stepdown script now verifies the failover it injects: it polls for a
+The stepdown script verifies the failover it injects: it polls for a
 DIFFERENT primary and exits non-zero if no election happened, so a failed
-fault injection can never masquerade as a successful one.
+fault injection can never masquerade as a successful one. The native tool
+rejects degenerate runs (zero workers, zero duration, or no verification
+timed) instead of reporting a vacuous success.
 
 ### Leg 2 — native Longfellow under sustained load
 
