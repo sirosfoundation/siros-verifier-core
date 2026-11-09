@@ -144,6 +144,8 @@ M = [
  ("tb", 'if cfg.processing_deadline_secs + FLOW_STORE_WRITE_BOUND_SECS > cfg.processing_lease_secs {', 'if false {', "plugin deadline under lease"),
  ("tb", 'if cfg.max_concurrent_verifications == 0 || cfg.max_concurrent_verifications > 512 {', 'if false {', "plugin verification permits bounds"),
  ("tb", 'match self.verification_permits.clone().acquire_owned().await {', 'match self.verification_permits.clone().try_acquire_owned() {', "plugin verification admission"),
+ ("tb", "        let verified = match tokio::task::spawn_blocking(move || {\n            let _held_zkp_crypto = crypto_permit;\n            pending.finish(&verdicts)\n        })\n        .await\n        {", "        let verified = match Ok::<_, tokio::task::JoinError>({\n            let _held_zkp_crypto = crypto_permit;\n            pending.finish(&verdicts)\n        }) {", "plugin zkp blocking verify"),
+ ("tb", 'let _held_zkp_crypto = crypto_permit;', 'drop(crypto_permit);', "plugin zkp crypto admission"),
  ("tb", 'if budget <= 0 {', 'if false {', "plugin zero budget skip"),
  ("tb", 'std::time::Duration::from_secs(budget.max(0) as u64)', 'std::time::Duration::from_secs(u64::MAX)', "plugin processing deadline"),
  ("tb", 'deadline_secs.min(remaining.saturating_sub(Self::FINALIZE_RESERVE_SECS))', 'deadline_secs', "plugin lease budget"),

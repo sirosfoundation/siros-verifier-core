@@ -298,18 +298,20 @@ fn a_wrong_artifact_is_a_fault_found_at_first_use() {
         |_, _| panic!("a circuit that failed its digest must never reach a loader"),
     )
     .unwrap();
-    let v = siros_verifier_zkp::verify::ZkpVerifier::new(
-        allow,
-        Box::new(FsArtifactSource),
-        siros_verifier_zkp::functions::FunctionRegistry::with_builtins(),
-        reg,
-        siros_verifier_zkp::verify::VerifierPolicy {
-            role: "r".into(),
-            issuer_set: siros_verifier_core::issuer_set::IssuerSetPolicy::AllTrusted,
-            tolerance: Default::default(),
-        },
-    )
-    .unwrap();
+    let v = std::sync::Arc::new(
+        siros_verifier_zkp::verify::ZkpVerifier::new(
+            allow,
+            Box::new(FsArtifactSource),
+            siros_verifier_zkp::functions::FunctionRegistry::with_builtins(),
+            reg,
+            siros_verifier_zkp::verify::VerifierPolicy {
+                role: "r".into(),
+                issuer_set: siros_verifier_core::issuer_set::IssuerSetPolicy::AllTrusted,
+                tolerance: Default::default(),
+            },
+        )
+        .unwrap(),
+    );
     let f = support::fx(support::Opts::default());
     let plan = f.plan.clone();
     let ch = support::dc_channel();
