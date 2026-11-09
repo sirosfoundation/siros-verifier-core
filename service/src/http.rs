@@ -1,9 +1,20 @@
-//! A bounded reqwest-backed implementation of tunnelbana's outbound HTTP trait.
-//! Adapted from SUNET/tunnelbana's `reqwest_client.rs` (BSD-2-Clause).
+//! The HTTP adapters: a bounded reqwest-backed implementation of tunnelbana's
+//! outbound HTTP trait (adapted from SUNET/tunnelbana's `reqwest_client.rs`,
+//! BSD-2-Clause), and the inbound actix glue — request translation, response
+//! translation, and the health endpoint — used by the binary's server setup.
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use actix_web::{web, HttpRequest, HttpResponse};
 use async_trait::async_trait;
 use tunnelbana_core::error::{Error, Result};
-use tunnelbana_core::http::{HttpClient, HttpFetchResponse};
+use tunnelbana_core::http::{HttpClient, HttpFetchResponse, HttpRequestData, Response};
+use tunnelbana_core::proxy::Proxy;
+
+/// A real Longfellow nym_auth proof is about 344 KiB before CBOR and JWE
+/// base64 expansion. Keep a hard limit, but allow those genuine presentations.
+pub const MAX_HTTP_BODY_BYTES: usize = 2 * 1024 * 1024;
 
 pub struct ReqwestClient {
     inner: reqwest::Client,
@@ -105,4 +116,94 @@ async fn into_fetch(
         body,
         content_type,
     })
+}
+
+// ---- the inbound actix adapter -------------------------------------------------
+
+pub async fn health() -> HttpResponse {
+    HttpResponse::Ok().json(serde_json::json!({ "status": "ok" }))
+}
+
+pub async fn handle(
+    req: HttpRequest,
+    body: web::Bytes,
+    proxy: web::Data<Arc<Proxy>>,
+) -> HttpResponse {
+    let request = build_request_data(&req, &body);
+    let response = proxy.run(request).await;
+    to_actix(response)
+}
+
+/// Translate an actix request into tunnelbana's transport-independent form,
+/// preserving every query and form pair — including duplicates, which the
+/// verifiers read by position — and lowercasing header names.
+pub fn build_request_data(req: &HttpRequest, body: &web::Bytes) -> HttpRequestData {
+    let path = req.path().trim_start_matches('/').to_string();
+    let method = req.method().as_str().to_uppercase();
+    let query_pairs = form_urlencoded::parse(req.query_string().as_bytes())
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect::<Vec<_>>();
+    let query = query_pairs.iter().cloned().collect();
+
+    let mut headers = BTreeMap::new();
+    for (name, value) in req.headers() {
+        if let Ok(v) = value.to_str() {
+            headers.insert(name.as_str().to_lowercase(), v.to_string());
+        }
+    }
+    let is_form = headers
+        .get("content-type")
+        .map(|c| c.starts_with("application/x-www-form-urlencoded"))
+        .unwrap_or(false);
+    let form_pairs = if is_form {
+        form_urlencoded::parse(std::str::from_utf8(body).unwrap_or("").as_bytes())
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let form = form_pairs.iter().cloned().collect();
+    let cookies = parse_cookies(headers.get("cookie").map(|s| s.as_str()).unwrap_or(""));
+    let uri = format!(
+        "{}://{}{}",
+        req.connection_info().scheme(),
+        req.connection_info().host(),
+        req.uri()
+    );
+
+    HttpRequestData {
+        path,
+        method,
+        uri,
+        query_pairs,
+        query,
+        form_pairs,
+        form,
+        body: body.to_vec(),
+        headers,
+        cookies,
+    }
+}
+
+fn parse_cookies(header: &str) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for part in header.split(';') {
+        let part = part.trim();
+        if let Some((k, v)) = part.split_once('=') {
+            map.insert(k.trim().to_string(), v.trim().to_string());
+        }
+    }
+    map
+}
+
+/// Translate tunnelbana's transport-independent response into an actix one.
+/// An unmappable status is never silently rewritten: it falls back to 500.
+pub fn to_actix(resp: Response) -> HttpResponse {
+    let status = actix_web::http::StatusCode::from_u16(resp.status)
+        .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
+    let mut builder = HttpResponse::build(status);
+    for (k, v) in &resp.headers {
+        builder.append_header((k.clone(), v.clone()));
+    }
+    builder.body(resp.body)
 }
