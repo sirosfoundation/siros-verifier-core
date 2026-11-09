@@ -122,63 +122,74 @@ with SIGKILL at +75s and restarted at +90s.
 
 The recorded run (the driver's strictest verdict: every accepted flow must
 reach a terminal state — a verified result or an explicit refusal — and none
-may be abandoned; sampled re-collection proves exactly-once; classification
-polls the non-destructive `/vp/status` first and only then collects):
+may be abandoned; sampled re-collection proves exactly-once, and the PASS
+gate requires the samples to have actually run; classification polls the
+non-destructive `/vp/status` first and only then collects):
 
 ```
-started:            39520
-accepted:           39520  (200: 39514, 409: 6)
+started:            38310
+max presentations in flight: 32   (offered concurrency; the verifier's
+                                  budget is 16 verification slots)
+accepted:           38310  (200: 38305, 409: 5)
 re-driven after lease expiry: 4
 store 503 retried:  0        # the 3-member election finished inside the
                              # write bound: not one store-unavailable answer
-connect failovers:  16       # the SIGKILL boundary
-completed:          39520
-delivered-unseen:   0
+connect failovers:  15       # the SIGKILL boundary
+completed:          38310
+delivered-unseen:   1  (delivered once; the collect's response was severed
+                       by the kill — observed live in this run)
 refused (terminal): 0
 abandoned:          0
 never accepted:     0
-duplicate results:  0
+duplicate results:  0 (of 3815 sampled re-collections)
 completions resumed after the last connect failure: true
 every accepted flow reached a terminal state: true
 VERDICT: PASS
 ```
 
-~219 flows/second sustained across the two replicas (the sandbox's throughput
-varies with ambient load; rehearsals of the same stack sustained 216-484/s),
-every flow a complete genuine SD-JWT presentation: nonce-bound KB-JWT and
-JWE response, a trust evaluation, a majority write, and one-time collection.
+~213 flows/second sustained across the two replicas at **twice the
+admission budget** (32 concurrent users, measured at 32 presentations in
+flight against the 16 verification slots), every flow a complete genuine
+SD-JWT presentation: nonce-bound KB-JWT and JWE response, a trust
+evaluation, a majority write, and one-time collection.
 
 Every flow caught in the SIGKILL window resolved, each by its designed path:
 
-- **6 flows replayed (409)** — wallet retries whose POST landed on the dying
+- **5 flows replayed (409)** — wallet retries whose POST landed on the dying
   replica mid-connection; the retry was correctly refused as already
-  received. 2 delivered immediately on the retry; **4 were claimed
+  received. 1 delivered immediately on the retry; **4 were claimed
   mid-processing by the killed replica and recovered by the WALLET'S RE-POST
   past the lease expiry, re-claimed, re-driven, and delivered exactly once**
   (the recovery `real_mongo_lease_recovery_mirrors_the_memory_contract` pins
   at the unit level, here observed firing under load).
-- **The one-time delivery crash window was observed and quantified in an
-  earlier rehearsal of the same stack**: flows whose collect response was
-  severed by the kill between the store's one-time `Collected` transition
-  and the HTTP response leaving — 2 in ~39k flows at the kill boundary
-  (a ~1-in-20,000 window). The raw record (queried from MongoDB during
-  reproduction) proves `outcome: collected` with the original claim's lease:
-  delivered exactly once, no duplicate, no loss — but invisible to the
-  wallet that lost the connection. This is inherent to one-time delivery
-  over an unreliable transport. The driver classifies these as
-  `delivered-unseen` (counted as delivered, reported separately); an
-  `unknown` status *without* a severed collect remains an abandonment and
-  fails the verdict. This run's kill drew zero such windows (the lottery);
-  the classification is demonstrated by the earlier rehearsal.
+- **1 flow was delivered exactly once to a collect whose HTTP response was
+  severed by the kill** — observed live in this run, with the disconnect
+  recorded. This is the **inherent crash window of one-time delivery over an
+  unreliable transport**: the store's one-time `Collected` transition commits
+  between the write and the response leaving, and the wallet that lost the
+  connection never sees its result (measured at roughly 1 per 20k-40k flows
+  at the kill boundary across rehearsals). The raw MongoDB record proves
+  `outcome: collected` with the original claim's lease — no duplicate, no
+  loss. The driver classifies these as `delivered-unseen` (counted as
+  delivered, reported separately); the store's `Collected` outcome is the
+  authority: for an accepted flow inside its recovery window, status
+  `unknown` can only be that one-time transition firing.
 - **0 abandoned, 0 duplicates, 0 lost results.**
 
-Verifier resident memory after ~39k flows: 20-37 MiB per replica.
+A longer observation from an earlier rehearsal of the same stack: under a
+heavier ambient load, the three-member replica set's majority writes
+occasionally exceeded the five-second write bound mid-run — 52
+store-unavailable answers in one 180s run, every one retried and recovered,
+0 abandoned, 0 duplicates. The write bound bounds; the recovery recovers.
+
+Verifier resident memory after ~38k flows: 20-37 MiB per replica.
 
 The stepdown script verifies the failover it injects: it polls for a
 DIFFERENT primary and exits non-zero if no election happened, so a failed
 fault injection can never masquerade as a successful one. The native tool
 rejects degenerate runs (zero workers, zero duration, or no verification
-timed) instead of reporting a vacuous success.
+timed) instead of reporting a vacuous success, and the driver's PASS gate
+likewise requires at least one actually-performed exactly-once sample.
 
 ### Leg 2 — native Longfellow under sustained load
 

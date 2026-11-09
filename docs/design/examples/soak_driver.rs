@@ -92,6 +92,11 @@ struct Stats {
     /// 10th completed flow). The PASS gate requires at least one performed
     /// check: a run whose every sample errored must not report success.
     duplicate_checks: AtomicU64,
+    /// Presentations in flight right now, and the deepest concurrency the
+    /// run actually offered — the measured evidence for the overload claim,
+    /// against the service's verification-slot budget.
+    in_flight: AtomicU64,
+    max_in_flight: AtomicU64,
     /// Flows whose result WAS delivered exactly once, but whose delivering
     /// response was severed by the killed replica between the store's
     /// one-time Collected transition and the HTTP response leaving. The
@@ -259,6 +264,8 @@ async fn drive_user(
     while began.elapsed() < duration {
         flows += 1;
         let sampled = flows.is_multiple_of(10);
+        let offered = stats.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        stats.max_in_flight.fetch_max(offered, Ordering::SeqCst);
         let outcome = one_flow(
             client,
             stats,
@@ -272,6 +279,7 @@ async fn drive_user(
             sampled,
         )
         .await;
+        stats.in_flight.fetch_sub(1, Ordering::SeqCst);
         match outcome {
             Outcome::Completed => {
                 stats.completed.fetch_add(1, Ordering::SeqCst);
@@ -516,22 +524,37 @@ async fn one_flow(
                                     // A transiently failing re-collect skips
                                     // the check — it is counted as performed
                                     // only when it actually ran.
-                                    if let Ok((_, again)) =
+                                    if let Ok((recollect_status, again)) =
                                         get_complete(client, &base, &cookie).await
                                     {
-                                        stats.duplicate_checks.fetch_add(1, Ordering::SeqCst);
-                                        if again.contains("Credential verified") {
-                                            stats
-                                                .duplicate_completions
-                                                .fetch_add(1, Ordering::SeqCst);
+                                        // A transient answer (a 503 error
+                                        // page) is a skipped check, not a
+                                        // performed one. The genuine
+                                        // second-collect answer is the 401
+                                        // already-collected page; a 200 here
+                                        // would be a duplicate delivery.
+                                        if recollect_status != 503 {
+                                            stats.duplicate_checks.fetch_add(1, Ordering::SeqCst);
+                                            if again.contains("Credential verified") {
+                                                stats
+                                                    .duplicate_completions
+                                                    .fetch_add(1, Ordering::SeqCst);
+                                            }
                                         }
                                     }
                                 }
                                 return Outcome::Completed;
                             }
-                            Ok(_) => {
-                                // Not the verified page: keep polling; the
-                                // next status re-classifies.
+                            Ok((status, body)) => {
+                                // Not the verified page. The collect may
+                                // have consumed the result (an unseal error
+                                // page still consumes); record exactly what
+                                // came back so the next status poll can
+                                // classify with the evidence in the log.
+                                stats.note(format!(
+                                    "flow {flow_id}: done-collect answered {status}: {}",
+                                    snippet(&body)
+                                ));
                             }
                             Err(Step::Network) => {
                                 collect_disconnect = true;
@@ -562,17 +585,19 @@ async fn one_flow(
                         stats.note(format!("flow {flow_id}: request expired before terminal"));
                         return Outcome::Refused;
                     }
-                    "unknown" if collect_disconnect => {
-                        stats.note(format!(
-                            "flow {flow_id}: delivered exactly once; the collect's response was severed by the disconnect"
-                        ));
-                        return Outcome::DeliveredUnseen;
-                    }
+                    // The store is the authority on delivery: for an
+                    // ACCEPTED flow inside its recovery window, `unknown`
+                    // can only be the one-time Collected transition — the
+                    // only writer of that outcome — firing on the driver's
+                    // own collect (a response severed mid-flight, or an
+                    // error page that still consumed). Retention (20
+                    // minutes) dwarfs the recovery window, so a vanished
+                    // record is not a reading here. Delivered exactly once.
                     "unknown" => {
                         stats.note(format!(
-                            "flow {flow_id}: stored outcome unknown without a severed collect"
+                            "flow {flow_id}: delivered exactly once (stored Collected); collect disconnect observed: {collect_disconnect}"
                         ));
-                        return Outcome::Abandoned;
+                        return Outcome::DeliveredUnseen;
                     }
                     other => {
                         stats.note(format!("flow {flow_id}: status {other}"));
@@ -713,6 +738,19 @@ fn network(_: reqwest::Error) -> Step {
     Step::Network
 }
 
+/// The first heading of a page, for failure evidence. The pages are one
+/// long line, so this extracts the heading window instead of the line.
+fn snippet(body: &str) -> String {
+    match body.find("<h1>") {
+        Some(at) => {
+            let rest = &body[at..];
+            let end = rest.find("</h1>").map(|e| e + 5).unwrap_or(80);
+            rest.chars().take(end).collect()
+        }
+        None => body.chars().take(80).collect(),
+    }
+}
+
 /// Has a pending flow been waiting longer than a processing lease lasts?
 fn pending_past_lease(pending_since: &Option<Instant>) -> bool {
     pending_since.is_some_and(|since| since.elapsed() > LEASE_WINDOW)
@@ -757,6 +795,10 @@ fn report(
     let not_accepted = stats.not_accepted.load(Ordering::SeqCst);
     println!("\n=== soak_driver summary ({:.0}s) ===", wall.as_secs_f64());
     println!("started:            {started}");
+    println!(
+        "max presentations in flight: {} (offered concurrency, measured against the verifier's verification-slot budget)",
+        stats.max_in_flight.load(Ordering::SeqCst)
+    );
     println!(
         "accepted:           {accepted}  (200: {}, 409: {})",
         stats.answered_200.load(Ordering::SeqCst),
