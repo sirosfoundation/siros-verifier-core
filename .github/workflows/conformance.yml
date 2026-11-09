@@ -51,6 +51,10 @@ on:
     tags: ["v*"]
   workflow_dispatch:
     inputs:
+      tag:
+        description: "RE-TRIGGER on a release tag (e.g. v0.1.2): check out THAT tag's source, run the suites against it, upload its verdict to that tag's release. Empty = a normal dispatch (this ref's source, nothing uploaded)."
+        required: false
+        default: ""
       conformance-ref:
         description: "The conformance repo ref to run (default: the pinned conformance/conformance-ref)"
         required: false
@@ -100,7 +104,12 @@ jobs:
       # suite images (server + nginx). Adopt a new release deliberately, with
       # its release notes, in the same PR.
     steps:
+      # The verifier-core source under test: the `tag` re-trigger input's
+      # tag when set, else this run's own triggering ref (the PR merge, the
+      # tag push, the dispatched branch).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: The conformance repo ref (pinned)
         run: |
@@ -343,12 +352,21 @@ jobs:
   # tags and PR runs skip the job entirely, never holding the grant.
   release-handoff:
     name: The certification set, on the release
-    if: github.event_name == 'push' && github.ref_type == 'tag'
+    # The release record: a TAG PUSH (ref_type=='tag' alone is NOT enough -
+    # a manual dispatch against a tag ref would otherwise masquerade as the
+    # release record, with an overridden harness pin), OR the explicit
+    # `tag` re-trigger (the recovery path: the named tag's verdict,
+    # rebuilt by today's workflow).
+    if: (github.event_name == 'push' && github.ref_type == 'tag') || inputs.tag != ''
     needs: conformance
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: write
+    env:
+      # The release this verdict belongs to: the re-trigger's named tag,
+      # else this run's own ref name (the pushed tag).
+      TARGET_REF: ${{ inputs.tag || github.ref_name }}
     steps:
       - name: The results, from the run
         uses: actions/download-artifact@v4
@@ -367,4 +385,4 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           ls conformance-results/*.zip conformance-results/*summary*.json 2>/dev/null || { echo "No exported plan ZIP or summary"; exit 0; }
-          gh release upload "${GITHUB_REF_NAME}" conformance-results/*.zip conformance-results/*summary*.json --clobber
+          gh release upload "${TARGET_REF}" conformance-results/*.zip conformance-results/*summary*.json --clobber
