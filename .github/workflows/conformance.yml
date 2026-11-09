@@ -57,13 +57,14 @@ on:
         default: ""
 
 permissions:
-  # Read everywhere; write ONLY on the release tags (the certification
-  # ZIPs and the run summary upload to the release). The
-  # conformance.siros.org publish is the conformance repo's own pull
-  # workflow (publish-releases.yml) reading these public assets — this
-  # repo hands nothing over, so it holds no cross-repo credential at
-  # all, and nothing here ever expires.
-  contents: ${{ github.ref_type == 'tag' && 'write' || 'read' }}
+  # Read everywhere by default. Expressions are not supported here — the
+  # `permissions` key takes literal scopes only — so the release write is
+  # granted statically on the ONE job that performs it, and that job runs
+  # only on release tags. The conformance.siros.org publish is the
+  # conformance repo's own pull workflow (publish-releases.yml) reading
+  # these public assets — this repo hands nothing over, so it holds no
+  # cross-repo credential at all, and nothing here ever expires.
+  contents: read
 
 concurrency:
   # The event name isolates manual experiments (workflow_dispatch) from
@@ -323,20 +324,38 @@ jobs:
             conformance-repo/playwright-report/
           if-no-files-found: error
 
-      # RELEASE TAG PUSHES ONLY: the release's conformance verdict rides the
-      # release itself — the certification ZIP (the verdict gate above proves
-      # it is the passing attempt's) plus the run summary. github.token
-      # carries the upload, and the conformance repo's pull workflow
-      # (publish-releases.yml) reads these public assets on its daily check
-      # and publishes the set to conformance.siros.org under
-      # releases/verifier-core/<tag>/. Push-event-only on purpose:
-      # workflow_dispatch against a tag ref would otherwise satisfy the tag
-      # check, sending the release record from a manual run whose harness pin
-      # may be overridden — manual runs are experiments, never the release
-      # record. No cross-repo secret, nothing to rotate.
+  # RELEASE TAG PUSHES ONLY: the release's conformance verdict rides the
+  # release itself — the certification ZIP (the verdict gate above proves
+  # it is the passing attempt's) plus the run summary. github.token carries
+  # the upload, and the conformance repo's pull workflow
+  # (publish-releases.yml) reads these public assets on its daily check
+  # and publishes the set to conformance.siros.org under
+  # releases/verifier-core/<tag>/. Push-event-only on purpose:
+  # workflow_dispatch against a tag ref would otherwise satisfy the tag
+  # check, sending the release record from a manual run whose harness pin
+  # may be overridden — manual runs are experiments, never the release
+  # record. No cross-repo secret, nothing to rotate.
+  #
+  # The static job-level `contents: write` is the whole reason this is a
+  # job: `permissions` takes literal scopes only (an expression there made
+  # the entire workflow unparseable — every run since died with zero jobs),
+  # so the write grant lives here, where the `if` confines it to release
+  # tags and PR runs skip the job entirely, never holding the grant.
+  release-handoff:
+    name: The certification set, on the release
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: conformance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: The results, from the run
+        uses: actions/download-artifact@v4
+        with:
+          name: verifier-conformance-results
+          path: conformance-results
       - name: The certification ZIP and run summary, on the release
-        if: github.event_name == 'push' && github.ref_type == 'tag'
-        working-directory: conformance-repo
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
