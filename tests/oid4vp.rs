@@ -1000,3 +1000,54 @@ fn mdoc_rejects_missing_claim_and_remote_device_mac() {
     let jwe = encrypted_body(&session, body);
     assert!(process_response(&session, &jwe, NOW + 1, &X5cLeaf).is_err());
 }
+
+/// The encrypted response modes' JWE parameters ride the request's
+/// client_metadata (OID4VP): `authorization_encrypted_response_alg`
+/// (the ephemeral key's ECDH-ES) + `authorization_encrypted_response_enc`.
+/// Wallets refuse to encrypt without them — the deployed wallet stack
+/// posts a plain `vp_token` in `direct_post.jwt` and its engine refuses
+/// it, so the presentation never completes (proven live on gdc).
+#[test]
+fn encrypted_response_params_ride_the_request_metadata() {
+    let w = world();
+    let signer = software_signer(&w.verifier_key).unwrap();
+    let cfg = RequestConfig {
+        response_uri: "https://verify.example/resp".to_owned(),
+        dcql_query: json!({
+            "credentials": [{
+                "id": "pid", "format": "dc+sd-jwt",
+                "meta": {"vct_values": ["urn:eudi:pid:arf-1.8:1"]},
+                "claims": [{"path": ["given_name"]}],
+            }]
+        }),
+        ttl_secs: 300,
+        vp_formats_supported: None,
+        client_id: None,
+    };
+    let (jar, _session) =
+        create_request(&cfg, &signer, "ES256", &[w.verifier_cert], NOW).expect("the request arms");
+    let header = jws::decode_header(&jar).unwrap();
+    let chain = sdjwt::x5c_chain(&header).unwrap();
+    let leaf = sdjwt::jwk_from_cert_der(&chain[0]).unwrap();
+    let payload: Value =
+        serde_json::from_slice(&jws::compact::verify_with_jwk(&leaf, &jar).unwrap()).unwrap();
+    let metadata = &payload["client_metadata"];
+    assert_eq!(
+        metadata["authorization_encrypted_response_alg"], "ECDH-ES",
+        "the JWE alg is the ephemeral key's own"
+    );
+    assert_eq!(
+        metadata["authorization_encrypted_response_enc"], "A128GCM",
+        "the first of encrypted_response_enc_values_supported"
+    );
+    assert!(
+        metadata["encrypted_response_enc_values_supported"]
+            .as_array()
+            .is_some_and(|values| values.contains(&json!("A128GCM"))),
+        "the declared enc is one of the advertised values"
+    );
+    assert_eq!(
+        metadata["jwks"]["keys"][0]["alg"], "ECDH-ES",
+        "the alg matches the advertised ephemeral key"
+    );
+}
