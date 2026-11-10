@@ -29,7 +29,11 @@ use crate::backend::{BackendError, BackendRegistry, ProofBackend};
 use crate::circuits::{check_artifact, Allowlist, ArtifactSource};
 use crate::functions::{AgeCheck, CircuitInput, FunctionRegistry, FUNCTION_AGE_CHECK};
 use crate::nym_auth;
-use crate::refusal::*;
+use crate::refusal::{
+    ZkpError, ZkpResult, ISSUER_KEY_NOT_A_CERTIFICATE, ISSUER_KEY_NOT_ECDSA, ISSUER_KEY_SET_SIZE,
+    ISSUER_KEY_WRONG_CURVE, ISSUER_NOT_TRUSTED, NOTHING_CHECKED, NO_PSEUDONYM,
+    PROOF_DID_NOT_VERIFY, PROOF_TIME_MISSING, PROOF_TIME_OUT_OF_RANGE, PSEUDONYM_MISMATCH,
+};
 use crate::request::Request;
 use crate::transcript;
 
