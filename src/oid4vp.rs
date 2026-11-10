@@ -104,7 +104,10 @@ fn mdoc_transcript_parts(
 ) -> Result<Vec<u8>> {
     use ciborium::Value as Cbor;
     let (handover, info) = match mode {
-        "direct_post.jwt" => (
+        // The direct_post family shares ONE handover (client_id, nonce,
+        // thumbprint, response_uri): the `.jwt` suffix governs only the
+        // response's encryption, not the transcript.
+        "direct_post" | "direct_post.jwt" => (
             "OpenID4VPHandover",
             vec![
                 Cbor::Text(client_id.to_owned()),
@@ -333,6 +336,24 @@ pub fn create_dc_api_request(
     create_request_with_response_mode(cfg, signer, alg, chain_der, now, "dc_api.jwt", Some(origin))
 }
 
+/// Create a request for OID4VP's plain `direct_post` response mode:
+/// the wallet returns the `vp_token` + `state` form in the clear (over
+/// TLS to the `response_uri`) — no JWE layer. The tradeoff is the
+/// verifier's to state: the presentation rides TLS without the
+/// response-encryption layer. The mdoc session transcript is the SAME
+/// `OpenID4VPHandover` as `direct_post.jwt` (client_id, nonce,
+/// thumbprint, response_uri) — the `.jwt` suffix governs only the
+/// response's encryption, not the transcript.
+pub fn create_plain_request(
+    cfg: &RequestConfig,
+    signer: &dyn kryptering::Signer,
+    alg: &str,
+    chain_der: &[Vec<u8>],
+    now: i64,
+) -> Result<(String, Session)> {
+    create_request_with_response_mode(cfg, signer, alg, chain_der, now, "direct_post", None)
+}
+
 fn create_request_with_response_mode(
     cfg: &RequestConfig,
     signer: &dyn kryptering::Signer,
@@ -406,19 +427,13 @@ fn create_request_with_response_mode(
             })
         }
     });
-    let payload = json!({
-        "iat": now,
-        "exp": session.expires_at,
-        "aud": REQUEST_AUD,
-        "client_id": client_id,
-        "response_type": "vp_token",
-        "response_mode": response_mode,
-        "response_uri": cfg.response_uri,
-        "nonce": session.nonce,
-        "state": session.state,
-        "dcql_query": cfg.dcql_query,
-        "client_metadata": {
-            "jwks": { "keys": [enc_pub] },
+    // The JARM encryption parameters ride ONLY the encrypted modes: a
+    // plain `direct_post` request must NOT advertise them (a wallet
+    // would encrypt against the mode's instruction). The `jwks` stays
+    // in every mode — the mdoc session transcript's thumbprint
+    // resolves from it.
+    let jarm_metadata = if response_mode.ends_with(".jwt") {
+        json!({
             // OID4VP's encrypted response modes: the Authorization
             // Request Object's JWE parameters. REQUIRED for
             // `direct_post.jwt`/`dc_api.jwt` (the response is a JWE
@@ -432,8 +447,33 @@ fn create_request_with_response_mode(
             "authorization_encrypted_response_alg": "ECDH-ES",
             "authorization_encrypted_response_enc": "A128GCM",
             "encrypted_response_enc_values_supported": ["A128GCM", "A256GCM"],
-            "vp_formats_supported": vp_formats_supported,
-        },
+        })
+    } else {
+        json!({})
+    };
+    let mut client_metadata = json!({
+        "jwks": { "keys": [enc_pub] },
+        "vp_formats_supported": vp_formats_supported,
+    });
+    if let (Some(metadata), Some(jarm)) =
+        (client_metadata.as_object_mut(), jarm_metadata.as_object())
+    {
+        for (key, value) in jarm {
+            metadata.insert(key.clone(), value.clone());
+        }
+    }
+    let payload = json!({
+        "iat": now,
+        "exp": session.expires_at,
+        "aud": REQUEST_AUD,
+        "client_id": client_id,
+        "response_type": "vp_token",
+        "response_mode": response_mode,
+        "response_uri": cfg.response_uri,
+        "nonce": session.nonce,
+        "state": session.state,
+        "dcql_query": cfg.dcql_query,
+        "client_metadata": client_metadata,
     });
     let mut header = JoseHeader::new(alg);
     header.typ = Some("oauth-authz-req+jwt".into());
@@ -871,9 +911,61 @@ pub fn process_response(
     now: i64,
     resolver: &dyn IssuerKeyResolver,
 ) -> Result<Vec<PresentationResult>> {
+    if session.response_mode != "direct_post.jwt" && session.response_mode != "dc_api.jwt" {
+        return Err(policy(format!(
+            "a `response` JWE answers only the encrypted modes; this request is {}",
+            session.response_mode
+        )));
+    }
     let opened = open_response(session, jwe, now)?;
-    let vp = &opened.vp_token;
+    walk_response(session, &opened.vp_token, now, resolver)
+}
 
+/// Process a PLAIN `direct_post` response (OID4VP's unencrypted mode):
+/// the wallet returned the `vp_token` + `state` form in the clear.
+/// The checks — expiry, the wallet-error short-circuit, the state
+/// match, the DCQL walk, the key-binding window — are the same as the
+/// encrypted modes'; only the JWE layer is absent.
+pub fn process_response_plain(
+    session: &Session,
+    body: &[u8],
+    now: i64,
+    resolver: &dyn IssuerKeyResolver,
+) -> Result<Vec<PresentationResult>> {
+    if session.response_mode != "direct_post" {
+        return Err(policy(format!(
+            "a plain `vp_token` answers only the plain direct_post mode; this request is {}",
+            session.response_mode
+        )));
+    }
+    if now >= session.expires_at {
+        return Err(policy("request has expired"));
+    }
+    let body: Value = crate::json_strict::from_slice(body)
+        .map_err(|e| malformed(format!("response is not JSON: {e}")))?;
+    if let Some(err) = body.get("error") {
+        return Err(policy(format!("wallet returned an error: {err}")));
+    }
+    if body.get("state").and_then(Value::as_str) != Some(session.state.as_str()) {
+        return Err(integrity("state mismatch"));
+    }
+    let vp = body
+        .get("vp_token")
+        .and_then(Value::as_object)
+        .cloned()
+        .ok_or_else(|| malformed("missing vp_token object"))?;
+    walk_response(session, &vp, now, resolver)
+}
+
+/// The shared DCQL walk both response paths take: every answered
+/// credential verifies (format-aware), matches its query, and signs
+/// its key binding into the session's audience.
+fn walk_response(
+    session: &Session,
+    vp: &serde_json::Map<String, Value>,
+    now: i64,
+    resolver: &dyn IssuerKeyResolver,
+) -> Result<Vec<PresentationResult>> {
     if session.dcql_query.get("credential_sets").is_some() {
         return Err(policy("credential_sets are not supported in the spike"));
     }
