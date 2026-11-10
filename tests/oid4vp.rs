@@ -1005,18 +1005,20 @@ fn mdoc_rejects_missing_claim_and_remote_device_mac() {
     assert!(process_response(&session, &jwe, NOW + 1, &X5cLeaf).is_err());
 }
 
-/// The encrypted response modes' JWE parameters are TOP-LEVEL
-/// Authorization Request Object members (RFC 9101; the working-group
-/// clarification in OpenID4VP PR #233): `authorization_encrypted_response_alg`
-/// (the ephemeral key's ECDH-ES) + `authorization_encrypted_response_enc`.
-/// Wallets refuse to encrypt without them — the deployed wallet stack
-/// posts a plain `vp_token` in `direct_post.jwt` and its engine refuses
-/// it, so the presentation never completes (proven live on gdc) — and
-/// the OIDF suite rejects them inside client_metadata
-/// (VP1FinalCheckForUnexpectedParametersInVpClientMetadata), so the
-/// placement is load-bearing in both directions.
+/// OpenID4VP 1.0 response encryption (clarified by
+/// openid/OpenID4VP#233): client_metadata carries exactly `jwks`,
+/// `encrypted_response_enc_values_supported`, and
+/// `vp_formats_supported`. The response JWE's alg is the ephemeral
+/// jwks key's own `alg` member (ECDH-ES) and its enc is the wallet's
+/// pick from the advertised values. The JARM client-registration
+/// names `authorization_encrypted_response_alg`/`_enc` ride nowhere in
+/// the request — the OIDF suite rejects them as client_metadata
+/// members (VP1FinalCheckForUnexpectedParametersInVpClientMetadata),
+/// and the final spec defines no top-level members of those names.
+/// The exact member-set assertion guards against re-introducing
+/// anything the working group ruled out.
 #[test]
-fn encrypted_response_params_ride_the_request_top_level() {
+fn encrypted_response_metadata_matches_openid4vp_1_0() {
     let w = world();
     let signer = software_signer(&w.verifier_key).unwrap();
     let cfg = RequestConfig {
@@ -1039,32 +1041,46 @@ fn encrypted_response_params_ride_the_request_top_level() {
     let leaf = sdjwt::jwk_from_cert_der(&chain[0]).unwrap();
     let payload: Value =
         serde_json::from_slice(&jws::compact::verify_with_jwk(&leaf, &jar).unwrap()).unwrap();
-    assert_eq!(
-        payload["authorization_encrypted_response_alg"], "ECDH-ES",
-        "the JWE alg is the ephemeral key's own, at the request's top level"
-    );
-    assert_eq!(
-        payload["authorization_encrypted_response_enc"], "A128GCM",
-        "the first of encrypted_response_enc_values_supported, at the request's top level"
-    );
-    let metadata = &payload["client_metadata"];
     assert!(
-        metadata
+        payload
             .get("authorization_encrypted_response_alg")
             .is_none()
-            && metadata
+            && payload
                 .get("authorization_encrypted_response_enc")
                 .is_none(),
-        "the OIDF suite rejects these as client_metadata members"
+        "OpenID4VP 1.0 defines no top-level members of the JARM names"
+    );
+    let metadata = payload["client_metadata"]
+        .as_object()
+        .expect("client_metadata is an object");
+    assert!(
+        !metadata.contains_key("authorization_encrypted_response_alg")
+            && !metadata.contains_key("authorization_encrypted_response_enc"),
+        "the OIDF suite rejects the JARM names as client_metadata members"
+    );
+    let mut members: Vec<&str> = metadata.keys().map(String::as_str).collect();
+    members.sort_unstable();
+    assert_eq!(
+        members,
+        vec![
+            "encrypted_response_enc_values_supported",
+            "jwks",
+            "vp_formats_supported"
+        ],
+        "openid/OpenID4VP#233 allows exactly these client_metadata members"
     );
     assert!(
         metadata["encrypted_response_enc_values_supported"]
             .as_array()
             .is_some_and(|values| values.contains(&json!("A128GCM"))),
-        "the declared enc is one of the advertised values"
+        "the wallet's enc pick comes from the advertised values"
     );
     assert_eq!(
         metadata["jwks"]["keys"][0]["alg"], "ECDH-ES",
-        "the alg matches the advertised ephemeral key"
+        "the JWE alg rides the ephemeral key's own alg member"
+    );
+    assert_eq!(
+        metadata["jwks"]["keys"][0]["use"], "enc",
+        "the ephemeral key is an encryption key"
     );
 }

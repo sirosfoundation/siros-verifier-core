@@ -416,18 +416,23 @@ fn create_request_with_response_mode(
         "nonce": session.nonce,
         "state": session.state,
         "dcql_query": cfg.dcql_query,
-        // OID4VP's encrypted-response JWE parameters. REQUIRED for
-        // `direct_post.jwt`/`dc_api.jwt` (the response is a JWE to
-        // the ephemeral key in client_metadata below) and wallets
-        // refuse to encrypt without them. Per RFC 9101 and the
-        // working-group clarification (OpenID4VP PR #233) they are
-        // TOP-LEVEL Authorization Request Object members — the OIDF
-        // suite's VP1FinalCheckForUnexpectedParametersInVpClientMetadata
-        // rejects them inside client_metadata. The alg is the
-        // ephemeral key's own (ECDH-ES); the enc the first of
-        // `encrypted_response_enc_values_supported`.
-        "authorization_encrypted_response_alg": "ECDH-ES",
-        "authorization_encrypted_response_enc": "A128GCM",
+        // OpenID4VP 1.0 response encryption (clarified by
+        // openid/OpenID4VP#233): client_metadata carries exactly the
+        // three members below. The response JWE's alg is the
+        // ephemeral jwks key's own `alg` member (ECDH-ES, set when
+        // the key is minted) and its enc is the wallet's pick from
+        // `encrypted_response_enc_values_supported`. The JARM
+        // client-registration names `authorization_encrypted_response_alg`
+        // and `authorization_encrypted_response_enc` ride nowhere in
+        // the request: the OIDF suite's
+        // VP1FinalCheckForUnexpectedParametersInVpClientMetadata
+        // rejects them as client_metadata members, and the final
+        // spec defines no top-level members of those names either.
+        // `process_response` still insists on the JWE in the `.jwt`
+        // modes, so a wallet that gates encryption on the legacy
+        // names and answers with a plain vp_token is refused — such
+        // wallets must read the key's `alg` and the advertised enc
+        // values instead.
         "client_metadata": {
             "jwks": { "keys": [enc_pub] },
             "encrypted_response_enc_values_supported": ["A128GCM", "A256GCM"],
