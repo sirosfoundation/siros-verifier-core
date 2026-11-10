@@ -512,8 +512,15 @@ fn valid_authority(authority: &str) -> bool {
 
 fn valid_status_uri(uri: &str) -> bool {
     // Token Status List §6.2 uses an RFC 3986 URI, not an IRI or a WHATWG
-    // normalized URL. Reject raw whitespace/non-ASCII and malformed percent
-    // escapes before validating each URI component.
+    // normalized URL. The byte scan rejects raw whitespace/non-ASCII and
+    // malformed percent escapes; the structure pass then validates each
+    // URI component.
+    valid_uri_bytes(uri) && valid_uri_structure(uri)
+}
+
+// The first pass: every byte is ASCII and either an allowed URI character
+// or the lead of a well-formed percent escape.
+fn valid_uri_bytes(uri: &str) -> bool {
     if uri.is_empty() || !uri.is_ascii() {
         return false;
     }
@@ -561,7 +568,12 @@ fn valid_status_uri(uri: &str) -> bool {
         }
         index += 1;
     }
+    true
+}
 
+// The second pass: scheme, optional authority, path, query and fragment
+// must satisfy RFC 3986's component rules.
+fn valid_uri_structure(uri: &str) -> bool {
     let Some((scheme, remainder)) = uri.split_once(':') else {
         return false;
     };

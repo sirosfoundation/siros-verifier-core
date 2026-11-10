@@ -12,9 +12,12 @@ use siros_verifier_core::mdoc::format_utc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use crate::backend::*;
-use crate::circuits::*;
-use crate::nym_auth::*;
+use crate::backend::{check_claimed, BackendError, BackendRegistry, ProofBackend, SystemProfile};
+use crate::circuits::CircuitConfig;
+use crate::nym_auth::{
+    known_offender_matching, pseudonym, verifier_input, CONFIG_KNOWN_OFFENDER_MATCHING_SSC,
+    SYSTEM_LONGFELLOW,
+};
 use crate::refusal::ZkpResult;
 use crate::request::Request;
 use crate::verify::Channel;
