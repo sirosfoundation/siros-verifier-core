@@ -62,7 +62,7 @@ jobs:
   docker:
     name: Build and publish GHCR image
     needs: validate
-    uses: sirosfoundation/.github/.github/workflows/docker-build-push.yml@6dfb92e7edc20a50c134b8eafc7994dc8389947c # main (cosign v3 SBOM signing fix, sirosfoundation/.github#39)
+    uses: sirosfoundation/.github/.github/workflows/docker-build-push.yml@e9052f30ef341824ced5172cbc14f0eaeb97294c # main (cosign v3 SBOM signing + container-SBOM signature, sirosfoundation/.github#39, #40)
     permissions:
       contents: read
       packages: write
@@ -74,7 +74,7 @@ jobs:
   sbom:
     name: Generate signed source and image SBOMs
     needs: docker
-    uses: sirosfoundation/.github/.github/workflows/sbom.yml@6dfb92e7edc20a50c134b8eafc7994dc8389947c # main (cosign v3 SBOM signing fix, sirosfoundation/.github#39)
+    uses: sirosfoundation/.github/.github/workflows/sbom.yml@e9052f30ef341824ced5172cbc14f0eaeb97294c # main (cosign v3 SBOM signing + container-SBOM signature, sirosfoundation/.github#39, #40)
     permissions:
       contents: write
       id-token: write
