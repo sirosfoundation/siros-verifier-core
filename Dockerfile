@@ -10,9 +10,16 @@ RUN apk add --no-cache ca-certificates cmake g++ git make musl-dev perl zstd \
     && cargo build --locked --release -p siros-verifier-service
 
 FROM alpine:3.22
-RUN apk add --no-cache ca-certificates curl
+RUN apk add --no-cache ca-certificates curl \
+    && addgroup -g 10001 -S siros \
+    && adduser -u 10001 -G siros -S -H siros
 COPY --from=build /src/target/release/siros-verifier-service /usr/local/bin/siros-verifier-service
 COPY --from=build /etc/siros-verifier/circuits/nymauth-mdoc.bin /etc/siros-verifier/circuits/nymauth-mdoc.bin
 ENV TUNNELBANA_BIND=0.0.0.0:9001
+# Numeric UID/GID: the container runs unprivileged, and orchestrators can
+# verify runAsNonRoot without name resolution. The service needs no
+# writable path — flow state lives in the shared store, config and keys
+# are mounted read-only — and 9001 is an unprivileged port.
+USER 10001:10001
 EXPOSE 9001
 ENTRYPOINT ["/usr/local/bin/siros-verifier-service"]
