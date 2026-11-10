@@ -1,6 +1,6 @@
 [package]
 name = "siros-verifier-zkp"
-version = "0.1.0-pre.1"
+version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -9,7 +9,7 @@ publish = true
 description = "zkp_req (nym_auth) verification: handover and challenge derivation, age bounds, circuit allowlist, issuer-key trust, dispatch to a proof backend"
 
 [dependencies]
-siros-verifier-core = { path = "..", version = "0.1.0-pre.1" }
+siros-verifier-core = { path = "..", version = "0.1.0" }
 siros-dc-matcher-core = { version = "0.12.0", git = "https://github.com/sirosfoundation/siros-dc-matcher.git", rev = "49946a331bd15021f5665eee21111d925cd10434" }
 zk-cred-longfellow = { version = "0.1.2", git = "https://github.com/sirosfoundation/zk-cred-longfellow.git", rev = "115bfec9bb58a7e3210062ece7c5c7ab0e936ae7" }
 zk-cred-vega = { version = "0.0.7", git = "https://github.com/sirosfoundation/zk-cred-vega.git", rev = "8e7be172e9010e8b47f3192f046d5f990f602790" }
@@ -31,7 +31,7 @@ rcgen = { version = "0.14", optional = true }
 testutil = ["dep:rcgen", "siros-verifier-core/testutil"]
 
 [dev-dependencies]
-siros-verifier-core = { path = "..", version = "0.1.0-pre.1", features = ["testutil"] }
+siros-verifier-core = { path = "..", version = "0.1.0", features = ["testutil"] }
 siros-verifier-zkp = { path = ".", features = ["testutil"] }
 
 # The native-verification soak: sustained genuine proof verification through

@@ -10,7 +10,7 @@ authors = ["SIROS Foundation"]
 
 [package]
 name = "siros-verifier-core"
-version = "0.1.0-pre.1"
+version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

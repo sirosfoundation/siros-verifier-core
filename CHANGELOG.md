@@ -11,6 +11,21 @@ unreleased work.
 
 ## Published releases
 
+### 0.1.0-pre.1 — 2026-11-10
+
+- **Source:** tag [`v0.1.0-pre.1`](https://github.com/sirosfoundation/siros-verifier-core/releases/tag/v0.1.0-pre.1) → commit [`f474853`](https://github.com/sirosfoundation/siros-verifier-core/commit/f474853a5e7636983ee80bf4d9c7808a9b075d40) (merge of #33; the Sonar cleanups #31 and the Alpine/musl non-root container #32 behind it), built from the locked dependency graph: pinned Git dependencies, no crates.io or Maven Central prerequisites. First GHCR-published release.
+- **Verifier image:** `ghcr.io/sirosfoundation/siros-verifier-core@sha256:7cb430fe29cdbe3b8aa8d1edd9cd0ed35fcf4633693dd10c8d9c8a68c36a7c4d` — Alpine 3.22 / musl, statically linked, running as the dedicated non-root user `siros` (UID/GID 10001); `image-digest.txt` and `SHA256SUMS` with provenance on the release. Pull-by-digest verified.
+- **Native artifacts:** Android AAR/POM `0.1.0-pre.1` in GitHub Packages and on the release; `SirosVerifierCore.xcframework.zip` with its SPM checksum and the generated Swift bindings on the release.
+- **Summary:** the first pinnable pre-release — the Phase 0 verifier (HA lifecycle, strict TSL, native ZKP on the blocking pool, the thin JS surface, the recorded soak evidence) in the org-standard Alpine container with the non-root hardening, at a semver pre-release of `v0.1.0`.
+- **Validation:**
+  - The release workflow's validate job green on the tag: tag/version equality across all five crates, fmt, clippy, workspace tests with real MongoDB, the mutation gate, the advisories/bans/licenses/sources gate, parser fuzz, and the JS suite.
+  - **The OIDF verifier plan passed on the tag: 14/14 modules, 0 failed, 0 skipped** (variant `sd_jwt_vc / x509_hash / direct_post.jwt / request_uri_signed / plain_vp`) — the certification ZIP and run summary are on the release. The first hand-off attempt raced the release creation ("release not found": the conformance workflow finished before the release existed) and was completed by the designed `workflow_dispatch` tag re-trigger — the recovery path the workflow documents; the verdict is the re-run's, on the same tag source.
+  - Native proof verification on the musl toolchain (in-container, same base as the image build): the `zkp` crate suite — 65 tests, 0 failures — including the genuine Longfellow vector suite (the 23.6 s proving run), the Vega vector suite, and the live-circuit catalog check against the pinned `api.circuits.siros.org` artifact.
+- **Deployment:** the sirosid-dev GDC environment pins the image by the digest above; the loopback-HTTP Compose profile remains the development profile (`docs/INTEGRATORS.md`, now including the file-backed secret permissions the non-root user requires).
+- **Rollback:** the first digest-pinnable release; there is no previous published image to roll back to. Remove the GDC deployment, or re-pin when `v0.1.0` publishes.
+- **Documentation:** this entry; the Alpine/non-root and secret-permissions guidance in #32; the Sonar cleanups in #31; the soak evidence in `docs/design/SOAK.md`.
+- **Known limitations:** the SBOMs on the release (source + container CycloneDX) are **unsigned**: the org-level SBOM workflow's cosign invocation broke on the cosign v2→v3 CLI change (`create bundle file: open : no such file or directory` — `--output-signature`/`--output-certificate` leave v3's bundle path empty), reproduced deterministically on the job re-run. Fixed in [sirosfoundation/.github#39](https://github.com/sirosfoundation/.github/pull/39) (the v3 `--bundle` output); this repository now pins the fixed workflow, so `v0.1.0` signs. The vulnerability scan results are on the Security tab either way. The pre-release image also predates the `oid4vp` encrypted-response `client_metadata` fix (513d459), which is in `v0.1.0`.
+
 ### 0.1.0-testing — 2026-11-09
 
 - **Source:** commit [`a6bd169`](https://github.com/sirosfoundation/siros-verifier-core/commit/a6bd1698a8d00f1fc9d6893bac6e56ff7c4dc963) (merge of #29 into `main`; every reviewed PR #17–#29 behind it), built from the locked dependency graph: pinned Git dependencies, no crates.io or Maven Central prerequisites. No signed tag yet — `v0.1.0` follows the tag workflow with explicit approval.
