@@ -48,7 +48,7 @@ The root `docker-compose.yml` starts one verifier and one MongoDB container usin
    cp .env.example .env
    ```
 
-2. Put the dedicated P-256 private key in PKCS#8 PEM format (a `PRIVATE KEY` block) and its certificate chain at the paths in `.env`. The certificate's DNS SAN must match `SIROS_VERIFIER_DNS_NAME` (`localhost` by default).
+2. Put the dedicated P-256 private key in PKCS#8 PEM format (a `PRIVATE KEY` block) and its certificate chain at the paths in `.env`. The certificate's DNS SAN must match `SIROS_VERIFIER_DNS_NAME` (`localhost` by default). The container runs as a dedicated non-root user (UID/GID 10001), and file-backed secrets keep their host-file permissions inside the mount — a key at mode 0600 owned by another UID is unreadable to the service and fails startup. On a single-user host, `chmod 0644` the key and chain files; on a shared host, give them a group that maps to the container's UID and use `chmod 0640`. Never make a private key world-writable, and never commit it.
 3. Set `SIROS_PDP_ENDPOINT` to an **HTTPS** go-trust/AuthZEN evaluation URL reachable from inside the verifier container. The Compose setup does not provide go-trust or an allow-all fallback. Configure issuer, verifier, and status-list signer policy there. Add `pdp_bearer_token` in `examples/compose.toml` only if your PDP requires it.
 4. Validate and start the stack:
 
