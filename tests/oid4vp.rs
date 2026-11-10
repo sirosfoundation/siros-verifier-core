@@ -1005,18 +1005,22 @@ fn mdoc_rejects_missing_claim_and_remote_device_mac() {
     assert!(process_response(&session, &jwe, NOW + 1, &X5cLeaf).is_err());
 }
 
-/// OpenID4VP 1.0 response encryption (clarified by
-/// openid/OpenID4VP#233): client_metadata carries exactly `jwks`,
+/// OpenID4VP 1.0 response encryption: the final spec's
+/// client_metadata defines exactly `jwks`,
 /// `encrypted_response_enc_values_supported`, and
-/// `vp_formats_supported`. The response JWE's alg is the ephemeral
-/// jwks key's own `alg` member (ECDH-ES) and its enc is the wallet's
-/// pick from the advertised values. The JARM client-registration
-/// names `authorization_encrypted_response_alg`/`_enc` ride nowhere in
-/// the request — the OIDF suite rejects them as client_metadata
-/// members (VP1FinalCheckForUnexpectedParametersInVpClientMetadata),
-/// and the final spec defines no top-level members of those names.
-/// The exact member-set assertion guards against re-introducing
-/// anything the working group ruled out.
+/// `vp_formats_supported`, and this verifier's output policy is to
+/// send exactly those three. The response JWE's alg MUST equal the
+/// chosen jwks key's `alg` member (ECDH-ES) and its enc comes from
+/// `encrypted_response_enc_values_supported`. The JARM
+/// client-registration names `authorization_encrypted_response_alg`
+/// and `authorization_encrypted_response_enc` appear nowhere in the
+/// final spec text — the 2024 draft (openid/OpenID4VP#233) still
+/// permitted them as client_metadata members, and the final spec
+/// removed them; the OIDF suite's
+/// VP1FinalCheckForUnexpectedParametersInVpClientMetadata flags
+/// them there (9 of 14 modules failed while this branch carried
+/// them). The exact member-set assertion pins the verifier to the
+/// final-spec output.
 #[test]
 fn encrypted_response_metadata_matches_openid4vp_1_0() {
     let w = world();
@@ -1067,7 +1071,7 @@ fn encrypted_response_metadata_matches_openid4vp_1_0() {
             "jwks",
             "vp_formats_supported"
         ],
-        "openid/OpenID4VP#233 allows exactly these client_metadata members"
+        "the final OpenID4VP 1.0 spec defines exactly these client_metadata members"
     );
     assert!(
         metadata["encrypted_response_enc_values_supported"]

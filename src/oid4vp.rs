@@ -416,23 +416,31 @@ fn create_request_with_response_mode(
         "nonce": session.nonce,
         "state": session.state,
         "dcql_query": cfg.dcql_query,
-        // OpenID4VP 1.0 response encryption (clarified by
-        // openid/OpenID4VP#233): client_metadata carries exactly the
-        // three members below. The response JWE's alg is the
-        // ephemeral jwks key's own `alg` member (ECDH-ES, set when
-        // the key is minted) and its enc is the wallet's pick from
-        // `encrypted_response_enc_values_supported`. The JARM
-        // client-registration names `authorization_encrypted_response_alg`
-        // and `authorization_encrypted_response_enc` ride nowhere in
-        // the request: the OIDF suite's
+        // OpenID4VP 1.0 response encryption: the final spec's
+        // client_metadata defines exactly `jwks`,
+        // `encrypted_response_enc_values_supported`, and
+        // `vp_formats_supported`, and this verifier's output policy
+        // is to send exactly those three. The response JWE's alg MUST
+        // equal the chosen jwks key's `alg` member (ECDH-ES, set
+        // when the key is minted); the enc comes from
+        // `encrypted_response_enc_values_supported` (A128GCM is the
+        // spec's default; the request advertises it anyway). The
+        // JARM client-registration names
+        // `authorization_encrypted_response_alg` and
+        // `authorization_encrypted_response_enc` appear nowhere in
+        // the final spec text: the 2024 draft clarified by
+        // openid/OpenID4VP#233 still listed them as permitted
+        // client_metadata members — the placement the deployed
+        // wallet implements — and the final spec removed them. The
+        // OIDF suite certifies the final text: its
         // VP1FinalCheckForUnexpectedParametersInVpClientMetadata
-        // rejects them as client_metadata members, and the final
-        // spec defines no top-level members of those names either.
+        // flags unknown client_metadata members (9 of 14 modules
+        // failed while this branch carried the JARM names there).
         // `process_response` still insists on the JWE in the `.jwt`
-        // modes, so a wallet that gates encryption on the legacy
-        // names and answers with a plain vp_token is refused — such
-        // wallets must read the key's `alg` and the advertised enc
-        // values instead.
+        // modes, so a wallet implementing the draft placement —
+        // gating on the legacy names and otherwise answering with a
+        // plain vp_token — is refused until it reads the key's
+        // `alg` and the advertised enc values instead.
         "client_metadata": {
             "jwks": { "keys": [enc_pub] },
             "encrypted_response_enc_values_supported": ["A128GCM", "A256GCM"],
