@@ -416,20 +416,20 @@ fn create_request_with_response_mode(
         "nonce": session.nonce,
         "state": session.state,
         "dcql_query": cfg.dcql_query,
+        // OID4VP's encrypted-response JWE parameters. REQUIRED for
+        // `direct_post.jwt`/`dc_api.jwt` (the response is a JWE to
+        // the ephemeral key in client_metadata below) and wallets
+        // refuse to encrypt without them. Per RFC 9101 and the
+        // working-group clarification (OpenID4VP PR #233) they are
+        // TOP-LEVEL Authorization Request Object members — the OIDF
+        // suite's VP1FinalCheckForUnexpectedParametersInVpClientMetadata
+        // rejects them inside client_metadata. The alg is the
+        // ephemeral key's own (ECDH-ES); the enc the first of
+        // `encrypted_response_enc_values_supported`.
+        "authorization_encrypted_response_alg": "ECDH-ES",
+        "authorization_encrypted_response_enc": "A128GCM",
         "client_metadata": {
             "jwks": { "keys": [enc_pub] },
-            // OID4VP's encrypted response modes: the Authorization
-            // Request Object's JWE parameters. REQUIRED for
-            // `direct_post.jwt`/`dc_api.jwt` (the response is a JWE
-            // to the ephemeral key above) and wallets refuse to
-            // encrypt without them — the wallet stack posts a plain
-            // `vp_token`, its engine refuses it in this mode
-            // ("the client answered with a vp_token instead of
-            // response_jwe"), and the presentation never completes.
-            // The alg is the ephemeral key's own (ECDH-ES); the enc
-            // the first of `encrypted_response_enc_values_supported`.
-            "authorization_encrypted_response_alg": "ECDH-ES",
-            "authorization_encrypted_response_enc": "A128GCM",
             "encrypted_response_enc_values_supported": ["A128GCM", "A256GCM"],
             "vp_formats_supported": vp_formats_supported,
         },

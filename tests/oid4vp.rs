@@ -1005,14 +1005,18 @@ fn mdoc_rejects_missing_claim_and_remote_device_mac() {
     assert!(process_response(&session, &jwe, NOW + 1, &X5cLeaf).is_err());
 }
 
-/// The encrypted response modes' JWE parameters ride the request's
-/// client_metadata (OID4VP): `authorization_encrypted_response_alg`
+/// The encrypted response modes' JWE parameters are TOP-LEVEL
+/// Authorization Request Object members (RFC 9101; the working-group
+/// clarification in OpenID4VP PR #233): `authorization_encrypted_response_alg`
 /// (the ephemeral key's ECDH-ES) + `authorization_encrypted_response_enc`.
 /// Wallets refuse to encrypt without them — the deployed wallet stack
 /// posts a plain `vp_token` in `direct_post.jwt` and its engine refuses
-/// it, so the presentation never completes (proven live on gdc).
+/// it, so the presentation never completes (proven live on gdc) — and
+/// the OIDF suite rejects them inside client_metadata
+/// (VP1FinalCheckForUnexpectedParametersInVpClientMetadata), so the
+/// placement is load-bearing in both directions.
 #[test]
-fn encrypted_response_params_ride_the_request_metadata() {
+fn encrypted_response_params_ride_the_request_top_level() {
     let w = world();
     let signer = software_signer(&w.verifier_key).unwrap();
     let cfg = RequestConfig {
@@ -1035,14 +1039,23 @@ fn encrypted_response_params_ride_the_request_metadata() {
     let leaf = sdjwt::jwk_from_cert_der(&chain[0]).unwrap();
     let payload: Value =
         serde_json::from_slice(&jws::compact::verify_with_jwk(&leaf, &jar).unwrap()).unwrap();
-    let metadata = &payload["client_metadata"];
     assert_eq!(
-        metadata["authorization_encrypted_response_alg"], "ECDH-ES",
-        "the JWE alg is the ephemeral key's own"
+        payload["authorization_encrypted_response_alg"], "ECDH-ES",
+        "the JWE alg is the ephemeral key's own, at the request's top level"
     );
     assert_eq!(
-        metadata["authorization_encrypted_response_enc"], "A128GCM",
-        "the first of encrypted_response_enc_values_supported"
+        payload["authorization_encrypted_response_enc"], "A128GCM",
+        "the first of encrypted_response_enc_values_supported, at the request's top level"
+    );
+    let metadata = &payload["client_metadata"];
+    assert!(
+        metadata
+            .get("authorization_encrypted_response_alg")
+            .is_none()
+            && metadata
+                .get("authorization_encrypted_response_enc")
+                .is_none(),
+        "the OIDF suite rejects these as client_metadata members"
     );
     assert!(
         metadata["encrypted_response_enc_values_supported"]
