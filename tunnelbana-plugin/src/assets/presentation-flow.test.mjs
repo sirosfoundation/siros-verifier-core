@@ -82,6 +82,12 @@ test("claim labels skip trailing language-map keys and keep short claim names", 
   assert.equal(claimLabel({path: ["org.iso.18013.5.1", "sex"]}), "sex");
   assert.equal(claimLabel({path: ["org.iso.18013.5.1", "age"]}), "age");
   assert.equal(claimLabel({path: ["credentialSubject", "birthDate"]}), "birthDate");
+  // The full ISO 639-1 registry — non-EU codes — skip too.
+  assert.equal(claimLabel({path: ["credentialSubject", "familyName", "nb"]}), "familyName");
+  assert.equal(claimLabel({path: ["credentialSubject", "familyName", "nn"]}), "familyName");
+  assert.equal(claimLabel({path: ["credentialSubject", "name", "zh-Hant"]}), "name");
+  assert.equal(claimLabel({path: ["credentialSubject", "name", "ar"]}), "name");
+  assert.equal(claimLabel({path: ["credentialSubject", "name", "ru"]}), "name");
   // An explicit id on a language-map path still wins.
   assert.equal(claimLabel({id: "Title", path: ["credentialSubject", "hasClaim", "title", "nl"]}), "Title");
   // Singleton and empty paths never collapse past the first segment.

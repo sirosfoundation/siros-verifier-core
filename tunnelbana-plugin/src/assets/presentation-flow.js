@@ -76,17 +76,20 @@ export function setSelectedClaims(dcql, availableCredentials, selectedValues) {
 // ...,"countryCode","prefLabel","en-US"]). Skip them when deriving a fallback
 // label so the selection list shows the claim type, never the language tag.
 //
-// The primary subtag is checked against a curated set — the EU's official
-// languages plus "und" — rather than a spelling heuristic, because a pattern
-// like /^[a-z]{2,3}$/ also strips real claim names (mdoc's "sex", "age").
-// Regional and script variants ("nl-BE", "en-Latn") split at the first
-// hyphen: the primary must be in the set and the remainder must be subtag-
-// shaped (alphanumeric segments joined by hyphens).
-const languageTagPrimaries = new Set([
-  "und", "en", "nl", "sv", "de", "fr", "fi", "da", "it", "es", "pt",
-  "pl", "cs", "el", "hu", "ro", "bg", "hr", "sk", "sl", "lt", "lv",
-  "et", "ga", "mt",
-]);
+// The primary subtag is checked against the full ISO 639-1 registry (the
+// 184 two-letter codes) plus "und" — the finite, stable set of 2-letter
+// language primaries — rather than a spelling heuristic, because a pattern
+// like /^[a-z]{2,3}$/ also strips real claim names (mdoc's "sex", "age",
+// neither of which is a registered 639-1 code). Norwegian Bokmål/Nynorsk
+// ("nb"/"nn") are registered 639-1 codes and are covered. Three-letter
+// 639-2/3 primaries ("nob", "nno") are NOT in this set: no EU-credential
+// claim name collides with the 2-letter registry, and adding the 7,000+
+// 639-3 codes would reintroduce the collision risk the curated approach
+// exists to avoid. Regional and script variants ("nl-BE", "zh-Hant",
+// "en-Latn") split at the first hyphen: the primary must be in the set and
+// the remainder must be subtag-shaped (alphanumeric segments).
+const ISO_639_1 = "aa ab ae af ak am an ar as av ay az ba be bg bh bi bm bn bo br bs ca ce ch co cr cs cu cv cy da de dv dz ee el en eo es et eu fa ff fi fj fo fr fy ga gd gl gn gu gv ha he hi ho hr ht hu hy hz ia id ie ig ii ik io is it iu ja jv ka kg ki kj kk kl km kn ko kr ks ku kv kw ky la lb lg li ln lo lt lu lv mg mh mi mk ml mn mr ms mt my na nb ne ng nl nn no nr nv ny oc oj om or os pa pi pl ps pt qu rm rn ro ru rw sa sc sd se sg si sk sl sm sn so sq sr ss st su sv sw ta te tg th ti tk tl tn to tr ts tt tw ty ug uk ur uz ve vi vo wa wo xh yi yo za zh zu".split(" ");
+const languageTagPrimaries = new Set(["und", ...ISO_639_1]);
 
 function isLanguageTag(segment) {
   if (typeof segment !== "string") return false;
