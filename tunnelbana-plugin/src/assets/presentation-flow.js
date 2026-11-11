@@ -70,20 +70,27 @@ export function setSelectedClaims(dcql, availableCredentials, selectedValues) {
   return next;
 }
 
-// A trailing BCP-47 primary language tag (2-3 lowercase letters, or "und" for
-// undetermined) is a JSON-LD language-map key, not a claim type: the diploma's
-// paths descend into language maps (["credentialSubject","givenName","und"],
-// ["credentialSubject","hasClaim","title","nl"], ...prefLabel","en"]). Skip
-// them when deriving a fallback label so the selection list shows the claim
-// type (givenName, title, prefLabel), never the language tag ("und", "nl",
-// "en"). Claim ids, when the registry data carries them, always win.
-const languageTag = /^[a-z]{2,3}(-[a-zA-Z0-9]+)*$/;
+// A trailing BCP-47 language tag is a JSON-LD language-map key, not a claim
+// type: the diploma's paths descend into language maps
+// (["credentialSubject","givenName","und"], ["credentialSubject","hasClaim","title","nl"],
+// ...,"countryCode","prefLabel","en"]). Skip them when deriving a fallback
+// label so the selection list shows the claim type, never the language tag.
+//
+// The check is a curated set, not a spelling heuristic: the EU credential
+// space's language maps carry the EU's official languages plus "und", and a
+// pattern like /^[a-z]{2,3}$/ would also strip real claim names — mdoc's
+// "sex", "age" — regressing labels that were already correct.
+const languageTags = new Set([
+  "und", "en", "nl", "sv", "de", "fr", "fi", "da", "it", "es", "pt",
+  "pl", "cs", "el", "hu", "ro", "bg", "hr", "sk", "sl", "lt", "lv",
+  "et", "ga", "mt",
+]);
 
 export function claimLabel(claim) {
   if (claim.id) return claim.id;
   const path = claim.path ?? [];
   let last = path.length - 1;
-  while (last > 0 && languageTag.test(path[last])) last -= 1;
+  while (last > 0 && languageTags.has(path[last])) last -= 1;
   return path[last] ?? "claim";
 }
 
