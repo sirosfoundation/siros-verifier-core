@@ -1005,14 +1005,24 @@ fn mdoc_rejects_missing_claim_and_remote_device_mac() {
     assert!(process_response(&session, &jwe, NOW + 1, &X5cLeaf).is_err());
 }
 
-/// The encrypted response modes' JWE parameters ride the request's
-/// client_metadata (OID4VP): `authorization_encrypted_response_alg`
-/// (the ephemeral key's ECDH-ES) + `authorization_encrypted_response_enc`.
-/// Wallets refuse to encrypt without them — the deployed wallet stack
-/// posts a plain `vp_token` in `direct_post.jwt` and its engine refuses
-/// it, so the presentation never completes (proven live on gdc).
+/// OpenID4VP 1.0 response encryption: the final spec's
+/// client_metadata defines exactly `jwks`,
+/// `encrypted_response_enc_values_supported`, and
+/// `vp_formats_supported`, and this verifier's output policy is to
+/// send exactly those three. The response JWE's alg MUST equal the
+/// chosen jwks key's `alg` member (ECDH-ES) and its enc comes from
+/// `encrypted_response_enc_values_supported`. The JARM
+/// client-registration names `authorization_encrypted_response_alg`
+/// and `authorization_encrypted_response_enc` appear nowhere in the
+/// final spec text — the 2024 draft (openid/OpenID4VP#233) still
+/// permitted them as client_metadata members, and the final spec
+/// removed them; the OIDF suite's
+/// VP1FinalCheckForUnexpectedParametersInVpClientMetadata flags
+/// them there (9 of 14 modules failed while this branch carried
+/// them). The exact member-set assertion pins the verifier to the
+/// final-spec output.
 #[test]
-fn encrypted_response_params_ride_the_request_metadata() {
+fn encrypted_response_metadata_matches_openid4vp_1_0() {
     let w = world();
     let signer = software_signer(&w.verifier_key).unwrap();
     let cfg = RequestConfig {
@@ -1035,23 +1045,46 @@ fn encrypted_response_params_ride_the_request_metadata() {
     let leaf = sdjwt::jwk_from_cert_der(&chain[0]).unwrap();
     let payload: Value =
         serde_json::from_slice(&jws::compact::verify_with_jwk(&leaf, &jar).unwrap()).unwrap();
-    let metadata = &payload["client_metadata"];
-    assert_eq!(
-        metadata["authorization_encrypted_response_alg"], "ECDH-ES",
-        "the JWE alg is the ephemeral key's own"
+    assert!(
+        payload
+            .get("authorization_encrypted_response_alg")
+            .is_none()
+            && payload
+                .get("authorization_encrypted_response_enc")
+                .is_none(),
+        "OpenID4VP 1.0 defines no top-level members of the JARM names"
     );
+    let metadata = payload["client_metadata"]
+        .as_object()
+        .expect("client_metadata is an object");
+    assert!(
+        !metadata.contains_key("authorization_encrypted_response_alg")
+            && !metadata.contains_key("authorization_encrypted_response_enc"),
+        "the OIDF suite rejects the JARM names as client_metadata members"
+    );
+    let mut members: Vec<&str> = metadata.keys().map(String::as_str).collect();
+    members.sort_unstable();
     assert_eq!(
-        metadata["authorization_encrypted_response_enc"], "A128GCM",
-        "the first of encrypted_response_enc_values_supported"
+        members,
+        vec![
+            "encrypted_response_enc_values_supported",
+            "jwks",
+            "vp_formats_supported"
+        ],
+        "the final OpenID4VP 1.0 spec defines exactly these client_metadata members"
     );
     assert!(
         metadata["encrypted_response_enc_values_supported"]
             .as_array()
             .is_some_and(|values| values.contains(&json!("A128GCM"))),
-        "the declared enc is one of the advertised values"
+        "the wallet's enc pick comes from the advertised values"
     );
     assert_eq!(
         metadata["jwks"]["keys"][0]["alg"], "ECDH-ES",
-        "the alg matches the advertised ephemeral key"
+        "the JWE alg rides the ephemeral key's own alg member"
+    );
+    assert_eq!(
+        metadata["jwks"]["keys"][0]["use"], "enc",
+        "the ephemeral key is an encryption key"
     );
 }

@@ -416,20 +416,33 @@ fn create_request_with_response_mode(
         "nonce": session.nonce,
         "state": session.state,
         "dcql_query": cfg.dcql_query,
+        // OpenID4VP 1.0 response encryption: the final spec's
+        // client_metadata defines exactly `jwks`,
+        // `encrypted_response_enc_values_supported`, and
+        // `vp_formats_supported`, and this verifier's output policy
+        // is to send exactly those three. The response JWE's alg MUST
+        // equal the chosen jwks key's `alg` member (ECDH-ES, set
+        // when the key is minted); the enc comes from
+        // `encrypted_response_enc_values_supported` (A128GCM is the
+        // spec's default; the request advertises it anyway). The
+        // JARM client-registration names
+        // `authorization_encrypted_response_alg` and
+        // `authorization_encrypted_response_enc` appear nowhere in
+        // the final spec text: the 2024 draft clarified by
+        // openid/OpenID4VP#233 still listed them as permitted
+        // client_metadata members — the placement the deployed
+        // wallet implements — and the final spec removed them. The
+        // OIDF suite certifies the final text: its
+        // VP1FinalCheckForUnexpectedParametersInVpClientMetadata
+        // flags unknown client_metadata members (9 of 14 modules
+        // failed while this branch carried the JARM names there).
+        // `process_response` still insists on the JWE in the `.jwt`
+        // modes, so a wallet implementing the draft placement —
+        // gating on the legacy names and otherwise answering with a
+        // plain vp_token — is refused until it reads the key's
+        // `alg` and the advertised enc values instead.
         "client_metadata": {
             "jwks": { "keys": [enc_pub] },
-            // OID4VP's encrypted response modes: the Authorization
-            // Request Object's JWE parameters. REQUIRED for
-            // `direct_post.jwt`/`dc_api.jwt` (the response is a JWE
-            // to the ephemeral key above) and wallets refuse to
-            // encrypt without them — the wallet stack posts a plain
-            // `vp_token`, its engine refuses it in this mode
-            // ("the client answered with a vp_token instead of
-            // response_jwe"), and the presentation never completes.
-            // The alg is the ephemeral key's own (ECDH-ES); the enc
-            // the first of `encrypted_response_enc_values_supported`.
-            "authorization_encrypted_response_alg": "ECDH-ES",
-            "authorization_encrypted_response_enc": "A128GCM",
             "encrypted_response_enc_values_supported": ["A128GCM", "A256GCM"],
             "vp_formats_supported": vp_formats_supported,
         },
