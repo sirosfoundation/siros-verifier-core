@@ -62,6 +62,45 @@ test("claim labels prefer ids and otherwise use the final path segment", () => {
   assert.equal(claimLabel({path: ["address", "street_address"]}), "street_address");
 });
 
+test("claim labels skip trailing language-map keys and keep short claim names", () => {
+  // Language-map paths from the diploma's registry DCQL: the tag is the key
+  // of the JSON-LD language map, not the claim type.
+  assert.equal(claimLabel({path: ["credentialSubject", "givenName", "und"]}), "givenName");
+  assert.equal(claimLabel({path: ["credentialSubject", "familyName", "und"]}), "familyName");
+  assert.equal(claimLabel({path: ["credentialSubject", "hasClaim", "title", "nl"]}), "title");
+  assert.equal(
+    claimLabel({path: ["credentialSubject", "hasClaim", "awardedBy", "awardingBody", "legalName", "nl"]}),
+    "legalName",
+  );
+  // Regional and script variants split at the first hyphen.
+  assert.equal(claimLabel({path: ["credentialSubject", "givenName", "en-US"]}), "givenName");
+  assert.equal(claimLabel({path: ["credentialSubject", "hasClaim", "title", "nl-BE"]}), "title");
+  assert.equal(claimLabel({path: ["credentialSubject", "prefLabel", "en-Latn"]}), "prefLabel");
+  // Consecutive tags all skip.
+  assert.equal(claimLabel({path: ["credentialSubject", "givenName", "und", "nl"]}), "givenName");
+  // Short claim names are NOT language tags and must render.
+  assert.equal(claimLabel({path: ["org.iso.18013.5.1", "sex"]}), "sex");
+  assert.equal(claimLabel({path: ["org.iso.18013.5.1", "age"]}), "age");
+  assert.equal(claimLabel({path: ["credentialSubject", "birthDate"]}), "birthDate");
+  // The full ISO 639-1 registry — non-EU codes — skip too.
+  assert.equal(claimLabel({path: ["credentialSubject", "familyName", "nb"]}), "familyName");
+  assert.equal(claimLabel({path: ["credentialSubject", "familyName", "nn"]}), "familyName");
+  assert.equal(claimLabel({path: ["credentialSubject", "name", "zh-Hant"]}), "name");
+  assert.equal(claimLabel({path: ["credentialSubject", "name", "ar"]}), "name");
+  assert.equal(claimLabel({path: ["credentialSubject", "name", "ru"]}), "name");
+  // An explicit id on a language-map path still wins.
+  assert.equal(claimLabel({id: "Title", path: ["credentialSubject", "hasClaim", "title", "nl"]}), "Title");
+  // Singleton and empty paths never collapse past the first segment.
+  assert.equal(claimLabel({path: ["en"]}), "en");
+  assert.equal(claimLabel({path: []}), "claim");
+  assert.equal(claimLabel({}), "claim");
+  // Scalar claims whose name collides with a language code render intact:
+  // a language map descends under a claim name, never sits directly under
+  // the payload root — "id" (Indonesian in ISO 639-1) is a claim here.
+  assert.equal(claimLabel({path: ["credentialSubject", "id"]}), "id");
+  assert.equal(claimLabel({path: ["credentialSubject", "en"]}), "en");
+});
+
 class FakeElement {
   constructor(tagName) {
     this.tagName = tagName;
