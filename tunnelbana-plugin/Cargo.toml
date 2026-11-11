@@ -1,6 +1,6 @@
 [package]
 name = "siros-verifier-core-tunnelbana"
-version = "0.1.1"
+version = "0.1.2"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -9,8 +9,8 @@ description = "Tunnelbana backend for the SIROS verifier core"
 publish = true
 
 [dependencies]
-siros-verifier-core = { path = "..", version = "0.1.1", default-features = false }
-siros-verifier-zkp = { path = "../zkp", version = "0.1.1" }
+siros-verifier-core = { path = "..", version = "0.1.2", default-features = false }
+siros-verifier-zkp = { path = "../zkp", version = "0.1.2" }
 siros-dc-matcher-core = { version = "0.12.0", git = "https://github.com/sirosfoundation/siros-dc-matcher.git", rev = "49946a331bd15021f5665eee21111d925cd10434" }
 tunnelbana-core = { version = "0.6.0", git = "https://github.com/sirosfoundation/tunnelbana.git", rev = "ed96497f1504d0dd708dc05391366716fdd56c95" }
 async-trait = "0.1"
