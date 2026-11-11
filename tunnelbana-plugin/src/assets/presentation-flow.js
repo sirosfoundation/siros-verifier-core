@@ -70,9 +70,21 @@ export function setSelectedClaims(dcql, availableCredentials, selectedValues) {
   return next;
 }
 
+// A trailing BCP-47 primary language tag (2-3 lowercase letters, or "und" for
+// undetermined) is a JSON-LD language-map key, not a claim type: the diploma's
+// paths descend into language maps (["credentialSubject","givenName","und"],
+// ["credentialSubject","hasClaim","title","nl"], ...prefLabel","en"]). Skip
+// them when deriving a fallback label so the selection list shows the claim
+// type (givenName, title, prefLabel), never the language tag ("und", "nl",
+// "en"). Claim ids, when the registry data carries them, always win.
+const languageTag = /^[a-z]{2,3}(-[a-zA-Z0-9]+)*$/;
+
 export function claimLabel(claim) {
   if (claim.id) return claim.id;
-  return claim.path?.[claim.path.length - 1] ?? "claim";
+  const path = claim.path ?? [];
+  let last = path.length - 1;
+  while (last > 0 && languageTag.test(path[last])) last -= 1;
+  return path[last] ?? "claim";
 }
 
 function createSirosSpinner() {
