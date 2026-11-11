@@ -13,4 +13,4 @@
 #
 # workflow_dispatch may override this pin for a single manual run (the
 # conformance-ref input); PR and tag runs always use this commit.
-conformance-repo-ref: f71aee4ba4a822a955e62746053bf635db1c00f0
+conformance-repo-ref: 1ce25830621b71044f312e072c9189ef61adea68
