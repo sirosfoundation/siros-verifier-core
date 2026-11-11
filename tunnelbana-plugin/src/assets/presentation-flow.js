@@ -101,8 +101,15 @@ function isLanguageTag(segment) {
 export function claimLabel(claim) {
   if (claim.id) return claim.id;
   const path = claim.path ?? [];
+  // A strippable tag needs at least a payload root AND a claim name before it
+  // (root → claimName → tag): a language map always descends under a claim
+  // name, never sits directly under the root. A two-segment path
+  // (["credentialSubject","id"], ["org.iso.18013.5.1","sex"]) is a scalar
+  // claim whose last segment IS the claim name — and some claim names are
+  // registered language codes ("id" is Indonesian in ISO 639-1), so they
+  // must not be stripped at this depth.
   let last = path.length - 1;
-  while (last > 0 && isLanguageTag(path[last])) last -= 1;
+  while (last > 1 && isLanguageTag(path[last])) last -= 1;
   return path[last] ?? "claim";
 }
 

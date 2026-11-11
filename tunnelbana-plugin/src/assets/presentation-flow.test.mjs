@@ -94,6 +94,11 @@ test("claim labels skip trailing language-map keys and keep short claim names", 
   assert.equal(claimLabel({path: ["en"]}), "en");
   assert.equal(claimLabel({path: []}), "claim");
   assert.equal(claimLabel({}), "claim");
+  // Scalar claims whose name collides with a language code render intact:
+  // a language map descends under a claim name, never sits directly under
+  // the payload root — "id" (Indonesian in ISO 639-1) is a claim here.
+  assert.equal(claimLabel({path: ["credentialSubject", "id"]}), "id");
+  assert.equal(claimLabel({path: ["credentialSubject", "en"]}), "en");
 });
 
 class FakeElement {
