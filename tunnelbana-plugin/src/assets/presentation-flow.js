@@ -73,24 +73,33 @@ export function setSelectedClaims(dcql, availableCredentials, selectedValues) {
 // A trailing BCP-47 language tag is a JSON-LD language-map key, not a claim
 // type: the diploma's paths descend into language maps
 // (["credentialSubject","givenName","und"], ["credentialSubject","hasClaim","title","nl"],
-// ...,"countryCode","prefLabel","en"]). Skip them when deriving a fallback
+// ...,"countryCode","prefLabel","en-US"]). Skip them when deriving a fallback
 // label so the selection list shows the claim type, never the language tag.
 //
-// The check is a curated set, not a spelling heuristic: the EU credential
-// space's language maps carry the EU's official languages plus "und", and a
-// pattern like /^[a-z]{2,3}$/ would also strip real claim names — mdoc's
-// "sex", "age" — regressing labels that were already correct.
-const languageTags = new Set([
+// The primary subtag is checked against a curated set — the EU's official
+// languages plus "und" — rather than a spelling heuristic, because a pattern
+// like /^[a-z]{2,3}$/ also strips real claim names (mdoc's "sex", "age").
+// Regional and script variants ("nl-BE", "en-Latn") split at the first
+// hyphen: the primary must be in the set and the remainder must be subtag-
+// shaped (alphanumeric segments joined by hyphens).
+const languageTagPrimaries = new Set([
   "und", "en", "nl", "sv", "de", "fr", "fi", "da", "it", "es", "pt",
   "pl", "cs", "el", "hu", "ro", "bg", "hr", "sk", "sl", "lt", "lv",
   "et", "ga", "mt",
 ]);
 
+function isLanguageTag(segment) {
+  if (typeof segment !== "string") return false;
+  const [primary, ...subtags] = segment.split("-");
+  return languageTagPrimaries.has(primary)
+    && subtags.every((subtag) => /^[a-zA-Z0-9]+$/.test(subtag));
+}
+
 export function claimLabel(claim) {
   if (claim.id) return claim.id;
   const path = claim.path ?? [];
   let last = path.length - 1;
-  while (last > 0 && languageTags.has(path[last])) last -= 1;
+  while (last > 0 && isLanguageTag(path[last])) last -= 1;
   return path[last] ?? "claim";
 }
 
