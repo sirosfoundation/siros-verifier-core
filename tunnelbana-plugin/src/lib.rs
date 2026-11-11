@@ -1226,7 +1226,10 @@ impl VpBackend {
         {
             Ok(FinishResult::Finished) => Ok(response),
             Ok(FinishResult::Conflict) => Ok(Response::text(409, "flow completion conflict")),
-            Err(_) => Ok(Response::text(503, "flow store unavailable")),
+            Err(e) => {
+                tracing::error!(error = %e, flow = %id, "flow store finish failed");
+                Ok(Response::text(503, "flow store unavailable"))
+            }
         }
     }
 
@@ -1300,7 +1303,10 @@ impl VpBackend {
             Ok(ClaimResult::Replay) => {
                 return Ok(Response::text(409, "response already received"));
             }
-            Err(_) => return Ok(Response::text(503, "flow store unavailable")),
+            Err(e) => {
+                tracing::error!(error = %e, flow = %id, "flow store claim failed");
+                return Ok(Response::text(503, "flow store unavailable"));
+            }
         };
         // The budget never takes more of the lease than leaves room to
         // persist the terminal outcome while this claim is still held; a
@@ -1468,7 +1474,7 @@ impl VpBackend {
                     );
                 }
                 Err(e) => {
-                    tracing_noop(&e);
+                    tracing::error!(error = %e, "trust evaluation failed");
                     return Decision::failed(
                         "trust_unavailable",
                         Response::text(503, "trust evaluation unavailable"),
@@ -1720,7 +1726,8 @@ impl VpBackend {
         let now = (self.clock)();
         let flow = match self.store.get(&id, now).await {
             Ok(flow) => flow,
-            Err(_) => {
+            Err(e) => {
+                tracing::error!(error = %e, flow = %id, "flow store get failed");
                 return Ok(BackendAction::Respond(Response::text(
                     503,
                     "flow store unavailable",
@@ -1770,15 +1777,16 @@ impl VpBackend {
                     })?;
                 Ok(BackendAction::AuthResponse(data))
             }
-            Err(_) => Ok(BackendAction::Respond(Response::text(
-                503,
-                "flow store unavailable",
-            ))),
+            Err(e) => {
+                tracing::error!(error = %e, flow = %id, "flow store collect failed");
+                Ok(BackendAction::Respond(Response::text(
+                    503,
+                    "flow store unavailable",
+                )))
+            }
         }
     }
 }
-
-fn tracing_noop(_e: &str) {}
 
 fn pct(s: &str) -> String {
     let mut o = String::new();
