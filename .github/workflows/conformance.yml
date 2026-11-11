@@ -360,7 +360,10 @@ jobs:
     if: (github.event_name == 'push' && github.ref_type == 'tag') || inputs.tag != ''
     needs: conformance
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    # The hand-off WAITS for the Release workflow to create the release
+    # (bounded below, ~90 minutes) — the wait rides this timeout, so it
+    # must cover the whole window plus the upload.
+    timeout-minutes: 100
     permissions:
       contents: write
     env:
@@ -385,4 +388,28 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           ls conformance-results/*.zip conformance-results/*summary*.json 2>/dev/null || { echo "No exported plan ZIP or summary"; exit 0; }
+          # The Release workflow creates the release only after its validate
+          # job clears — the full CI matrix, ~75 minutes on this tag, with
+          # the mutation gate alone at ~59. This run finishes in ~12, so on
+          # a tag push the release WILL NOT EXIST YET when we get here:
+          # racing it failed both releases so far (v0.1.0-pre.1 and
+          # v0.1.0), each rescued by the workflow_dispatch re-trigger.
+          # WAIT for the release instead, bounded and polled — the
+          # re-trigger stays the recovery for a Release workflow that
+          # never completes, and a deadline breach fails THIS job loudly
+          # so a release cannot silently ship without its verdict.
+          # The re-trigger path (inputs.tag) always finds the release
+          # already on the first poll and uploads at once.
+          waited=0
+          until gh release view "${TARGET_REF}" >/dev/null 2>&1; do
+            if [ "$waited" -ge 90 ]; then
+              echo "::error::The release ${TARGET_REF} never materialized after ${waited} minutes — the Release workflow did not complete. Re-trigger this workflow (workflow_dispatch, tag=${TARGET_REF}) once it does."
+              exit 1
+            fi
+            sleep 60
+            waited=$((waited + 1))
+          done
+          if [ "$waited" -gt 0 ]; then
+            echo "Waited ${waited} minutes for the release to materialize."
+          fi
           gh release upload "${TARGET_REF}" conformance-results/*.zip conformance-results/*summary*.json --clobber
