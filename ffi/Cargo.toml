@@ -1,6 +1,6 @@
 [package]
 name = "siros-verifier-core-ffi"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -17,7 +17,7 @@ name = "uniffi-bindgen"
 path = "src/bin.rs"
 
 [dependencies]
-siros-verifier-core = { path = "..", version = "0.1.0", default-features = false }
+siros-verifier-core = { path = "..", version = "0.1.1", default-features = false }
 kryptering = { version = "0.7", default-features = false, features = ["rustcrypto"] }
 uniffi = { version = "0.28", features = ["cli"] }
 ciborium = "0.2"
