@@ -658,4 +658,22 @@ fn x5c_issuer_evidence_and_status() {
     let issued3 = issue(&f.issuer, &spec(&f)).unwrap();
     let p3 = present(&issued3, &[], Some(kb(&f, "v", "n")), HashAlg::Sha256).unwrap();
     assert!(verify(&p3, &X5cLeaf, &params("v", "n")).is_err());
+
+    // A pinned issuer key never parades the header chain as evidence: the
+    // credential carries the issuer's x5c chain, the pinned key verifies the
+    // signature, and the trust evidence is the RESOLVER's provenance — the
+    // pinned key, no chain. The header-supplied chain must not reach the
+    // trust query as evidence for a key it did not resolve.
+    let p_pinned = present(&issued, &[], Some(kb(&f, "v", "n")), HashAlg::Sha256).unwrap();
+    let pinned = verify(
+        &p_pinned,
+        &StaticKey(public_of(&issuer_jwk)),
+        &params("v", "n"),
+    )
+    .unwrap();
+    assert!(
+        pinned.issuer.x5c_der.is_empty(),
+        "a pinned-key resolution carries no chain evidence"
+    );
+    assert_eq!(pinned.issuer.iss, "https://issuer.example");
 }
