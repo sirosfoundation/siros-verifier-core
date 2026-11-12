@@ -222,7 +222,45 @@ fn the_wrprc_payload_is_held_to_table_7() {
     claims["status"] = json!({"status_list": {"idx": "nine", "uri": "https://x"}});
     let error = parse_wrprc(&mint_wrprc(&claims), NOW).unwrap_err();
     assert!(
-        error.to_string().contains("wrprc_status_idx_not_integer"),
+        error
+            .to_string()
+            .contains("wrprc_status_idx_not_unsigned_integer"),
+        "{error}"
+    );
+    // Token Status List section 6.2: the index is UNSIGNED - a negative
+    // value is not a valid reference, and a valid u64 above i64::MAX
+    // parses (the round-3 as_i64 read accepted the first and rejected the
+    // second, both wrong).
+    let mut claims = register_claims();
+    claims["status"] =
+        json!({"status_list": {"idx": -1, "uri": "https://registrar.example/statuslists/9"}});
+    let error = parse_wrprc(&mint_wrprc(&claims), NOW).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("wrprc_status_idx_not_unsigned_integer"),
+        "{error}"
+    );
+    let mut claims = register_claims();
+    claims["status"] =
+        json!({"status_list": {"idx": u64::MAX, "uri": "https://registrar.example/statuslists/9"}});
+    parse_wrprc(&mint_wrprc(&claims), NOW)
+        .expect("a valid u64 index parses at the full unsigned range");
+    // Section 6.2: the URI is an RFC 3986 URI - the same check the
+    // credential status references apply. Non-URIs and malformed escapes
+    // fail; the HTTPS/egress policy stays the transport layer's.
+    let mut claims = register_claims();
+    claims["status"] = json!({"status_list": {"idx": 9, "uri": "not a URI"}});
+    let error = parse_wrprc(&mint_wrprc(&claims), NOW).unwrap_err();
+    assert!(
+        error.to_string().contains("wrprc_status_uri_not_valid"),
+        "{error}"
+    );
+    let mut claims = register_claims();
+    claims["status"] = json!({"status_list": {"idx": 9, "uri": "https://example.com/%zz"}});
+    let error = parse_wrprc(&mint_wrprc(&claims), NOW).unwrap_err();
+    assert!(
+        error.to_string().contains("wrprc_status_uri_not_valid"),
         "{error}"
     );
     // The default-Mint token (policy_id the only optional member) parses:

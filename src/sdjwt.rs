@@ -540,6 +540,13 @@ fn valid_status_uri(uri: &str) -> bool {
     valid_uri_bytes(uri) && valid_uri_structure(uri)
 }
 
+/// The WRPRC carrier's status-reference validation (crate::wrprc): the
+/// same §6.2 RFC 3986 check the credential status references use — the
+/// WRPRC's `status.status_list.uri` is the same class of reference.
+pub(crate) fn status_uri_is_valid(uri: &str) -> bool {
+    valid_status_uri(uri)
+}
+
 // The first pass: every byte is ASCII and either an allowed URI character
 // or the lead of a well-formed percent escape.
 fn valid_uri_bytes(uri: &str) -> bool {

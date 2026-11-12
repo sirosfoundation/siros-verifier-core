@@ -228,7 +228,11 @@ pub fn parse_wrprc(token: &str, now: i64) -> Result<Wrprc> {
     }
     if let Some(status) = claims.get("status") {
         // NOTE 5: the IETF Token Status List pointer — the same shape the
-        // credential status references use.
+        // credential status references use, held to the same rules: the
+        // index is an UNSIGNED integer (Token Status List §6.2), and the
+        // URI an RFC 3986 URI (the same check the credential status
+        // references apply; the transport layer keeps its separate HTTPS
+        // and egress policy).
         let object = status
             .as_object()
             .ok_or_else(|| malformed("wrprc_status_not_object"))?;
@@ -238,14 +242,16 @@ pub fn parse_wrprc(token: &str, now: i64) -> Result<Wrprc> {
             .ok_or_else(|| malformed("wrprc_status_missing_status_list"))?;
         let idx = status_list
             .get("idx")
-            .and_then(Value::as_i64)
-            .ok_or_else(|| malformed("wrprc_status_idx_not_integer"))?;
+            .and_then(Value::as_u64)
+            .ok_or_else(|| malformed("wrprc_status_idx_not_unsigned_integer"))?;
         let uri = status_list
             .get("uri")
             .and_then(Value::as_str)
-            .filter(|uri| !uri.is_empty())
             .ok_or_else(|| malformed("wrprc_status_missing_uri"))?;
-        let _ = (idx, uri);
+        if !crate::sdjwt::status_uri_is_valid(uri) {
+            return Err(malformed("wrprc_status_uri_not_valid"));
+        }
+        let _ = idx;
     }
     // `purpose` (Table 7): the registered purposes, a flat array of
     // MultiLangStrings.
