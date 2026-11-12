@@ -1,7 +1,9 @@
 use serde_json::{json, Value};
 use siros_verifier_core::sdjwt::{StatusRef, X5cLeaf};
-use siros_verifier_core::status_list::{index_parts, status_at, verify_token};
-use siros_verifier_core::testutil::{self_signed_ec, sign_raw};
+use siros_verifier_core::status_list::{
+    index_parts, status_at, verify_token, StatusListKeyResolver, StatusListKeySource,
+};
+use siros_verifier_core::testutil::{self_signed_ec, sign_raw, sign_raw_embedded_jwk};
 use siros_verifier_core::trust::TrustQuery;
 
 const NOW: i64 = 1_793_656_800;
@@ -52,6 +54,89 @@ fn an_index_beyond_the_native_usize_range_is_rejected_not_truncated() {
 fn valid_claims() -> Value {
     serde_json::from_slice(&jose_rs::base64url::decode(TOKEN.split('.').nth(1).unwrap()).unwrap())
         .unwrap()
+}
+
+#[test]
+fn embedded_jwk_status_lists_verify_under_the_configured_key_source() {
+    // Status-list tokens in the wild — the GDC registry's among them, and IETF
+    // Token Status List issuers generally — embed the signer as a `jwk` with
+    // no certificate chain. The default `x5c` policy refuses them; the
+    // `x5c-or-jwk` interop policy accepts: the x5c leaf when the header
+    // carries a chain, otherwise the embedded key.
+    let (_cert, key) = self_signed_ec("status.example", "ES256");
+    let token = sign_raw_embedded_jwk(&key, "statuslist+jwt", &valid_claims());
+
+    // Default (`x5c`): refused — the token carries no chain.
+    let error = verify_token(&token, LIST_URI, &StatusListKeyResolver::default(), NOW).unwrap_err();
+    assert_eq!(error.code(), "malformed");
+    assert!(error.to_string().contains("no x5c chain"));
+
+    // `x5c-or-jwk`: the embedded key verifies and the list reads.
+    let interop = StatusListKeyResolver {
+        source: StatusListKeySource::X5cOrJwk,
+    };
+    let verified = verify_token(&token, LIST_URI, &interop, NOW).unwrap();
+    assert_eq!(status_at(&verified, &reference(4)).unwrap(), 0);
+
+    // `jwk`-only: the token's carrier is a jwk, so it verifies too...
+    let jwk_only = StatusListKeyResolver {
+        source: StatusListKeySource::Jwk,
+    };
+    let verified = verify_token(&token, LIST_URI, &jwk_only, NOW).unwrap();
+    // ...and the strict bindings still hold under every policy: a list whose
+    // subject is not the referenced URI never speaks for the credential.
+    let mut claims = valid_claims();
+    claims["sub"] = json!("https://status.example/other-list");
+    let foreign = sign_raw_embedded_jwk(&key, "statuslist+jwt", &claims);
+    assert!(verify_token(&foreign, LIST_URI, &jwk_only, NOW).is_err());
+    assert!(verify_token(&foreign, LIST_URI, &interop, NOW).is_err());
+    let _ = verified;
+
+    // The certificate-bound token still resolves under the interop policy
+    // (its carrier is x5c) and is refused under `jwk`-only — an x5c-carrying
+    // token with NO embedded key has no jwk carrier to resolve.
+    let (cert, key) = self_signed_ec("status.example", "ES256");
+    let x5c_only = sign_raw(
+        &key,
+        "statuslist+jwt",
+        &valid_claims(),
+        std::slice::from_ref(&cert),
+    );
+    verify_token(&x5c_only, LIST_URI, &interop, NOW).unwrap();
+    let error = verify_token(&x5c_only, LIST_URI, &jwk_only, NOW).unwrap_err();
+    assert!(error.to_string().contains("no embedded jwk"));
+    // The conformance suite's token carries BOTH members: every policy
+    // resolves it (x5c when accepted, else the embedded jwk).
+    verify_token(TOKEN, LIST_URI, &StatusListKeyResolver::default(), NOW).unwrap();
+    verify_token(TOKEN, LIST_URI, &interop, NOW).unwrap();
+    verify_token(TOKEN, LIST_URI, &jwk_only, NOW).unwrap();
+}
+
+#[test]
+fn a_present_but_broken_carrier_is_an_error_never_a_silent_fallback() {
+    // Under `x5c-or-jwk`, a header that CARRIES an x5c chain resolves through
+    // the chain — a broken chain is an error, not a fallthrough to an
+    // embedded key the deployer may not have meant to honor.
+    let (cert, key) = self_signed_ec("status.example", "ES256");
+    let mut claims = valid_claims();
+    claims["sub"] = json!("https://status.example/other-list");
+    // Sign with the key, but present some other certificate's chain: the x5c
+    // leaf does not match the signing key, so signature verification must
+    // fail rather than succeed via any fallback.
+    let (other_cert, _other_key) = self_signed_ec("status.example", "ES256");
+    let _ = cert;
+    let token = sign_raw(
+        &key,
+        "statuslist+jwt",
+        &claims,
+        std::slice::from_ref(&other_cert),
+    );
+    let interop = StatusListKeyResolver {
+        source: StatusListKeySource::X5cOrJwk,
+    };
+    let error =
+        verify_token(&token, "https://status.example/other-list", &interop, NOW).unwrap_err();
+    assert_eq!(error.code(), "integrity");
 }
 
 #[test]

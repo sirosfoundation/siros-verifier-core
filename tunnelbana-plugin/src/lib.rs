@@ -25,6 +25,7 @@ use siros_verifier_core::receipt::{
 };
 use siros_verifier_core::sdjwt::{CryptoVerified, X5cLeaf};
 use siros_verifier_core::session_seal::SessionSealer;
+use siros_verifier_core::status_list::{StatusListKeyResolver, StatusListKeySource};
 use siros_verifier_core::trust::TrustQuery;
 use siros_verifier_zkp::refusal::ZkpError;
 use siros_verifier_zkp::verify::{Channel, Exchange, VerifiedPresentation, ZkpVerifier};
@@ -256,6 +257,15 @@ pub struct VpBackendConfig {
     /// finishes, so sustained overload cannot accumulate unbounded work.
     #[serde(default = "default_max_concurrent_verifications")]
     pub max_concurrent_verifications: usize,
+    /// Which JOSE header members may carry a status-list token's signing key:
+    /// `x5c` (the certificate-bound default), `jwk` (embedded keys only), or
+    /// `x5c-or-jwk` (the `x5c` leaf when the header carries a chain, otherwise
+    /// the embedded `jwk` — the shape most status-list issuers actually emit:
+    /// IETF Token Status List tokens commonly embed the signer with no chain).
+    /// Every other rule — the signature, `sub` binding the token to the
+    /// referenced URI, `iat`/`exp` — applies regardless of the carrier.
+    #[serde(default)]
+    pub status_list_key_source: StatusListKeySource,
 }
 
 fn default_mdoc_role() -> String {
@@ -940,6 +950,32 @@ fn request_profile(
     Ok((dcql, attributes, subject_pointer.expect("a claim path")))
 }
 
+/// The human-readable reason a status-list token was refused, from the SDK's
+/// stable kind strings (`status_list_uri_mismatch`,
+/// `status_list_missing_iat`, `status list token carries no x5c chain`, ...):
+/// what failed and why, phrased for the result page — not the bare error code
+/// repeated twice. The full error is logged server-side; only the reason
+/// travels to the client.
+fn status_list_reason(error: &siros_verifier_core::Error) -> String {
+    let detail = match error {
+        siros_verifier_core::Error::Malformed(detail)
+        | siros_verifier_core::Error::Integrity(detail)
+        | siros_verifier_core::Error::Policy(detail)
+        | siros_verifier_core::Error::Crypto(detail) => detail.clone(),
+        other => other.to_string(),
+    };
+    format!("the credential's status list could not be verified: {detail}")
+}
+
+/// A status-list check refusal: the stable machine `code` for the API and
+/// logs, plus a human-readable `description` — the underlying reason, not
+/// the code repeated — for the verifier's result page and the wallet.
+struct StatusListRefusal {
+    code: &'static str,
+    status: u16,
+    description: String,
+}
+
 impl VpBackend {
     pub fn new(
         name: &str,
@@ -1077,6 +1113,7 @@ impl VpBackend {
             processing_lease_secs: default_processing_lease(),
             processing_deadline_secs: default_processing_deadline(),
             max_concurrent_verifications: default_max_concurrent_verifications(),
+            status_list_key_source: StatusListKeySource::default(),
         };
         let mut backend =
             Self::new_inner(name, module_base, cfg, gate, signer, chain_der, clock, true)?;
@@ -1253,34 +1290,85 @@ impl VpBackend {
         )
     }
 
+    /// A status-list check refusal: the stable machine `code` for the API and
+    /// logs, plus a human-readable `description` — the underlying reason, not
+    /// the code repeated — for the verifier's result page and the wallet.
     async fn check_sd_jwt_status(
         &self,
         verified: &CryptoVerified,
         now: i64,
-    ) -> std::result::Result<(), (String, u16)> {
+    ) -> std::result::Result<(), StatusListRefusal> {
         let Some(reference) = &verified.status else {
             return Ok(());
         };
         let Some(client) = &self.status_list_client else {
-            return Err(("status_list_unavailable".into(), 503));
+            return Err(StatusListRefusal {
+                code: "status_list_unavailable",
+                status: 503,
+                description: "this verifier has no status list endpoint configured".into(),
+            });
         };
-        let token = client
-            .fetch(&reference.uri)
-            .await
-            .map_err(|_| ("status_list_unavailable".to_owned(), 503))?;
+        let token = client.fetch(&reference.uri).await.map_err(|e| {
+            tracing::warn!(error = %e, uri = %reference.uri, "status list fetch failed");
+            StatusListRefusal {
+                code: "status_list_unavailable",
+                status: 503,
+                description: format!(
+                    "the status list at {uri} could not be fetched",
+                    uri = reference.uri
+                ),
+            }
+        })?;
+        let resolver = StatusListKeyResolver {
+            source: self.cfg.status_list_key_source,
+        };
         let token =
-            siros_verifier_core::status_list::verify_token(&token, &reference.uri, &X5cLeaf, now)
-                .map_err(|_| ("invalid_status_list".to_owned(), 400))?;
-        let status = siros_verifier_core::status_list::status_at(&token, reference)
-            .map_err(|_| ("invalid_status_list".to_owned(), 400))?;
+            siros_verifier_core::status_list::verify_token(&token, &reference.uri, &resolver, now)
+                .map_err(|e| {
+                    tracing::warn!(error = %e, "status list token rejected");
+                    StatusListRefusal {
+                        code: "invalid_status_list",
+                        status: 400,
+                        description: status_list_reason(&e),
+                    }
+                })?;
+        let status =
+            siros_verifier_core::status_list::status_at(&token, reference).map_err(|e| {
+                tracing::warn!(error = %e, "status list status lookup failed");
+                StatusListRefusal {
+                    code: "invalid_status_list",
+                    status: 400,
+                    description: status_list_reason(&e),
+                }
+            })?;
         let query = TrustQuery::for_issuer(&token.issuer, "status-list-signer", "status-list");
         match self.gate.permits(&query.to_authzen(), now).await {
             Ok(true) => {}
-            Ok(false) => return Err(("status_list_signer_not_trusted".into(), 403)),
-            Err(_) => return Err(("trust_unavailable".into(), 503)),
+            Ok(false) => {
+                return Err(StatusListRefusal {
+                    code: "status_list_signer_not_trusted",
+                    status: 403,
+                    description:
+                        "the status list's signer is not trusted to sign status lists here".into(),
+                })
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "status list signer trust evaluation failed");
+                return Err(StatusListRefusal {
+                    code: "trust_unavailable",
+                    status: 503,
+                    description:
+                        "the trust service could not be reached to evaluate the status list signer"
+                            .into(),
+                });
+            }
         }
         if status != 0 {
-            return Err(("credential_revoked".into(), 403));
+            return Err(StatusListRefusal {
+                code: "credential_revoked",
+                status: 403,
+                description: "the credential is revoked".into(),
+            });
         }
         Ok(())
     }
@@ -1482,8 +1570,11 @@ impl VpBackend {
                 }
             }
             if let oid4vp::VerifiedCredential::SdJwt(credential) = &p.verified {
-                if let Err((code, status)) = self.check_sd_jwt_status(credential, now).await {
-                    return Decision::failed(&code, Response::text(status, &code));
+                if let Err(refusal) = self.check_sd_jwt_status(credential, now).await {
+                    return Decision::failed(
+                        refusal.code,
+                        Response::text(refusal.status, &refusal.description),
+                    );
                 }
             }
             let claims = match p.verified.claims() {

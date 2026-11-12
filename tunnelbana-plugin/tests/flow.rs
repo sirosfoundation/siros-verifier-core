@@ -10,6 +10,7 @@ use common::ClockBumpingClaimStore;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use siros_verifier_core::session_seal::SessionSealer;
+use siros_verifier_core::status_list::StatusListKeySource;
 use siros_verifier_core::testutil::*;
 use siros_verifier_core_tunnelbana::*;
 use tunnelbana_core::context::Context;
@@ -66,7 +67,10 @@ impl PdpClient for MockPdp {
         if self.go_trust_always_trusted.load(Ordering::SeqCst) {
             return Ok(serde_json::from_str(REAL_ALWAYS_TRUSTED).unwrap());
         }
-        assert_eq!(req["resource"]["type"], "x5c");
+        assert!(
+            matches!(req["resource"]["type"].as_str(), Some("x5c" | "jwk")),
+            "resource type follows the signer's key carrier"
+        );
         Ok(json!({"decision": self.permit.load(Ordering::SeqCst),
                   "context": {"id": format!("dec-{}", self.calls.load(Ordering::SeqCst)),
                               "trust_data": [{"registry": "etsi", "as_of": "2027-01-15T00:00:00Z",
@@ -768,6 +772,81 @@ async fn malformed_status_structure_is_rejected_before_signer_evaluation() {
     );
     assert!(!body.contains("Lovelace"));
     assert!(complete(&f, &state).await.is_err());
+}
+
+#[tokio::test]
+async fn an_embedded_jwk_status_list_needs_the_configured_key_source() {
+    // Status-list tokens in the wild embed the signer as a `jwk` with no
+    // certificate chain — the GDC registry's do, as does the IETF Token
+    // Status List profile. The default `x5c` policy refuses such a token
+    // with the underlying reason in the body, never the code twice; the
+    // `x5c-or-jwk` interop policy accepts it, the signer still faces the
+    // trust gate, and the flow completes.
+    let claims = json!({
+        "sub": "https://status.example/list.jwt", "iat": T0 - 10, "exp": T0 + 1_000,
+        // RFC 1950: zlib-compressed single byte 0x00 — index 0 is unrevoked.
+        "status_list": {"bits": 1, "lst": "eJxjAAAAAQAB"},
+    });
+    let (_status_cert, status_key) = self_signed_ec("status.example", "ES256");
+    let token = sign_raw_embedded_jwk(&status_key, "statuslist+jwt", &claims);
+    let issue_with_status = |f: &mut Fx| {
+        let (issuer_cert, issuer_key) = self_signed_ec("issuer.example", "ES256");
+        let mut spec = IssueSpec::new(json!({
+            "iss": "https://issuer.example", "vct": "urn:eudi:pid:1", "iat": T0 - 10,
+            "exp": T0 + 1_000_000, "given_name": "Ada", "family_name": "Lovelace",
+            "status": {"status_list": {"idx": 0, "uri": "https://status.example/list.jwt"}},
+        }));
+        spec.holder_pub = Some(public_of(&f.holder));
+        spec.x5c_der = vec![issuer_cert];
+        spec.conceal = vec![vec![Seg::Key("given_name")], vec![Seg::Key("family_name")]];
+        f.issued = issue(&issuer_key, &spec).unwrap();
+    };
+
+    // The default policy refuses: the token carries no x5c chain, and the
+    // body says so — the error_description carries the reason.
+    let mut f = fx();
+    issue_with_status(&mut f);
+    f.b = f.b.with_status_list_client(Arc::new(CountingStatusClient {
+        calls: AtomicUsize::new(0),
+        token: Some(token.clone()),
+    }));
+    let (_state, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    let (st, body) = post(&f, &id, &wallet(&f, &jar)).await;
+    assert_eq!(st, 400, "{body}");
+    let error: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(error["error"], "invalid_status_list");
+    assert!(
+        error["error_description"]
+            .as_str()
+            .unwrap()
+            .contains("no x5c chain"),
+        "the description must carry the reason: {body}"
+    );
+
+    // The x5c-or-jwk policy accepts the embedded key, the signer still
+    // faces the trust gate, and the presentation completes.
+    let mut cfg = pid_cfg("/family_name", "get", None, 16);
+    cfg.status_list_key_source = StatusListKeySource::X5cOrJwk;
+    let mut f = assemble(cfg, mock_pdp(100_000, false), pid_parts());
+    issue_with_status(&mut f);
+    f.b = f.b.with_status_list_client(Arc::new(CountingStatusClient {
+        calls: AtomicUsize::new(0),
+        token: Some(token),
+    }));
+    let (state, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    let (st, body) = post(&f, &id, &wallet(&f, &jar)).await;
+    assert_eq!(st, 200, "{body}");
+    assert!(matches!(
+        complete(&f, &state).await.unwrap(),
+        BackendAction::AuthResponse(_)
+    ));
+    assert_eq!(
+        f.pdp.calls.load(Ordering::SeqCst),
+        2,
+        "issuer permit + status-list signer permit"
+    );
 }
 
 #[tokio::test]
