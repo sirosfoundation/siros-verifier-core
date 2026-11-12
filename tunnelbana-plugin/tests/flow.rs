@@ -571,6 +571,44 @@ async fn complete(f: &Fx, state: &State) -> Result<BackendAction, String> {
         .map_err(|e| e.to_string())
 }
 
+/// A refused flow completes to the failure page carrying its human-readable
+/// reason — never a success, and never the legacy bare `authentication
+/// error: <code>` string. `code`, when given, must ride the page.
+async fn assert_failure_page(f: &Fx, state: &State, code: Option<&str>) {
+    match complete(f, state).await {
+        Ok(BackendAction::Respond(response)) => {
+            let body = String::from_utf8_lossy(&response.body).into_owned();
+            assert!(
+                body.contains("Presentation failed"),
+                "not the failure page: {body}"
+            );
+            assert!(
+                body.contains("class=\"siros-failure-description\""),
+                "the page shows the reason: {body}"
+            );
+            if let Some(code) = code {
+                assert!(body.contains(code), "the page carries {code}: {body}");
+            }
+        }
+        Ok(_) => panic!("a refused flow must complete to a page, not a success"),
+        Err(e) => panic!("a refused flow must show its reason, got the error {e}"),
+    }
+}
+
+/// The browser's polling endpoint, as JSON: `status` plus, for a refusal,
+/// the bounded reason the page renders.
+async fn status_json(f: &Fx, state: &State) -> serde_json::Value {
+    let mut ctx = Context::new(req("vp/status", "GET"), state.clone());
+    match f.b.handle_endpoint(&mut ctx, "status").await {
+        Ok(BackendAction::Respond(response)) => {
+            let body = String::from_utf8_lossy(&response.body).into_owned();
+            serde_json::from_str(&body)
+                .unwrap_or_else(|e| panic!("status is not JSON ({e}): {body}"))
+        }
+        _ => panic!("status must answer JSON"),
+    }
+}
+
 #[tokio::test]
 async fn happy_path_delivers_mapped_attributes_once() {
     let f = fx();
@@ -669,10 +707,7 @@ async fn a_non_scalar_mapped_claim_in_any_credential_fails_the_flow() {
     let jar = fetch_jar(&f, &id).await;
     let (st, _) = post(&f, &id, &wallet_multi(&f, &loyalty, &jar)).await;
     assert_eq!(st, 422);
-    assert_eq!(
-        complete(&f, &state).await.err().unwrap(),
-        "authentication error: attribute_not_scalar"
-    );
+    assert_failure_page(&f, &state, Some("attribute_not_scalar")).await; // was: the bare authn error
 }
 
 #[tokio::test]
@@ -687,10 +722,7 @@ async fn untrusted_issuer_fails_the_flow_and_no_attributes_leak() {
     assert_eq!(error["error"], "issuer_not_trusted");
     assert!(error["error_description"].is_string());
     assert!(!body.contains("Lovelace"));
-    assert_eq!(
-        complete(&f, &state).await.err().unwrap(),
-        "authentication error: issuer_not_trusted"
-    );
+    assert_failure_page(&f, &state, Some("issuer_not_trusted")).await; // was: the bare authn error
 }
 
 #[tokio::test]
@@ -724,7 +756,7 @@ async fn an_untrusted_issuer_cannot_trigger_status_network_activity() {
         "only the issuer permit"
     );
     assert!(!body.contains("Lovelace"));
-    assert!(complete(&f, &state).await.is_err());
+    assert_failure_page(&f, &state, None).await;
 }
 
 #[tokio::test]
@@ -771,7 +803,7 @@ async fn malformed_status_structure_is_rejected_before_signer_evaluation() {
         "only the issuer permit"
     );
     assert!(!body.contains("Lovelace"));
-    assert!(complete(&f, &state).await.is_err());
+    assert_failure_page(&f, &state, None).await;
 }
 
 #[tokio::test]
@@ -810,7 +842,7 @@ async fn an_embedded_jwk_status_list_needs_the_configured_key_source() {
         calls: AtomicUsize::new(0),
         token: Some(token.clone()),
     }));
-    let (_state, id) = start(&f).await;
+    let (state, id) = start(&f).await;
     let jar = fetch_jar(&f, &id).await;
     let (st, body) = post(&f, &id, &wallet(&f, &jar)).await;
     assert_eq!(st, 400, "{body}");
@@ -823,6 +855,18 @@ async fn an_embedded_jwk_status_list_needs_the_configured_key_source() {
             .contains("no x5c chain"),
         "the description must carry the reason: {body}"
     );
+    // The browser polling /status sees the reason, not just the state...
+    let status = status_json(&f, &state).await;
+    assert_eq!(status["status"], "failed");
+    assert!(
+        status["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no x5c chain"),
+        "the status endpoint must carry the reason: {status}"
+    );
+    // ...and the complete page renders it.
+    assert_failure_page(&f, &state, Some("invalid_status_list")).await;
 
     // The x5c-or-jwk policy accepts the embedded key, the signer still
     // faces the trust gate, and the presentation completes.
@@ -894,7 +938,7 @@ async fn revoked_status_is_refused_after_the_signer_permit() {
         "issuer and signer permits"
     );
     assert!(!body.contains("Lovelace"));
-    assert!(complete(&f, &state).await.is_err());
+    assert_failure_page(&f, &state, None).await;
 }
 
 #[tokio::test]
@@ -904,10 +948,7 @@ async fn pdp_down_with_cold_cache_fails_closed() {
     let (state, id) = start(&f).await;
     let jar = fetch_jar(&f, &id).await;
     assert_eq!(post(&f, &id, &wallet(&f, &jar)).await.0, 503);
-    assert_eq!(
-        complete(&f, &state).await.err().unwrap(),
-        "authentication error: trust_unavailable"
-    );
+    assert_failure_page(&f, &state, Some("trust_unavailable")).await; // was: the bare authn error
 }
 
 #[tokio::test]
@@ -1007,11 +1048,9 @@ async fn a_stalled_pdp_fails_the_flow_within_the_processing_deadline() {
     assert_eq!(st, 504, "{body}");
     let error: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(error["error"], "processing_deadline");
-    assert_eq!(
-        complete(&f, &state).await.err().unwrap(),
-        "authentication error: processing_deadline",
-        "the failure is terminal, not a hang until the lease"
-    );
+    // The failure is terminal — the page shows the reason — not a hang
+    // until the lease.
+    assert_failure_page(&f, &state, Some("processing_deadline")).await;
 }
 
 #[tokio::test]
@@ -1044,10 +1083,7 @@ async fn the_processing_budget_never_outlives_the_remaining_lease() {
     assert_eq!(st, 504, "{body}");
     let error: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(error["error"], "processing_deadline");
-    assert_eq!(
-        complete(&f, &state).await.err().unwrap(),
-        "authentication error: processing_deadline"
-    );
+    assert_failure_page(&f, &state, Some("processing_deadline")).await; // was: the bare authn error
 
     // With one second of lease left there is no safe processing window at
     // all: verification is never polled, so the stalled PDP is never called.
@@ -1076,10 +1112,7 @@ async fn the_processing_budget_never_outlives_the_remaining_lease() {
     .expect("an exhausted window must finalize without polling");
     assert_eq!(st, 504, "{body}");
     assert_eq!(gate_pdp.calls.load(Ordering::SeqCst), 0);
-    assert_eq!(
-        complete(&f, &state).await.err().unwrap(),
-        "authentication error: processing_deadline"
-    );
+    assert_failure_page(&f, &state, Some("processing_deadline")).await; // was: the bare authn error
 }
 
 #[tokio::test]
@@ -1110,10 +1143,7 @@ async fn a_synchronous_overrun_past_the_deadline_is_not_persisted() {
     assert_eq!(st, 504, "{body}");
     let error: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(error["error"], "processing_deadline");
-    assert_eq!(
-        complete(&f, &state).await.err().unwrap(),
-        "authentication error: processing_deadline"
-    );
+    assert_failure_page(&f, &state, Some("processing_deadline")).await; // was: the bare authn error
 }
 
 #[tokio::test]
@@ -1214,10 +1244,7 @@ async fn a_decision_past_the_claims_safe_window_is_not_persisted() {
     assert_eq!(st, 504, "{body}");
     let error: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(error["error"], "processing_deadline");
-    assert_eq!(
-        complete(&f, &state).await.err().unwrap(),
-        "authentication error: processing_deadline"
-    );
+    assert_failure_page(&f, &state, Some("processing_deadline")).await; // was: the bare authn error
 }
 
 #[tokio::test]
@@ -1306,7 +1333,7 @@ async fn response_for_another_flow_does_not_verify() {
     let jwe_for_1 = wallet(&f, &fetch_jar(&f, &id1).await);
     // posted to flow 2: wrong nonce/state/key for that session
     assert_eq!(post(&f, &id2, &jwe_for_1).await.0, 400);
-    assert!(complete(&f, &s2).await.is_err());
+    assert_failure_page(&f, &s2, None).await;
 }
 
 #[tokio::test]
@@ -1391,10 +1418,7 @@ async fn missing_response_parameter_fails_the_flow() {
         respond_body(f.b.handle_endpoint(&mut ctx, "response").await.unwrap()).0,
         400
     );
-    assert_eq!(
-        complete(&f, &state).await.err().unwrap(),
-        "authentication error: missing_response"
-    );
+    assert_failure_page(&f, &state, Some("missing_response")).await; // was: the bare authn error
 }
 
 #[tokio::test]
@@ -1416,10 +1440,7 @@ async fn duplicate_response_parameters_are_rejected() {
     assert_eq!(status, 400);
     let error: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(error["error"], "duplicate_response");
-    assert_eq!(
-        complete(&f, &state).await.err().unwrap(),
-        "authentication error: duplicate_response"
-    );
+    assert_failure_page(&f, &state, Some("duplicate_response")).await; // was: the bare authn error
 }
 
 #[test]
@@ -1706,10 +1727,7 @@ async fn a_credential_without_the_subject_claim_fails_for_that_reason() {
     let (state, id) = start(&f).await;
     let jar = fetch_jar(&f, &id).await;
     assert_eq!(post(&f, &id, &wallet(&f, &jar)).await.0, 422);
-    assert_eq!(
-        complete(&f, &state).await.err().unwrap(),
-        "authentication error: subject_claim_missing"
-    );
+    assert_failure_page(&f, &state, Some("subject_claim_missing")).await; // was: the bare authn error
 }
 
 #[test]

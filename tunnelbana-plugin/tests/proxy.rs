@@ -237,9 +237,16 @@ async fn untrusted_issuer_reaches_the_frontend_as_an_error() {
     let (cookie, id) = login(&w).await;
     assert_eq!(wallet_posts(&w, &id).await.status, 403);
     let r = w.proxy.run(get("vp/complete", Some(&cookie))).await;
-    assert_eq!(r.status, 401);
+    // The refusal renders on the failure page: the stable code plus the
+    // human-readable reason, and no credential data.
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     let body = String::from_utf8(r.body).unwrap();
+    assert!(body.contains("Presentation failed"), "{body}");
     assert!(body.contains("issuer_not_trusted"), "{body}");
+    assert!(
+        body.contains("class=\"siros-failure-description\""),
+        "{body}"
+    );
     assert!(!body.contains("Lovelace") && !body.contains("Ada"));
 }
 

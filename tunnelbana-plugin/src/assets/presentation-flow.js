@@ -422,7 +422,9 @@ export class PresentationFlow {
             return result;
           }
           if (["failed", "expired", "unknown"].includes(result.status)) {
-            throw new Error(`Presentation ${result.status}; start a new request`);
+            // The verifier's bounded, human-readable reason when it has one —
+            // e.g. why a status list was refused — otherwise the bare state.
+            throw new Error(result.description || `Presentation ${result.status}; start a new request`);
           }
         }
       } catch (error) {

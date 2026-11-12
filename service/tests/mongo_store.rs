@@ -64,6 +64,7 @@ fn pending_flow(id: &str, now: i64) -> Flow {
         attribute_map: BTreeMap::new(),
         subject_pointer: "/sub".into(),
         outcome: Outcome::Pending,
+        failure_description: String::new(),
     }
 }
 

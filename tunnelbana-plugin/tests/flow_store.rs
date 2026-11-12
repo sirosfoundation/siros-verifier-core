@@ -26,6 +26,7 @@ fn flow(id: &str) -> Flow {
         attribute_map: BTreeMap::new(),
         subject_pointer: "/sub".into(),
         outcome: Outcome::Pending,
+        failure_description: String::new(),
     }
 }
 
@@ -45,7 +46,10 @@ async fn only_one_response_claim_and_one_collection_win() {
                 "flow-1",
                 NOW,
                 "claim-b",
-                TerminalOutcome::Failed("stale".into())
+                TerminalOutcome::Failed {
+                    code: "stale".into(),
+                    description: "the stored lease was superseded".into()
+                }
             )
             .await
             .unwrap(),
@@ -84,7 +88,10 @@ async fn only_one_response_claim_and_one_collection_win() {
                 "flow-1",
                 NOW + 302,
                 "claim-a",
-                TerminalOutcome::Failed("stale".into())
+                TerminalOutcome::Failed {
+                    code: "stale".into(),
+                    description: "the stored lease was superseded".into()
+                }
             )
             .await
             .unwrap(),
@@ -121,7 +128,10 @@ async fn expiry_and_retention_have_exact_boundaries() {
                 "flow-2",
                 NOW + 1200,
                 "claim",
-                TerminalOutcome::Failed("too_late".into())
+                TerminalOutcome::Failed {
+                    code: "too_late".into(),
+                    description: "the processing lease expired before the finish".into()
+                }
             )
             .await
             .unwrap(),

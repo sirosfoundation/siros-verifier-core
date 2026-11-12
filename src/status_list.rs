@@ -11,7 +11,7 @@ use jose_rs::{jws, JoseHeader};
 use serde_json::Value;
 
 use crate::error::{integrity, malformed, policy};
-use crate::sdjwt::{x5c_chain, IssuerEvidence, IssuerKeyResolver, StatusRef};
+use crate::sdjwt::{x5c_chain, IssuerEvidence, IssuerKeyResolver, ResolvedKey, StatusRef};
 use crate::{b64u_decode, json_strict, Result};
 
 const MAX_TOKEN_BYTES: usize = 64 * 1024;
@@ -57,26 +57,35 @@ pub struct StatusListKeyResolver {
 }
 
 impl StatusListKeyResolver {
-    fn x5c_leaf(header: &JoseHeader) -> Result<Jwk> {
+    fn x5c_leaf(header: &JoseHeader) -> Result<ResolvedKey> {
         let chain = x5c_chain(header)?;
         let leaf = chain
             .first()
             .ok_or_else(|| malformed("status list token carries no x5c chain"))?;
-        crate::sdjwt::jwk_from_cert_der(leaf)
+        Ok(ResolvedKey {
+            jwk: crate::sdjwt::jwk_from_cert_der(leaf)?,
+            x5c_der: chain,
+        })
     }
 
-    fn embedded_jwk(header: &JoseHeader) -> Result<Jwk> {
+    fn embedded_jwk(header: &JoseHeader) -> Result<ResolvedKey> {
         let value = header
             .jwk
             .as_ref()
             .ok_or_else(|| malformed("status list token carries no embedded jwk"))?;
-        serde_json::from_value(value.clone())
-            .map_err(|e| malformed(format!("status list jwk header is not a valid JWK: {e}")))
+        let jwk: Jwk = serde_json::from_value(value.clone())
+            .map_err(|e| malformed(format!("status list jwk header is not a valid JWK: {e}")))?;
+        // The embedded key vouched for itself and nothing else: the evidence
+        // must not carry any header-supplied chain.
+        Ok(ResolvedKey {
+            jwk,
+            x5c_der: Vec::new(),
+        })
     }
 }
 
 impl IssuerKeyResolver for StatusListKeyResolver {
-    fn resolve(&self, header: &JoseHeader, _iss: &str) -> Result<Jwk> {
+    fn resolve(&self, header: &JoseHeader, _iss: &str) -> Result<ResolvedKey> {
         match self.source {
             StatusListKeySource::X5c => Self::x5c_leaf(header),
             StatusListKeySource::Jwk => Self::embedded_jwk(header),
@@ -124,9 +133,8 @@ pub fn verify_token(
     now: i64,
 ) -> Result<StatusListToken> {
     let header = header(token)?;
-    let chain = x5c_chain(&header)?;
-    let jwk = resolver.resolve(&header, "status-list")?;
-    let payload = jws::compact::verify_with_jwk(&jwk, token)
+    let resolved = resolver.resolve(&header, "status-list")?;
+    let payload = jws::compact::verify_with_jwk(&resolved.jwk, token)
         .map_err(|e| integrity(format!("status list signature: {e}")))?;
     let claims: Value = json_strict::from_slice(&payload)?;
     let claims_object = claims
@@ -169,8 +177,11 @@ pub fn verify_token(
         iss: sub.to_owned(),
         alg: header.alg.clone(),
         kid: header.kid.clone(),
-        x5c_der: chain,
-        jwk,
+        // The chain that vouched for the verified key — never the raw header,
+        // so a dual-carrier token cannot parade a decoy chain as trust
+        // evidence for a key resolved from its embedded `jwk`.
+        x5c_der: resolved.x5c_der,
+        jwk: resolved.jwk,
     };
     Ok(StatusListToken {
         claims,

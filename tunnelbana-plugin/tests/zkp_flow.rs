@@ -552,6 +552,27 @@ async fn complete(f: &Fx, state: &State) -> Result<BackendAction, String> {
         .map_err(|e| e.to_string())
 }
 
+/// A refused flow completes to the failure page carrying its reason — never
+/// the legacy bare `authentication error: <code>` string. `code` rides the page.
+async fn assert_failure_page(f: &Fx, state: &State, code: &str) {
+    match complete(f, state).await {
+        Ok(BackendAction::Respond(response)) => {
+            let body = String::from_utf8_lossy(&response.body).into_owned();
+            assert!(
+                body.contains("Presentation failed"),
+                "not the failure page: {body}"
+            );
+            assert!(
+                body.contains("class=\"siros-failure-description\""),
+                "the page shows the reason: {body}"
+            );
+            assert!(body.contains(code), "the page carries {code}: {body}");
+        }
+        Ok(_) => panic!("a refused flow must complete to a page, not a success"),
+        Err(e) => panic!("a refused flow must show its reason, got the error {e}"),
+    }
+}
+
 #[tokio::test]
 async fn a_pseudonym_login_reaches_the_frontend_as_a_pairwise_subject() {
     let f = fx();
@@ -628,10 +649,7 @@ async fn an_exhausted_budget_starts_no_zkp_verification() {
         0,
         "no circuit may be loaded"
     );
-    assert_eq!(
-        complete(&f, &state).await.err().unwrap(),
-        "authentication error: processing_deadline"
-    );
+    assert_failure_page(&f, &state, "processing_deadline").await;
 }
 
 #[tokio::test]
@@ -763,11 +781,8 @@ async fn an_abandoned_native_verify_keeps_its_crypto_slot() {
         panic!("expected auth response")
     };
     assert!(data.subject_id.is_some());
-    assert_eq!(
-        complete(&f, &state).await.err().unwrap(),
-        "authentication error: processing_deadline",
-        "the abandoned flow stays refused"
-    );
+    // The abandoned flow stays refused: the page shows the reason.
+    assert_failure_page(&f, &state, "processing_deadline").await;
 }
 
 #[tokio::test]
@@ -813,7 +828,7 @@ async fn inconsistent_sealed_channels_are_refused_before_verification() {
         let (status, body) = post(&f, &id, &jwe).await;
         assert_eq!(status, 500, "{body}");
         assert!(body.contains("verifier_error"), "{body}");
-        assert!(complete(&f, &state).await.is_err());
+        assert_failure_page(&f, &state, "verifier_error").await;
     }
 }
 
@@ -890,10 +905,7 @@ async fn an_untrusted_issuer_certificate_is_refused_with_the_wallets_code() {
     let (status, body) = post(&f, &id, &jwe).await;
     assert_eq!(status, 400, "a refusal is the wallet's business");
     assert!(body.contains("zkp_req_issuer_not_trusted"), "{body}");
-    assert_eq!(
-        complete(&f, &state).await.err().unwrap(),
-        "authentication error: zkp_req_issuer_not_trusted"
-    );
+    assert_failure_page(&f, &state, "zkp_req_issuer_not_trusted").await;
 }
 
 #[tokio::test]

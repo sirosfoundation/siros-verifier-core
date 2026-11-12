@@ -1,3 +1,5 @@
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use serde_json::{json, Value};
 use siros_verifier_core::sdjwt::{StatusRef, X5cLeaf};
 use siros_verifier_core::status_list::{
@@ -113,30 +115,84 @@ fn embedded_jwk_status_lists_verify_under_the_configured_key_source() {
 }
 
 #[test]
-fn a_present_but_broken_carrier_is_an_error_never_a_silent_fallback() {
-    // Under `x5c-or-jwk`, a header that CARRIES an x5c chain resolves through
-    // the chain — a broken chain is an error, not a fallthrough to an
-    // embedded key the deployer may not have meant to honor.
-    let (cert, key) = self_signed_ec("status.example", "ES256");
-    let mut claims = valid_claims();
-    claims["sub"] = json!("https://status.example/other-list");
-    // Sign with the key, but present some other certificate's chain: the x5c
-    // leaf does not match the signing key, so signature verification must
-    // fail rather than succeed via any fallback.
-    let (other_cert, _other_key) = self_signed_ec("status.example", "ES256");
-    let _ = cert;
-    let token = sign_raw(
-        &key,
-        "statuslist+jwt",
-        &claims,
-        std::slice::from_ref(&other_cert),
+fn an_embedded_key_never_parades_a_header_chain_as_trust_evidence() {
+    // The security heart of the carrier policy: a dual-carrier token whose
+    // signature verifies under its embedded `jwk` while its header ALSO
+    // carries a foreign certificate chain. The trust query's evidence is
+    // the resolver's own provenance — NO chain for an embedded key — so
+    // go-trust judges the embedded key, never the decoy chain; and the
+    // interop policy, seeing a present chain, resolves through it, fails the
+    // signature, and does not fall back.
+    let (decoy_cert, _decoy_key) = self_signed_ec("trusted-status.example", "ES256");
+    let (_signer_cert, signer_key) = self_signed_ec("status.example", "ES256");
+    let claims = valid_claims();
+    let token = dual_carrier_token(&signer_key, &claims, &decoy_cert);
+
+    // `jwk` policy: the embedded key verifies...
+    let jwk_only = StatusListKeyResolver {
+        source: StatusListKeySource::Jwk,
+    };
+    let verified = verify_token(&token, LIST_URI, &jwk_only, NOW).unwrap();
+    // ...but the evidence carries no chain: the embedded key vouched for
+    // itself, and the decoy chain must not reach go-trust.
+    assert!(
+        verified.issuer.x5c_der.is_empty(),
+        "an embedded-key resolution must not emit chain evidence"
     );
+
+    // `x5c-or-jwk` on the same token: the header carries a chain, so
+    // resolution goes through it — it does not vouch for the signer — and
+    // the signature fails rather than falling back to the embedded key.
     let interop = StatusListKeyResolver {
         source: StatusListKeySource::X5cOrJwk,
     };
-    let error =
-        verify_token(&token, "https://status.example/other-list", &interop, NOW).unwrap_err();
+    let error = verify_token(&token, LIST_URI, &interop, NOW).unwrap_err();
     assert_eq!(error.code(), "integrity");
+
+    // And the resolution-failure leg of the no-fallback guarantee: a token
+    // with NO x5c and a malformed embedded jwk fails resolution outright —
+    // there is no second carrier to fall through to.
+    let broken = broken_embedded_jwk_token();
+    let error = verify_token(&broken, LIST_URI, &interop, NOW).unwrap_err();
+    assert_eq!(error.code(), "malformed");
+}
+
+/// Mint a `statuslist+jwt` carrying BOTH an embedded signer `jwk` and an
+/// `x5c` chain (leaf first) — the dual-carrier confusion probe: the signature
+/// is the signer's, the chain is the decoy's.
+fn dual_carrier_token(signer: &jose_rs::jwk::Jwk, claims: &Value, decoy_cert_der: &[u8]) -> String {
+    use jose_rs::jws::compact::{sign_with_jwk_options, SignOptions};
+    use jose_rs::JoseHeader;
+    let mut header = JoseHeader::new("ES256");
+    header.typ = Some("statuslist+jwt".into());
+    // `x5c` rides standard base64 — the engine `x5c_chain` decodes with —
+    // unlike the compact segments' base64url.
+    header.x5c = Some(vec![STANDARD.encode(decoy_cert_der)]);
+    header.jwk = Some(serde_json::to_value(signer.to_public_jwk()).unwrap());
+    let opts = SignOptions::new().with_key_reference_headers(true);
+    sign_with_jwk_options(signer, &serde_json::to_vec(claims).unwrap(), &header, &opts)
+        .expect("sign")
+}
+
+/// A token whose embedded `jwk` is not a parseable JWK at all and which
+/// carries no chain: resolution itself must fail, with no other carrier to
+/// fall through to.
+fn broken_embedded_jwk_token() -> String {
+    use jose_rs::jws::compact::{sign_with_jwk_options, SignOptions};
+    use jose_rs::JoseHeader;
+    let (_cert, key) = self_signed_ec("status.example", "ES256");
+    let mut header = JoseHeader::new("ES256");
+    header.typ = Some("statuslist+jwt".into());
+    // `kty` must be a string; this is not a JWK any parser will accept.
+    header.jwk = Some(serde_json::json!({"kty": 42}));
+    let opts = SignOptions::new().with_key_reference_headers(true);
+    sign_with_jwk_options(
+        &key,
+        &serde_json::to_vec(&valid_claims()).unwrap(),
+        &header,
+        &opts,
+    )
+    .expect("sign")
 }
 
 #[test]

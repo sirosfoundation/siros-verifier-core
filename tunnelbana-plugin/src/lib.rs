@@ -303,6 +303,11 @@ struct Decision {
 }
 
 impl Decision {
+    /// The bound on the persisted failure reason: enough for any honest
+    /// sentence, small enough that a hostile or buggy description cannot
+    /// bloat every stored flow.
+    const DESCRIPTION_LIMIT: usize = 512;
+
     fn failed(code: &str, response: Response) -> Result<Self> {
         let status = response.status;
         let description = String::from_utf8_lossy(&response.body).into_owned();
@@ -311,8 +316,21 @@ impl Decision {
             "error_description": description,
         }))?;
         response.status = status;
+        // The bounded, client-safe reason the result page shows: the same
+        // description the wallet receives, truncated at a character boundary.
+        let mut bounded = description;
+        if bounded.len() > Self::DESCRIPTION_LIMIT {
+            let mut end = Self::DESCRIPTION_LIMIT;
+            while !bounded.is_char_boundary(end) {
+                end -= 1;
+            }
+            bounded.truncate(end);
+        }
         Ok(Self {
-            outcome: TerminalOutcome::Failed(code.to_owned()),
+            outcome: TerminalOutcome::Failed {
+                code: code.to_owned(),
+                description: bounded,
+            },
             response,
         })
     }
@@ -1837,12 +1855,16 @@ impl VpBackend {
             Outcome::Done(_) => "done",
             Outcome::Collected => "unknown",
         };
-        Ok(BackendAction::Respond(Response::json(
-            &serde_json::json!({
-                "status": status,
-                "complete_uri": format!("{}/complete", self.module_base),
-            }),
-        )?))
+        let mut body = serde_json::json!({
+            "status": status,
+            "complete_uri": format!("{}/complete", self.module_base),
+        });
+        // The bounded, client-safe failure reason for the result page —
+        // the browser polls this endpoint and renders the description.
+        if !flow.failure_description.is_empty() {
+            body["description"] = serde_json::json!(flow.failure_description);
+        }
+        Ok(BackendAction::Respond(Response::json(&body)?))
     }
 
     async fn complete(&self, ctx: &Context) -> Result<BackendAction> {
@@ -1858,7 +1880,20 @@ impl VpBackend {
                 Ok(BackendAction::Respond(waiting_page(&self.module_base)))
             }
             Ok(CollectResult::Expired) => Err(Error::Authn("flow_expired".into())),
-            Ok(CollectResult::Failed(code)) => Err(Error::Authn(code)),
+            Ok(CollectResult::Failed { code, description }) => {
+                // A refusal with a reason renders the reason on the page —
+                // the browser user sees why, not just the code. Legacy flows
+                // without a description keep the bare authn error.
+                if description.is_empty() {
+                    Err(Error::Authn(code))
+                } else {
+                    Ok(BackendAction::Respond(failure_page(
+                        &self.module_base,
+                        &code,
+                        &description,
+                    )))
+                }
+            }
             Ok(CollectResult::Done(sealed_result)) => {
                 let data: InternalData = self
                     .sealer
@@ -1907,6 +1942,22 @@ fn waiting_page(module_base: &str) -> Response {
         html_escape(module_base)
     );
     Response::html(ui::page("Waiting for your wallet", &body))
+}
+
+/// The terminal failure page: the stable refusal code for support and logs,
+/// and the human-readable reason the presentation was refused. Reached from
+/// `/complete` after a refused wallet response.
+fn failure_page(module_base: &str, code: &str, description: &str) -> Response {
+    let body = format!(
+        r#"<h1>Presentation failed</h1>
+<p class="siros-failure-description">{}</p>
+<p><code>{}</code></p>
+<p><a href="{}/">Start a new request</a></p>"#,
+        html_escape(description),
+        html_escape(code),
+        html_escape(module_base)
+    );
+    Response::html(ui::page("Presentation failed", &body))
 }
 
 fn qr_page(module_base: &str, link: &str) -> Result<Response> {
@@ -2044,6 +2095,7 @@ impl Backend for VpBackend {
             attribute_map,
             subject_pointer,
             outcome: Outcome::Pending,
+            failure_description: String::new(),
         };
         if self.store.insert(flow, now).await.is_err() {
             return Ok(Response::text(503, "flow store unavailable"));
