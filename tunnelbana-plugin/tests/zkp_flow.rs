@@ -905,6 +905,15 @@ async fn an_untrusted_issuer_certificate_is_refused_with_the_wallets_code() {
     let (status, body) = post(&f, &id, &jwe).await;
     assert_eq!(status, 400, "a refusal is the wallet's business");
     assert!(body.contains("zkp_req_issuer_not_trusted"), "{body}");
+    // The description is the readable refusal reason, never a wrapped JSON
+    // document: the wallet's error_description and the page both carry the
+    // detail itself.
+    let refusal: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let description = refusal["error_description"].as_str().unwrap();
+    assert!(
+        !description.contains("{\"error"),
+        "the wallet-facing description must not wrap the reason in JSON: {body}"
+    );
     assert_failure_page(&f, &state, "zkp_req_issuer_not_trusted").await;
 }
 

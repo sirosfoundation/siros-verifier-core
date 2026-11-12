@@ -1816,18 +1816,14 @@ impl VpBackend {
 
     fn zkp_failure(&self, e: &ZkpError) -> Result<Decision> {
         match e {
+            // The refusal's `detail` is the human-readable reason; it rides
+            // the wallet-facing body (Decision::failed builds the
+            // `{"error", "error_description"}` JSON from it), the persisted
+            // failure description, and the result page. Passing a
+            // pre-serialized JSON body here would wrap it twice — the wallet
+            // would see escaped JSON and the page raw, truncated JSON.
             ZkpError::Refused { code, detail } => {
-                let body = serde_json::to_vec(&serde_json::json!({
-                    "error": code,
-                    "error_description": detail,
-                }))
-                .unwrap_or_else(|_| b"{\"error\":\"zkp_req\"}".to_vec());
-                Decision::failed(
-                    code,
-                    Response::new(400)
-                        .with_header("content-type", "application/json")
-                        .with_body(body),
-                )
+                Decision::failed(code, Response::text(400, detail))
             }
             ZkpError::Fault(_) => {
                 Decision::failed("verifier_error", Response::text(500, "verifier error"))
