@@ -78,6 +78,27 @@ pub struct Wrprc {
     pub claims: Value,
 }
 
+/// A B.2.6 MultiLangString entry: `{lang, value}`, both non-empty strings
+/// (the producer's shape). The `prefix` names the member being validated so
+/// each rejection carries its own stable kind.
+fn validate_multi_lang_string(entry: &Value, prefix: &str) -> Result<()> {
+    let object = entry
+        .as_object()
+        .ok_or_else(|| malformed(format!("{prefix}_entry_not_object")))?;
+    let lang = object
+        .get("lang")
+        .and_then(Value::as_str)
+        .filter(|lang| !lang.is_empty())
+        .ok_or_else(|| malformed(format!("{prefix}_lang")))?;
+    let value = object
+        .get("value")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| malformed(format!("{prefix}_value")))?;
+    let _ = (lang, value);
+    Ok(())
+}
+
 /// Parse and signature-check a serialized `rc-wrp+jwt` (GEN-5.2.1-01,
 /// GEN-5.2.2, GEN-5.2.4). Shape-strict, trust-free: the signature must verify
 /// under the token's own `x5c` leaf, and every REQUIRED register member must
@@ -163,20 +184,7 @@ pub fn parse_wrprc(token: &str, now: i64) -> Result<Wrprc> {
             .filter(|list| !list.is_empty())
             .ok_or_else(|| malformed("wrprc_srv_description_group"))?;
         for entry in group {
-            let object = entry
-                .as_object()
-                .ok_or_else(|| malformed("wrprc_srv_description_entry"))?;
-            let lang = object
-                .get("lang")
-                .and_then(Value::as_str)
-                .filter(|lang| !lang.is_empty())
-                .ok_or_else(|| malformed("wrprc_srv_description_lang"))?;
-            let value = object
-                .get("value")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| malformed("wrprc_srv_description_value"))?;
-            let _ = (lang, value);
+            validate_multi_lang_string(entry, "wrprc_srv_description")?;
         }
     }
     // Table 7's technical members. `iat` is required; `exp` is not in the
@@ -261,20 +269,7 @@ pub fn parse_wrprc(token: &str, now: i64) -> Result<Wrprc> {
             .filter(|list| !list.is_empty())
             .ok_or_else(|| malformed("wrprc_purpose_not_array"))?;
         for entry in list {
-            let object = entry
-                .as_object()
-                .ok_or_else(|| malformed("wrprc_purpose_entry_not_object"))?;
-            let lang = object
-                .get("lang")
-                .and_then(Value::as_str)
-                .filter(|lang| !lang.is_empty())
-                .ok_or_else(|| malformed("wrprc_purpose_lang"))?;
-            let value = object
-                .get("value")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| malformed("wrprc_purpose_value"))?;
-            let _ = (lang, value);
+            validate_multi_lang_string(entry, "wrprc_purpose")?;
         }
     }
     if let Some(authority) = claims.get("supervisory_authority") {
