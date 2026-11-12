@@ -941,16 +941,28 @@ fn is_language_tag(segment: &str) -> bool {
 /// (`["credentialSubject","id"]`) keeps its final segment even when it
 /// collides with a language code ("id" is Indonesian in ISO 639-1).
 fn last_non_language_segment(path: &[Value]) -> Option<String> {
+    // Walk back over trailing segments: language tags skip (the claim's
+    // name sits beneath them), and non-string members skip too — DCQL
+    // paths may end in null (the array-index selector:
+    // ["nationalities", null] is a valid path selecting every array
+    // element), and the pre-existing fallback took the last STRING
+    // segment, never panicking on a non-string one.
     let mut idx = path.len().checked_sub(1)?;
-    while idx > 1
-        && path
-            .get(idx)
-            .and_then(Value::as_str)
-            .is_some_and(is_language_tag)
-    {
-        idx -= 1;
+    while idx > 1 {
+        match path.get(idx).and_then(Value::as_str) {
+            Some(segment) if is_language_tag(segment) => idx -= 1,
+            Some(segment) => return Some(segment.to_owned()),
+            None => idx -= 1,
+        }
     }
-    path.get(idx).and_then(Value::as_str).map(str::to_owned)
+    // The scalar depth (index <= 1): the segment here IS the claim name,
+    // even when it collides with a language code ("id" is Indonesian in
+    // ISO 639-1) or is a non-string selector. Take the first string at or
+    // beneath the depth boundary — matching the previous find_map's
+    // take-the-last-string behavior for every shape.
+    (0..=idx)
+        .rev()
+        .find_map(|i| path.get(i).and_then(Value::as_str).map(str::to_owned))
 }
 
 fn request_profile(
@@ -2361,12 +2373,38 @@ mod request_profile_name_tests {
             Some("en")
         );
         assert_eq!(last_non_language_segment(&path(&[])), None);
-        // A non-string segment yields no name at all rather than a guess.
-        // Unreachable in practice: validate_dcql_query rejects non-string
-        // path members before request_profile ever runs.
+        // A non-string member (the array-index selector's null, or a
+        // bare number) is not a name: the walk continues to the named
+        // segment beneath it — ["nationalities", null] names the claim
+        // "nationalities", the pre-existing find_map behavior. A path of
+        // ONLY non-strings (rejected by validation before this runs, but
+        // the helper stays panic-free regardless) yields no name.
         assert_eq!(
-            last_non_language_segment(&[json!("credentialSubject"), json!(0)]),
-            None
+            last_non_language_segment(&[json!("nationalities"), json!(null)]).as_deref(),
+            Some("nationalities")
+        );
+        assert_eq!(
+            last_non_language_segment(&[json!("credentialSubject"), json!(0)]).as_deref(),
+            Some("credentialSubject")
+        );
+        assert_eq!(last_non_language_segment(&[json!(0)]), None);
+        // The valid null-selector path, end to end through the public
+        // flow: a DC-API query with ["nationalities", null] derives the
+        // "nationalities" attribute — no panic (the round-1 helper
+        // returned None and the caller's expect aborted).
+        let raw = r#"{"credentials":[{"id":"pid","format":"dc+sd-jwt",
+            "meta":{"vct_values":["urn:eudi:pid:1"]},
+            "claims":[{"path":["nationalities",null]}]}]}"#;
+        let request = {
+            let mut r = InternalData::request(crate::ui::DC_API_REQUESTER);
+            r.set_attr(crate::ui::DCQL_ATTRIBUTE, raw.to_owned());
+            r
+        };
+        let (_dcql, attributes, _subject) =
+            request_profile(&request, &test_defaults()).expect("the null-selector path is valid");
+        assert_eq!(
+            attributes["nationalities"], "/nationalities",
+            "the pointer resolves the null selector exactly as before"
         );
     }
 
