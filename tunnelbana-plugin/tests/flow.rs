@@ -891,6 +891,59 @@ async fn an_embedded_jwk_status_list_needs_the_configured_key_source() {
         2,
         "issuer permit + status-list signer permit"
     );
+
+    // And the client-visible description carries only the STABLE kind of a
+    // refusal — never parser detail derived from attacker-controlled input.
+    // A token whose embedded jwk is not a JWK produces the fixed reason
+    // 'status list jwk header is not a valid JWK', not the serde parser's
+    // message quoting the hostile input.
+    let hostile = hostile_embedded_jwk_token(&claims);
+    let mut cfg = pid_cfg("/family_name", "get", None, 16);
+    cfg.status_list_key_source = StatusListKeySource::X5cOrJwk;
+    let mut f = assemble(cfg, mock_pdp(100_000, false), pid_parts());
+    issue_with_status(&mut f);
+    f.b = f.b.with_status_list_client(Arc::new(CountingStatusClient {
+        calls: AtomicUsize::new(0),
+        token: Some(hostile),
+    }));
+    let (state, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    let (st, body) = post(&f, &id, &wallet(&f, &jar)).await;
+    assert_eq!(st, 400, "{body}");
+    let error: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(error["error"], "invalid_status_list");
+    let description = error["error_description"].as_str().unwrap();
+    assert!(
+        description.contains("status list jwk header is not a valid JWK"),
+        "the stable kind reaches the client: {description}"
+    );
+    assert!(
+        !description.contains("invalid type") && !description.contains("at line"),
+        "parser detail over hostile input must stay in the server log: {description}"
+    );
+    let status = status_json(&f, &state).await;
+    assert!(
+        status["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("status list jwk header is not a valid JWK"),
+        "the polled status carries the stable kind: {status}"
+    );
+}
+
+/// A `statuslist+jwt` whose embedded `jwk` is not a parseable JWK — signed
+/// with a real key, so the failure is the jwk parse, and the parser's error
+/// message (quoting the hostile input) is what the client description must
+/// NOT carry.
+fn hostile_embedded_jwk_token(claims: &Value) -> String {
+    use jose_rs::jws::compact::{sign_with_jwk_options, SignOptions};
+    use jose_rs::JoseHeader;
+    let (_cert, key) = self_signed_ec("status.example", "ES256");
+    let mut header = JoseHeader::new("ES256");
+    header.typ = Some("statuslist+jwt".into());
+    header.jwk = Some(json!({"kty": 42}));
+    let opts = SignOptions::new().with_key_reference_headers(true);
+    sign_with_jwk_options(&key, &serde_json::to_vec(claims).unwrap(), &header, &opts).expect("sign")
 }
 
 #[tokio::test]

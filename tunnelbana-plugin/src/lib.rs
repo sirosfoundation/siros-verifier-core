@@ -972,8 +972,13 @@ fn request_profile(
 /// stable kind strings (`status_list_uri_mismatch`,
 /// `status_list_missing_iat`, `status list token carries no x5c chain`, ...):
 /// what failed and why, phrased for the result page — not the bare error code
-/// repeated twice. The full error is logged server-side; only the reason
-/// travels to the client.
+/// repeated twice.
+///
+/// Only the stable kind travels to the client. The SDK's kind strings are
+/// fixed machine codes, but some carry derived detail after a `": "` — parser
+/// messages over attacker-controlled input, and the credential's own status
+/// URI — which must not reach a persisted, client-visible description. The
+/// full error is logged server-side; only the kind leaves the verifier.
 fn status_list_reason(error: &siros_verifier_core::Error) -> String {
     let detail = match error {
         siros_verifier_core::Error::Malformed(detail)
@@ -982,7 +987,11 @@ fn status_list_reason(error: &siros_verifier_core::Error) -> String {
         | siros_verifier_core::Error::Crypto(detail) => detail.clone(),
         other => other.to_string(),
     };
-    format!("the credential's status list could not be verified: {detail}")
+    let kind = match detail.split_once(": ") {
+        Some((kind, _detail)) => kind.to_owned(),
+        None => detail,
+    };
+    format!("the credential's status list could not be verified: {kind}")
 }
 
 /// A status-list check refusal: the stable machine `code` for the API and
@@ -1327,14 +1336,13 @@ impl VpBackend {
             });
         };
         let token = client.fetch(&reference.uri).await.map_err(|e| {
+            // The URI (which may carry a per-credential identifier) belongs in
+            // the operator's log, never in a client-visible description.
             tracing::warn!(error = %e, uri = %reference.uri, "status list fetch failed");
             StatusListRefusal {
                 code: "status_list_unavailable",
                 status: 503,
-                description: format!(
-                    "the status list at {uri} could not be fetched",
-                    uri = reference.uri
-                ),
+                description: "the credential's status list could not be fetched".into(),
             }
         })?;
         let resolver = StatusListKeyResolver {
