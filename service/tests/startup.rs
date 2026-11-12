@@ -46,7 +46,8 @@ async fn builds_the_real_oidc_frontend_and_custom_backend() {
           pdp_endpoint = "http://go-trust-allow:6001/evaluation"
           allow_insecure_http = true
           role = "pid-provider"
-          dcql = {{ credentials = [{{ id = "pid", format = "dc+sd-jwt" }}] }}
+          dcql = {{ credentials = [{{ id = "pid", format = "dc+sd-jwt",
+            claims = [{{ path = ["given_name"] }}, {{ path = ["family_name"] }}] }}] }}
           attribute_map = {{}}
           subject_pointer = "/sub"
 
