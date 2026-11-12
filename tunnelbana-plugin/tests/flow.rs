@@ -814,6 +814,33 @@ async fn malformed_status_structure_is_rejected_before_signer_evaluation() {
 }
 
 #[tokio::test]
+async fn a_dc_api_query_without_claims_is_refused_at_start() {
+    // OpenID4VP 1.0 section 6.4.1: an absent claims member requests NO
+    // claims that are selectively disclosable — a compliant wallet returns
+    // only the mandatory claims and there is nothing to map (vc#920's
+    // failure mode). The DC-API path rejects the query at start instead of
+    // arming a request whose response can only be empty.
+    let f = fx();
+    let mut ctx = Context::new(req("vp/start", "GET"), State::new());
+    let mut request = InternalData::request(ui::DC_API_REQUESTER);
+    request.set_attr(
+        ui::DCQL_ATTRIBUTE,
+        r#"{"credentials":[{"id":"pid","format":"dc+sd-jwt","meta":{"vct_values":["urn:eudi:pid:1"]}}]}"#
+            .to_string(),
+    );
+    let error =
+        f.b.start_auth(&mut ctx, request)
+            .await
+            .expect_err("a claims-less DC-API query is refused");
+    assert!(
+        error
+            .to_string()
+            .contains("no selectively disclosable claims"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
 async fn an_rp_initiated_refusal_keeps_the_protocol_error_for_the_frontend() {
     // The relying party's frontend started this flow (the requester is the
     // RP's client id, not the UI's namespace): the refusal must surface as
@@ -1573,7 +1600,7 @@ fn config_rejects_unknown_fields_and_bad_pointers() {
     .is_err());
     let mk = |sp: &str, ttl: i64| {
         let cfg: VpBackendConfig = serde_json::from_value(json!({
-            "dcql": {"credentials": [{"id": "pid", "format": "dc+sd-jwt"}]},
+            "dcql": {"credentials": [{"id": "pid", "format": "dc+sd-jwt", "claims": [{"path": ["family_name"]}]}]},
             "attribute_map": {}, "subject_pointer": sp, "role": "r", "request_ttl_secs": ttl
         }))
         .unwrap();
@@ -1592,7 +1619,7 @@ fn config_rejects_unknown_fields_and_bad_pointers() {
 fn processing_lease_is_bounded() {
     let mk = |lease: i64| {
         let cfg: VpBackendConfig = serde_json::from_value(json!({
-            "dcql": {"credentials": [{"id": "pid", "format": "dc+sd-jwt"}]},
+            "dcql": {"credentials": [{"id": "pid", "format": "dc+sd-jwt", "claims": [{"path": ["family_name"]}]}]},
             "attribute_map": {}, "subject_pointer": "/family_name", "role": "r",
             "processing_lease_secs": lease, "processing_deadline_secs": 1
         }))
@@ -1620,7 +1647,7 @@ fn processing_lease_is_bounded() {
 fn processing_deadline_is_bounded() {
     let mk = |lease: i64, deadline: i64| {
         let cfg: VpBackendConfig = serde_json::from_value(json!({
-            "dcql": {"credentials": [{"id": "pid", "format": "dc+sd-jwt"}]},
+            "dcql": {"credentials": [{"id": "pid", "format": "dc+sd-jwt", "claims": [{"path": ["family_name"]}]}]},
             "attribute_map": {}, "subject_pointer": "/family_name", "role": "r",
             "processing_lease_secs": lease, "processing_deadline_secs": deadline
         }))
@@ -1647,7 +1674,7 @@ fn processing_deadline_is_bounded() {
 fn verification_concurrency_is_bounded() {
     let mk = |permits: usize| {
         let cfg: VpBackendConfig = serde_json::from_value(json!({
-            "dcql": {"credentials": [{"id": "pid", "format": "dc+sd-jwt"}]},
+            "dcql": {"credentials": [{"id": "pid", "format": "dc+sd-jwt", "claims": [{"path": ["family_name"]}]}]},
             "attribute_map": {}, "subject_pointer": "/family_name", "role": "r",
             "max_concurrent_verifications": permits
         }))
