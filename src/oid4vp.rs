@@ -553,6 +553,22 @@ pub fn validate_dcql_query(query: &Value) -> Result<()> {
         {
             return Err(malformed("mdoc query without doctype_value"));
         }
+        // OpenID4VP 1.0 §6.4.1 ("Selecting Claims"): an absent `claims`
+        // member means the Verifier is requesting NO claims that are
+        // selectively disclosable — a compliant wallet returns only the
+        // mandatory claims, and the verifier has nothing to map. That is
+        // almost always an operator error, so it is rejected here instead of
+        // arming a request whose response can only be empty. An explicit
+        // `claims = []` — the deliberate proof-of-possession ask — remains
+        // valid, as do `zkp_req` queries, whose request shape is `_req`.
+        if !query.contains_key("claims") {
+            return Err(policy(
+                "credential query without claims requests no selectively \
+                 disclosable claims (OpenID4VP 1.0 section 6.4.1); list the \
+                 claims to request, or set claims = [] to deliberately \
+                 request only the mandatory claims",
+            ));
+        }
         if query.get("claims").is_some_and(|claims| !claims.is_array()) {
             return Err(malformed("claims must be an array"));
         }

@@ -613,6 +613,48 @@ fn request_time_dcql_validation_is_closed_and_deterministic() {
     }
 }
 
+#[test]
+fn a_credential_query_without_claims_requests_nothing_selectively_disclosable() {
+    // OpenID4VP 1.0 section 6.4.1: an absent `claims` member means the
+    // Verifier is requesting no claims that are selectively disclosable —
+    // a compliant wallet returns only the mandatory claims and there is
+    // nothing to map (vc-verifier issue 920's failure, one deployer-visible
+    // symptom of the silent shape). The validator rejects it at request
+    // time instead of arming a request whose response can only be empty.
+    let mut no_claims = dcql(&["given_name"]);
+    no_claims["credentials"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("claims");
+    let error = validate_dcql_query(&no_claims).unwrap_err();
+    assert_eq!(error.code(), "policy");
+    assert!(
+        error
+            .to_string()
+            .contains("no selectively disclosable claims"),
+        "{error}"
+    );
+
+    // The same rule for mso_mdoc: absent claims request nothing.
+    let mdoc_no_claims = json!({"credentials": [{
+        "id": "mdl", "format": "mso_mdoc",
+        "meta": {"doctype_value": "org.iso.18013.5.1.mDL"},
+    }]});
+    assert!(validate_dcql_query(&mdoc_no_claims).is_err());
+
+    // An EXPLICIT empty claims list is the deliberate ask — only the
+    // mandatory claims, consciously — and stays valid for both formats.
+    let mut deliberate_empty = no_claims;
+    deliberate_empty["credentials"][0]["claims"] = json!([]);
+    assert!(validate_dcql_query(&deliberate_empty).is_ok());
+    let mdoc_deliberate_empty = json!({"credentials": [{
+        "id": "mdl", "format": "mso_mdoc",
+        "meta": {"doctype_value": "org.iso.18013.5.1.mDL"},
+        "claims": [],
+    }]});
+    assert!(validate_dcql_query(&mdoc_deliberate_empty).is_ok());
+}
+
 fn mutate_jwe_part(token: &str, index: usize, f: impl Fn(String) -> String) -> String {
     let mut parts: Vec<String> = token.split('.').map(str::to_owned).collect();
     parts[index] = f(parts[index].clone());
