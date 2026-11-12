@@ -4907,7 +4907,7 @@ dependencies = [
 
 [[package]]
 name = "siros-verifier-core"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "aes-gcm 0.11.1",
  "base64 0.22.1",
@@ -4932,7 +4932,7 @@ dependencies = [
 
 [[package]]
 name = "siros-verifier-core-ffi"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "aes-gcm 0.11.1",
  "ciborium",
@@ -4946,7 +4946,7 @@ dependencies = [
 
 [[package]]
 name = "siros-verifier-core-tunnelbana"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4972,7 +4972,7 @@ dependencies = [
 
 [[package]]
 name = "siros-verifier-service"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "actix-web",
  "anyhow",
@@ -5003,7 +5003,7 @@ dependencies = [
 
 [[package]]
 name = "siros-verifier-zkp"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "base64 0.22.1",
  "ciborium",
