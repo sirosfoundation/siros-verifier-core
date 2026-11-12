@@ -291,3 +291,87 @@ fn a_malformed_wrprc_fails_the_arm_and_a_forged_dataset_fails_the_build() {
     dataset.as_object_mut().unwrap().remove("purpose");
     assert!(build_verifier_info(Some(&dataset), None).is_err());
 }
+
+#[test]
+fn duplicate_header_members_and_malformed_dataset_entries_fail_the_arm() {
+    // Copilot round 1: the protected header is attacker-controlled JSON —
+    // it must go through the same strict parse as sdjwt's decode_header.
+    // A duplicated member is ambiguous to different parsers: a wallet's
+    // JOSE decoder may read a DIFFERENT typ or x5c than the one this
+    // parse validated, and forward it.
+    let (cert, key) = registrar();
+    // The duplicate-member header, as RAW JSON text — the json! macro
+    // deduplicates into its map, so the bytes must be crafted by hand.
+    let header_json = format!(
+        "{{\"typ\":\"rc-wrp+jwt\",\"typ\":\"application/jwt\",\"alg\":\"ES256\",\"x5c\":[\"{}\"]}}",
+        jose_rs::base64url::encode(&cert)
+    );
+    let forged_header = {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64U, Engine};
+        use jose_rs::jws::compact::{sign_with_jwk_options, SignOptions};
+        use jose_rs::JoseHeader;
+        let mut header = JoseHeader::new("ES256");
+        header.typ = Some("rc-wrp+jwt".into());
+        header.x5c = Some(vec![jose_rs::base64url::encode(&cert)]);
+        let opts = SignOptions::new().with_key_reference_headers(true);
+        let signed = sign_with_jwk_options(
+            &key,
+            &serde_json::to_vec(&register_claims()).unwrap(),
+            &header,
+            &opts,
+        )
+        .unwrap();
+        let parts: Vec<&str> = signed.split('.').collect();
+        // Swap the genuinely-signed header for the duplicate-member bytes
+        // (base64url of the raw JSON text above) — the parse rejects on the
+        // STRICT pass, before any signature is even read.
+        let header_b64 = B64U.encode(header_json.as_bytes());
+        format!("{header_b64}.{}.{}}}", parts[1], parts[2])
+    };
+    let error = parse_wrprc(&forged_header, NOW).unwrap_err();
+    assert_eq!(error.code(), "malformed");
+
+    // Copilot round 1: the B.2 arrays are validated per ENTRY, not just as
+    // containers — [null] entries, missing identifier members, and
+    // wrong-shaped multilanguage strings all fail the build.
+    let null_entries = json!({
+        "identifier": [null],
+        "srvDescription": [{"lang": "sv"}],
+        "purpose": [null],
+        "registryURI": "https://registrar.example/api",
+        "intendedUseIdentifier": "urn:registrar:use:1",
+        "policyURI": "https://example.com/privacy",
+    });
+    let error = build_verifier_info(Some(&null_entries), None).unwrap_err();
+    assert!(
+        error.to_string().contains("verifier_info_identifier"),
+        "{error}"
+    );
+    let mut dataset = registrar_dataset();
+    dataset["identifier"] = json!([{"type": "eori"}]);
+    let error = build_verifier_info(Some(&dataset), None).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("verifier_info_entry_missing_identifier"),
+        "{error}"
+    );
+    let mut dataset = registrar_dataset();
+    dataset["srvDescription"] = json!([{"lang": "sv", "value": "Tjänst"}]);
+    let error = build_verifier_info(Some(&dataset), None).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("verifier_info_entry_missing_content"),
+        "{error}"
+    );
+    let mut dataset = registrar_dataset();
+    dataset["credential"] = json!([{"format": 42}]);
+    let error = build_verifier_info(Some(&dataset), None).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("verifier_info_entry_missing_format"),
+        "{error}"
+    );
+}

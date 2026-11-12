@@ -87,6 +87,17 @@ pub fn parse_wrprc(token: &str, now: i64) -> Result<Wrprc> {
     if token.len() > MAX_WRPRC_BYTES || token.split('.').count() != 3 {
         return Err(malformed("wrprc_token_shape"));
     }
+    // The protected header is attacker-controlled JSON: run it through the
+    // same strict parse as sdjwt's decode_header (duplicate members are
+    // ambiguous to different parsers — a wallet's JOSE decoder may read a
+    // DIFFERENT typ or x5c than the one validated here, and forward it).
+    {
+        let encoded = token
+            .split('.')
+            .next()
+            .ok_or_else(|| malformed("wrprc has no header"))?;
+        crate::json_strict::from_slice(&crate::b64u_decode(encoded)?)?;
+    }
     let header: JoseHeader =
         jws::decode_header(token).map_err(|e| malformed(format!("wrprc_header: {e}")))?;
     // GEN-5.2.2 Table 5: the type marks the register artefact.
@@ -233,14 +244,48 @@ pub fn build_verifier_info(
             .as_object()
             .ok_or_else(|| malformed("verifier_info_dataset_not_object"))?;
         // RO-06..11: the B.2 members the wallet renders and the registrar
-        // API query needs. Arrays are non-empty; strings are non-empty.
-        for name in ["identifier", "srvDescription", "purpose"] {
+        // API query needs. Arrays are non-empty; strings are non-empty;
+        // and every ENTRY is validated, not just the container — a
+        // malformed entry would ride the armed request until the wallet
+        // rejected it, the same failure class the arm exists to prevent.
+        let require_string_member =
+            |object: &serde_json::Map<String, Value>, name: &str| -> Result<()> {
+                let value = object
+                    .get(name)
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| malformed(format!("verifier_info_entry_missing_{name}")))?;
+                let _ = value;
+                Ok(())
+            };
+        // RO-06 / B.2.2: the identifiers — objects of {type, identifier}.
+        let identifiers = data
+            .get("identifier")
+            .and_then(Value::as_array)
+            .filter(|list| !list.is_empty())
+            .ok_or_else(|| malformed("verifier_info_missing_identifier"))?;
+        for entry in identifiers {
+            let object = entry
+                .as_object()
+                .ok_or_else(|| malformed("verifier_info_identifier_not_object"))?;
+            require_string_member(object, "type")?;
+            require_string_member(object, "identifier")?;
+        }
+        // RO-07 / RO-10 / B.2.6: the multilanguage strings — each entry a
+        // {lang, content} pair (the 472-2 MultiLangString shape).
+        for name in ["srvDescription", "purpose"] {
             let list = data
                 .get(name)
                 .and_then(Value::as_array)
                 .filter(|list| !list.is_empty())
                 .ok_or_else(|| malformed(format!("verifier_info_missing_{name}")))?;
-            let _ = list;
+            for entry in list {
+                let object = entry
+                    .as_object()
+                    .ok_or_else(|| malformed(format!("verifier_info_{name}_entry_not_object")))?;
+                require_string_member(object, "lang")?;
+                require_string_member(object, "content")?;
+            }
         }
         for name in ["registryURI", "intendedUseIdentifier", "policyURI"] {
             let value = data
@@ -250,10 +295,18 @@ pub fn build_verifier_info(
                 .ok_or_else(|| malformed(format!("verifier_info_missing_{name}")))?;
             let _ = value;
         }
-        // RO-12: the optional credential array.
+        // RO-12 / B.2.9: the optional credential array — each entry an
+        // object with format and meta strings.
         if let Some(credential) = data.get("credential") {
-            if !credential.is_array() {
-                return Err(malformed("verifier_info_credential_not_array"));
+            let list = credential
+                .as_array()
+                .ok_or_else(|| malformed("verifier_info_credential_not_array"))?;
+            for entry in list {
+                let object = entry
+                    .as_object()
+                    .ok_or_else(|| malformed("verifier_info_credential_entry_not_object"))?;
+                require_string_member(object, "format")?;
+                require_string_member(object, "meta")?;
             }
         }
         // RO-03: the registrar-data element carries no credential_ids
