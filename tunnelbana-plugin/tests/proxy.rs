@@ -237,7 +237,12 @@ async fn untrusted_issuer_reaches_the_frontend_as_an_error() {
     let (cookie, id) = login(&w).await;
     assert_eq!(wallet_posts(&w, &id).await.status, 403);
     let r = w.proxy.run(get("vp/complete", Some(&cookie))).await;
-    assert_eq!(r.status, 401);
+    // This flow was initiated by the OIDC frontend (the RP's client id is
+    // the requester), so the refusal keeps the protocol error: the frontend
+    // must be able to return the authorization error — and the RP's original
+    // state — to the waiting relying party. The human-readable failure page
+    // is the browser-launched (UI requester) flow's surface.
+    assert_eq!(r.status, 401, "{}", String::from_utf8_lossy(&r.body));
     let body = String::from_utf8(r.body).unwrap();
     assert!(body.contains("issuer_not_trusted"), "{body}");
     assert!(!body.contains("Lovelace") && !body.contains("Ada"));

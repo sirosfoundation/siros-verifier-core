@@ -389,6 +389,23 @@ pub fn sign_raw(issuer: &Jwk, typ: &str, payload: &Value, x5c_der: &[Vec<u8>]) -
     sign_raw_bytes(issuer, typ, &serde_json::to_vec(payload).unwrap(), x5c_der)
 }
 
+/// As [`sign_raw`] but the signer is embedded as a JOSE `jwk` header member —
+/// the public key only, no certificate chain: the shape status-list issuers
+/// commonly emit in the wild (IETF Token Status List tokens included).
+pub fn sign_raw_embedded_jwk(issuer: &Jwk, typ: &str, payload: &Value) -> String {
+    let mut header = JoseHeader::new(issuer.alg.as_deref().expect("alg"));
+    header.typ = Some(typ.to_owned());
+    header.jwk = Some(serde_json::to_value(issuer.to_public_jwk()).expect("public jwk"));
+    let opts = SignOptions::new().with_key_reference_headers(true);
+    sign_with_jwk_options(
+        issuer,
+        &serde_json::to_vec(payload).unwrap(),
+        &header,
+        &opts,
+    )
+    .expect("sign")
+}
+
 /// As [`sign_raw`] but with the payload bytes exactly as given, so a test can sign JSON a `Value` cannot hold
 /// (repeated member names, odd escapes).
 pub fn sign_raw_bytes(issuer: &Jwk, typ: &str, payload: &[u8], x5c_der: &[Vec<u8>]) -> String {

@@ -50,6 +50,11 @@ pub struct Flow {
     pub attribute_map: BTreeMap<String, String>,
     pub subject_pointer: String,
     pub outcome: Outcome,
+    /// The bounded, client-safe reason a terminal outcome failed, shown on
+    /// the verifier's result page and in `/status`; empty when the refusal
+    /// carries no reason and for flows persisted before the field existed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub failure_description: String,
 }
 
 impl Flow {
@@ -70,14 +75,19 @@ impl Flow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalOutcome {
     Done(String),
-    Failed(String),
+    /// `code` is the stable machine refusal for the API and logs; `description`
+    /// is the bounded, client-safe reason the verifier's result page shows.
+    Failed {
+        code: String,
+        description: String,
+    },
 }
 
 impl From<TerminalOutcome> for Outcome {
     fn from(value: TerminalOutcome) -> Self {
         match value {
             TerminalOutcome::Done(result) => Self::Done(result),
-            TerminalOutcome::Failed(code) => Self::Failed(code),
+            TerminalOutcome::Failed { code, .. } => Self::Failed(code),
         }
     }
 }
@@ -104,7 +114,17 @@ pub enum CollectResult {
     Pending,
     Expired,
     Done(String),
-    Failed(String),
+    /// The stable machine refusal code plus the bounded, client-safe reason.
+    /// `browser_launched` marks a flow the browser started directly through
+    /// the UI frontend: its refusal renders on the failure page. RP-initiated
+    /// flows keep the protocol error instead, so the frontend returns the
+    /// authorization error — and the original state — to the waiting relying
+    /// party rather than leaving it on a 200 page.
+    Failed {
+        code: String,
+        description: String,
+        browser_launched: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,6 +250,9 @@ impl FlowStore for MemoryFlowStore {
         if !matches!(&flow.outcome, Outcome::Processing(current) if current == claim_id) {
             return Ok(FinishResult::Conflict);
         }
+        if let TerminalOutcome::Failed { description, .. } = &outcome {
+            flow.failure_description = description.clone();
+        }
         flow.outcome = outcome.into();
         flow.clear_secrets();
         Ok(FinishResult::Finished)
@@ -245,7 +268,11 @@ impl FlowStore for MemoryFlowStore {
             Outcome::Pending if flow.expired(now) => CollectResult::Expired,
             Outcome::Pending | Outcome::Processing(_) => return Ok(CollectResult::Pending),
             Outcome::Done(result) => CollectResult::Done(result.clone()),
-            Outcome::Failed(code) => CollectResult::Failed(code.clone()),
+            Outcome::Failed(code) => CollectResult::Failed {
+                code: code.clone(),
+                description: flow.failure_description.clone(),
+                browser_launched: crate::ui::is_ui_requester(flow.requester.as_deref()),
+            },
             Outcome::Collected => return Ok(CollectResult::Unknown),
         };
         flow.outcome = Outcome::Collected;

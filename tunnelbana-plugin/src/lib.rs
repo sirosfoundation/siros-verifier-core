@@ -25,6 +25,7 @@ use siros_verifier_core::receipt::{
 };
 use siros_verifier_core::sdjwt::{CryptoVerified, X5cLeaf};
 use siros_verifier_core::session_seal::SessionSealer;
+use siros_verifier_core::status_list::{StatusListKeyResolver, StatusListKeySource};
 use siros_verifier_core::trust::TrustQuery;
 use siros_verifier_zkp::refusal::ZkpError;
 use siros_verifier_zkp::verify::{Channel, Exchange, VerifiedPresentation, ZkpVerifier};
@@ -256,6 +257,15 @@ pub struct VpBackendConfig {
     /// finishes, so sustained overload cannot accumulate unbounded work.
     #[serde(default = "default_max_concurrent_verifications")]
     pub max_concurrent_verifications: usize,
+    /// Which JOSE header members may carry a status-list token's signing key:
+    /// `x5c` (the certificate-bound default), `jwk` (embedded keys only), or
+    /// `x5c-or-jwk` (the `x5c` leaf when the header carries a chain, otherwise
+    /// the embedded `jwk` — the shape most status-list issuers actually emit:
+    /// IETF Token Status List tokens commonly embed the signer with no chain).
+    /// Every other rule — the signature, `sub` binding the token to the
+    /// referenced URI, `iat`/`exp` — applies regardless of the carrier.
+    #[serde(default)]
+    pub status_list_key_source: StatusListKeySource,
 }
 
 fn default_mdoc_role() -> String {
@@ -293,6 +303,11 @@ struct Decision {
 }
 
 impl Decision {
+    /// The bound on the persisted failure reason: enough for any honest
+    /// sentence, small enough that a hostile or buggy description cannot
+    /// bloat every stored flow.
+    const DESCRIPTION_LIMIT: usize = 512;
+
     fn failed(code: &str, response: Response) -> Result<Self> {
         let status = response.status;
         let description = String::from_utf8_lossy(&response.body).into_owned();
@@ -301,8 +316,21 @@ impl Decision {
             "error_description": description,
         }))?;
         response.status = status;
+        // The bounded, client-safe reason the result page shows: the same
+        // description the wallet receives, truncated at a character boundary.
+        let mut bounded = description;
+        if bounded.len() > Self::DESCRIPTION_LIMIT {
+            let mut end = Self::DESCRIPTION_LIMIT;
+            while !bounded.is_char_boundary(end) {
+                end -= 1;
+            }
+            bounded.truncate(end);
+        }
         Ok(Self {
-            outcome: TerminalOutcome::Failed(code.to_owned()),
+            outcome: TerminalOutcome::Failed {
+                code: code.to_owned(),
+                description: bounded,
+            },
             response,
         })
     }
@@ -940,6 +968,41 @@ fn request_profile(
     Ok((dcql, attributes, subject_pointer.expect("a claim path")))
 }
 
+/// The human-readable reason a status-list token was refused, from the SDK's
+/// stable kind strings (`status_list_uri_mismatch`,
+/// `status_list_missing_iat`, `status list token carries no x5c chain`, ...):
+/// what failed and why, phrased for the result page — not the bare error code
+/// repeated twice.
+///
+/// Only the stable kind travels to the client. The SDK's kind strings are
+/// fixed machine codes, but some carry derived detail after a `": "` — parser
+/// messages over attacker-controlled input, and the credential's own status
+/// URI — which must not reach a persisted, client-visible description. The
+/// full error is logged server-side; only the kind leaves the verifier.
+fn status_list_reason(error: &siros_verifier_core::Error) -> String {
+    let detail = match error {
+        siros_verifier_core::Error::Malformed(detail)
+        | siros_verifier_core::Error::Integrity(detail)
+        | siros_verifier_core::Error::Policy(detail)
+        | siros_verifier_core::Error::Crypto(detail) => detail.clone(),
+        other => other.to_string(),
+    };
+    let kind = match detail.split_once(": ") {
+        Some((kind, _detail)) => kind.to_owned(),
+        None => detail,
+    };
+    format!("the credential's status list could not be verified: {kind}")
+}
+
+/// A status-list check refusal: the stable machine `code` for the API and
+/// logs, plus a human-readable `description` — the underlying reason, not
+/// the code repeated — for the verifier's result page and the wallet.
+struct StatusListRefusal {
+    code: &'static str,
+    status: u16,
+    description: String,
+}
+
 impl VpBackend {
     pub fn new(
         name: &str,
@@ -1077,6 +1140,7 @@ impl VpBackend {
             processing_lease_secs: default_processing_lease(),
             processing_deadline_secs: default_processing_deadline(),
             max_concurrent_verifications: default_max_concurrent_verifications(),
+            status_list_key_source: StatusListKeySource::default(),
         };
         let mut backend =
             Self::new_inner(name, module_base, cfg, gate, signer, chain_der, clock, true)?;
@@ -1253,34 +1317,84 @@ impl VpBackend {
         )
     }
 
+    /// A status-list check refusal: the stable machine `code` for the API and
+    /// logs, plus a human-readable `description` — the underlying reason, not
+    /// the code repeated — for the verifier's result page and the wallet.
     async fn check_sd_jwt_status(
         &self,
         verified: &CryptoVerified,
         now: i64,
-    ) -> std::result::Result<(), (String, u16)> {
+    ) -> std::result::Result<(), StatusListRefusal> {
         let Some(reference) = &verified.status else {
             return Ok(());
         };
         let Some(client) = &self.status_list_client else {
-            return Err(("status_list_unavailable".into(), 503));
+            return Err(StatusListRefusal {
+                code: "status_list_unavailable",
+                status: 503,
+                description: "this verifier has no status list endpoint configured".into(),
+            });
         };
-        let token = client
-            .fetch(&reference.uri)
-            .await
-            .map_err(|_| ("status_list_unavailable".to_owned(), 503))?;
+        let token = client.fetch(&reference.uri).await.map_err(|e| {
+            // The URI (which may carry a per-credential identifier) belongs in
+            // the operator's log, never in a client-visible description.
+            tracing::warn!(error = %e, uri = %reference.uri, "status list fetch failed");
+            StatusListRefusal {
+                code: "status_list_unavailable",
+                status: 503,
+                description: "the credential's status list could not be fetched".into(),
+            }
+        })?;
+        let resolver = StatusListKeyResolver {
+            source: self.cfg.status_list_key_source,
+        };
         let token =
-            siros_verifier_core::status_list::verify_token(&token, &reference.uri, &X5cLeaf, now)
-                .map_err(|_| ("invalid_status_list".to_owned(), 400))?;
-        let status = siros_verifier_core::status_list::status_at(&token, reference)
-            .map_err(|_| ("invalid_status_list".to_owned(), 400))?;
+            siros_verifier_core::status_list::verify_token(&token, &reference.uri, &resolver, now)
+                .map_err(|e| {
+                    tracing::warn!(error = %e, "status list token rejected");
+                    StatusListRefusal {
+                        code: "invalid_status_list",
+                        status: 400,
+                        description: status_list_reason(&e),
+                    }
+                })?;
+        let status =
+            siros_verifier_core::status_list::status_at(&token, reference).map_err(|e| {
+                tracing::warn!(error = %e, "status list status lookup failed");
+                StatusListRefusal {
+                    code: "invalid_status_list",
+                    status: 400,
+                    description: status_list_reason(&e),
+                }
+            })?;
         let query = TrustQuery::for_issuer(&token.issuer, "status-list-signer", "status-list");
         match self.gate.permits(&query.to_authzen(), now).await {
             Ok(true) => {}
-            Ok(false) => return Err(("status_list_signer_not_trusted".into(), 403)),
-            Err(_) => return Err(("trust_unavailable".into(), 503)),
+            Ok(false) => {
+                return Err(StatusListRefusal {
+                    code: "status_list_signer_not_trusted",
+                    status: 403,
+                    description:
+                        "the status list's signer is not trusted to sign status lists here".into(),
+                })
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "status list signer trust evaluation failed");
+                return Err(StatusListRefusal {
+                    code: "trust_unavailable",
+                    status: 503,
+                    description:
+                        "the trust service could not be reached to evaluate the status list signer"
+                            .into(),
+                });
+            }
         }
         if status != 0 {
-            return Err(("credential_revoked".into(), 403));
+            return Err(StatusListRefusal {
+                code: "credential_revoked",
+                status: 403,
+                description: "the credential is revoked".into(),
+            });
         }
         Ok(())
     }
@@ -1482,8 +1596,11 @@ impl VpBackend {
                 }
             }
             if let oid4vp::VerifiedCredential::SdJwt(credential) = &p.verified {
-                if let Err((code, status)) = self.check_sd_jwt_status(credential, now).await {
-                    return Decision::failed(&code, Response::text(status, &code));
+                if let Err(refusal) = self.check_sd_jwt_status(credential, now).await {
+                    return Decision::failed(
+                        refusal.code,
+                        Response::text(refusal.status, &refusal.description),
+                    );
                 }
             }
             let claims = match p.verified.claims() {
@@ -1699,18 +1816,14 @@ impl VpBackend {
 
     fn zkp_failure(&self, e: &ZkpError) -> Result<Decision> {
         match e {
+            // The refusal's `detail` is the human-readable reason; it rides
+            // the wallet-facing body (Decision::failed builds the
+            // `{"error", "error_description"}` JSON from it), the persisted
+            // failure description, and the result page. Passing a
+            // pre-serialized JSON body here would wrap it twice — the wallet
+            // would see escaped JSON and the page raw, truncated JSON.
             ZkpError::Refused { code, detail } => {
-                let body = serde_json::to_vec(&serde_json::json!({
-                    "error": code,
-                    "error_description": detail,
-                }))
-                .unwrap_or_else(|_| b"{\"error\":\"zkp_req\"}".to_vec());
-                Decision::failed(
-                    code,
-                    Response::new(400)
-                        .with_header("content-type", "application/json")
-                        .with_body(body),
-                )
+                Decision::failed(code, Response::text(400, detail))
             }
             ZkpError::Fault(_) => {
                 Decision::failed("verifier_error", Response::text(500, "verifier error"))
@@ -1746,12 +1859,16 @@ impl VpBackend {
             Outcome::Done(_) => "done",
             Outcome::Collected => "unknown",
         };
-        Ok(BackendAction::Respond(Response::json(
-            &serde_json::json!({
-                "status": status,
-                "complete_uri": format!("{}/complete", self.module_base),
-            }),
-        )?))
+        let mut body = serde_json::json!({
+            "status": status,
+            "complete_uri": format!("{}/complete", self.module_base),
+        });
+        // The bounded, client-safe failure reason for the result page —
+        // the browser polls this endpoint and renders the description.
+        if !flow.failure_description.is_empty() {
+            body["description"] = serde_json::json!(flow.failure_description);
+        }
+        Ok(BackendAction::Respond(Response::json(&body)?))
     }
 
     async fn complete(&self, ctx: &Context) -> Result<BackendAction> {
@@ -1767,7 +1884,24 @@ impl VpBackend {
                 Ok(BackendAction::Respond(waiting_page(&self.module_base)))
             }
             Ok(CollectResult::Expired) => Err(Error::Authn("flow_expired".into())),
-            Ok(CollectResult::Failed(code)) => Err(Error::Authn(code)),
+            Ok(CollectResult::Failed {
+                code,
+                description,
+                browser_launched,
+            }) => {
+                // A flow the browser launched directly through the UI
+                // renders the refusal's reason on the page — the browser
+                // user sees why. An RP-initiated flow keeps the protocol
+                // error, so the frontend returns the authorization error
+                // and the original state to the waiting relying party; a
+                // 200 page would leave the RP hanging. Legacy flows without
+                // a description keep the bare authn error either way.
+                if browser_launched && !description.is_empty() {
+                    Ok(BackendAction::Respond(failure_page(&code, &description)))
+                } else {
+                    Err(Error::Authn(code))
+                }
+            }
             Ok(CollectResult::Done(sealed_result)) => {
                 let data: InternalData = self
                     .sealer
@@ -1816,6 +1950,23 @@ fn waiting_page(module_base: &str) -> Response {
         html_escape(module_base)
     );
     Response::html(ui::page("Waiting for your wallet", &body))
+}
+
+/// The terminal failure page: the stable refusal code for support and logs,
+/// and the human-readable reason the presentation was refused. Reached from
+/// `/complete` after a refused wallet response. The retry link is the UI
+/// frontend's root — the wallet backend registers only its protocol routes,
+/// so the backend base itself is not a page.
+fn failure_page(code: &str, description: &str) -> Response {
+    let body = format!(
+        r#"<h1>Presentation failed</h1>
+<p class="siros-failure-description">{}</p>
+<p><code>{}</code></p>
+<p><a href="/">Start a new request</a></p>"#,
+        html_escape(description),
+        html_escape(code)
+    );
+    Response::html(ui::page("Presentation failed", &body))
 }
 
 fn qr_page(module_base: &str, link: &str) -> Result<Response> {
@@ -1953,6 +2104,7 @@ impl Backend for VpBackend {
             attribute_map,
             subject_pointer,
             outcome: Outcome::Pending,
+            failure_description: String::new(),
         };
         if self.store.insert(flow, now).await.is_err() {
             return Ok(Response::text(503, "flow store unavailable"));

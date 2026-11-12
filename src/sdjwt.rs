@@ -82,20 +82,39 @@ pub struct IssuerEvidence {
     pub jwk: Jwk,
 }
 
+/// The resolved verification key plus the certificate chain it was resolved
+/// from, leaf first. The chain is EMPTY when the key did not come from the
+/// `x5c` header (an embedded `jwk`, a pinned key): trust evidence must never
+/// parade a header-supplied chain for a key that chain did not vouch for.
+#[derive(Clone, Debug)]
+pub struct ResolvedKey {
+    /// The key the signature must verify under.
+    pub jwk: Jwk,
+    /// The DER chain the key was resolved from, leaf first; empty for keys
+    /// resolved from a JOSE `jwk` member or pinned by the deployment.
+    pub x5c_der: Vec<Vec<u8>>,
+}
+
 /// Resolves the issuer verification key. Implementations must not treat a
-/// resolved key as *trusted*; trust is evaluated separately.
+/// resolved key as *trusted*; trust is evaluated separately — and the trust
+/// query's evidence is the resolver's own [`ResolvedKey::x5c_der`], never the
+/// raw header, so a token cannot attach a decoy chain alongside a key that
+/// chain does not vouch for.
 pub trait IssuerKeyResolver {
-    fn resolve(&self, header: &JoseHeader, iss: &str) -> Result<Jwk>;
+    fn resolve(&self, header: &JoseHeader, iss: &str) -> Result<ResolvedKey>;
 }
 
 /// Uses the leaf certificate of the `x5c` header. Performs NO chain validation.
 pub struct X5cLeaf;
 
 impl IssuerKeyResolver for X5cLeaf {
-    fn resolve(&self, header: &JoseHeader, _iss: &str) -> Result<Jwk> {
+    fn resolve(&self, header: &JoseHeader, _iss: &str) -> Result<ResolvedKey> {
         let chain = x5c_chain(header)?;
         let leaf = chain.first().ok_or_else(|| malformed("no x5c header"))?;
-        jwk_from_cert_der(leaf)
+        Ok(ResolvedKey {
+            jwk: jwk_from_cert_der(leaf)?,
+            x5c_der: chain,
+        })
     }
 }
 
@@ -103,8 +122,11 @@ impl IssuerKeyResolver for X5cLeaf {
 pub struct StaticKey(pub Jwk);
 
 impl IssuerKeyResolver for StaticKey {
-    fn resolve(&self, _h: &JoseHeader, _iss: &str) -> Result<Jwk> {
-        Ok(self.0.clone())
+    fn resolve(&self, _h: &JoseHeader, _iss: &str) -> Result<ResolvedKey> {
+        Ok(ResolvedKey {
+            jwk: self.0.clone(),
+            x5c_der: Vec::new(),
+        })
     }
 }
 
@@ -661,8 +683,8 @@ pub fn verify(
         .get("iss")
         .and_then(Value::as_str)
         .ok_or_else(|| malformed("missing iss"))?;
-    let jwk = resolver.resolve(&header, iss_hint)?;
-    let payload = jws::compact::verify_with_jwk(&jwk, jwt)
+    let resolved = resolver.resolve(&header, iss_hint)?;
+    let payload = jws::compact::verify_with_jwk(&resolved.jwk, jwt)
         .map_err(|e| integrity(format!("issuer signature: {e}")))?;
     let mut claims = payload_object(&payload)?;
     // Same bytes as the unverified parse above, so `iss` equals `iss_hint`; read it
@@ -824,8 +846,8 @@ pub fn verify(
             iss,
             alg: header.alg.clone(),
             kid: header.kid.clone(),
-            x5c_der: x5c_chain(&header)?,
-            jwk,
+            x5c_der: resolved.x5c_der,
+            jwk: resolved.jwk,
         },
         holder_key: cnf_jwk,
         status,

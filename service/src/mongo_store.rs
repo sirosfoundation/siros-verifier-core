@@ -91,17 +91,28 @@ impl MongoFlowStore {
         outcome: Outcome,
         lease_until: i64,
         return_document: ReturnDocument,
+        failure_description: Option<&str>,
     ) -> StoreResult<Option<Flow>> {
         let clear_secrets = !matches!(&outcome, Outcome::Processing(_));
         let outcome = bson::to_bson(&outcome)
             .map_err(|e| FlowStoreError(format!("flow outcome encoding failed: {e}")))?;
         let update = if clear_secrets {
-            doc! {
-                "$set": {
-                    "outcome": outcome,
-                    "jar": "",
-                    "sealed_session": "",
-                }
+            match failure_description {
+                Some(description) => doc! {
+                    "$set": {
+                        "outcome": outcome,
+                        "failure_description": description,
+                        "jar": "",
+                        "sealed_session": "",
+                    }
+                },
+                None => doc! {
+                    "$set": {
+                        "outcome": outcome,
+                        "jar": "",
+                        "sealed_session": "",
+                    }
+                },
             }
         } else {
             // Only in-flight claims carry a processing lease deadline; the
@@ -171,6 +182,7 @@ impl FlowStore for MongoFlowStore {
                 Outcome::Processing(claim_id.to_owned()),
                 now.saturating_add(lease_secs),
                 ReturnDocument::After,
+                None,
             )
             .await?;
         if let Some(flow) = claimed {
@@ -191,6 +203,10 @@ impl FlowStore for MongoFlowStore {
         claim_id: &str,
         outcome: TerminalOutcome,
     ) -> StoreResult<FinishResult> {
+        let failure_description = match &outcome {
+            TerminalOutcome::Failed { description, .. } => Some(description.clone()),
+            _ => None,
+        };
         let finished = self
             .transition(
                 doc! {
@@ -202,6 +218,7 @@ impl FlowStore for MongoFlowStore {
                 outcome.into(),
                 0,
                 ReturnDocument::Before,
+                failure_description.as_deref(),
             )
             .await?
             .is_some();
@@ -227,13 +244,21 @@ impl FlowStore for MongoFlowStore {
                 Outcome::Collected,
                 0,
                 ReturnDocument::Before,
+                None,
             )
             .await?;
         if let Some(flow) = collected {
             let expired = flow.expired(now);
+            let failure_description = flow.failure_description.clone();
+            let browser_launched =
+                siros_verifier_core_tunnelbana::ui::is_ui_requester(flow.requester.as_deref());
             return match flow.outcome {
                 Outcome::Done(result) => Ok(CollectResult::Done(result)),
-                Outcome::Failed(code) => Ok(CollectResult::Failed(code)),
+                Outcome::Failed(code) => Ok(CollectResult::Failed {
+                    code,
+                    description: failure_description,
+                    browser_launched,
+                }),
                 Outcome::Pending if expired => Ok(CollectResult::Expired),
                 _ => Err(FlowStoreError("invalid MongoDB collect transition".into())),
             };

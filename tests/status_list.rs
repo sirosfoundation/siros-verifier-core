@@ -1,7 +1,11 @@
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use serde_json::{json, Value};
 use siros_verifier_core::sdjwt::{StatusRef, X5cLeaf};
-use siros_verifier_core::status_list::{index_parts, status_at, verify_token};
-use siros_verifier_core::testutil::{self_signed_ec, sign_raw};
+use siros_verifier_core::status_list::{
+    index_parts, status_at, verify_token, StatusListKeyResolver, StatusListKeySource,
+};
+use siros_verifier_core::testutil::{self_signed_ec, sign_raw, sign_raw_embedded_jwk};
 use siros_verifier_core::trust::TrustQuery;
 
 const NOW: i64 = 1_793_656_800;
@@ -52,6 +56,215 @@ fn an_index_beyond_the_native_usize_range_is_rejected_not_truncated() {
 fn valid_claims() -> Value {
     serde_json::from_slice(&jose_rs::base64url::decode(TOKEN.split('.').nth(1).unwrap()).unwrap())
         .unwrap()
+}
+
+#[test]
+fn embedded_jwk_status_lists_verify_under_the_configured_key_source() {
+    // Status-list tokens in the wild — the GDC registry's among them, and IETF
+    // Token Status List issuers generally — embed the signer as a `jwk` with
+    // no certificate chain. The default `x5c` policy refuses them; the
+    // `x5c-or-jwk` interop policy accepts: the x5c leaf when the header
+    // carries a chain, otherwise the embedded key.
+    let (_cert, key) = self_signed_ec("status.example", "ES256");
+    let token = sign_raw_embedded_jwk(&key, "statuslist+jwt", &valid_claims());
+
+    // Default (`x5c`): refused — the token carries no chain.
+    let error = verify_token(&token, LIST_URI, &StatusListKeyResolver::default(), NOW).unwrap_err();
+    assert_eq!(error.code(), "malformed");
+    assert!(error.to_string().contains("no x5c chain"));
+
+    // `x5c-or-jwk`: the embedded key verifies and the list reads.
+    let interop = StatusListKeyResolver {
+        source: StatusListKeySource::X5cOrJwk,
+    };
+    let verified = verify_token(&token, LIST_URI, &interop, NOW).unwrap();
+    assert_eq!(status_at(&verified, &reference(4)).unwrap(), 0);
+
+    // `jwk`-only: the token's carrier is a jwk, so it verifies too...
+    let jwk_only = StatusListKeyResolver {
+        source: StatusListKeySource::Jwk,
+    };
+    let verified = verify_token(&token, LIST_URI, &jwk_only, NOW).unwrap();
+    // ...and the strict bindings still hold under every policy: a list whose
+    // subject is not the referenced URI never speaks for the credential.
+    let mut claims = valid_claims();
+    claims["sub"] = json!("https://status.example/other-list");
+    let foreign = sign_raw_embedded_jwk(&key, "statuslist+jwt", &claims);
+    assert!(verify_token(&foreign, LIST_URI, &jwk_only, NOW).is_err());
+    assert!(verify_token(&foreign, LIST_URI, &interop, NOW).is_err());
+    let _ = verified;
+
+    // The certificate-bound token still resolves under the interop policy
+    // (its carrier is x5c) and is refused under `jwk`-only — an x5c-carrying
+    // token with NO embedded key has no jwk carrier to resolve.
+    let (cert, key) = self_signed_ec("status.example", "ES256");
+    let x5c_only = sign_raw(
+        &key,
+        "statuslist+jwt",
+        &valid_claims(),
+        std::slice::from_ref(&cert),
+    );
+    verify_token(&x5c_only, LIST_URI, &interop, NOW).unwrap();
+    let error = verify_token(&x5c_only, LIST_URI, &jwk_only, NOW).unwrap_err();
+    assert!(error.to_string().contains("no embedded jwk"));
+    // The conformance suite's token carries BOTH members: every policy
+    // resolves it (x5c when accepted, else the embedded jwk).
+    verify_token(TOKEN, LIST_URI, &StatusListKeyResolver::default(), NOW).unwrap();
+    verify_token(TOKEN, LIST_URI, &interop, NOW).unwrap();
+    verify_token(TOKEN, LIST_URI, &jwk_only, NOW).unwrap();
+}
+
+#[test]
+fn an_embedded_key_never_parades_a_header_chain_as_trust_evidence() {
+    // The security heart of the carrier policy: a dual-carrier token whose
+    // signature verifies under its embedded `jwk` while its header ALSO
+    // carries a foreign certificate chain. The trust query's evidence is
+    // the resolver's own provenance — NO chain for an embedded key — so
+    // go-trust judges the embedded key, never the decoy chain; and the
+    // interop policy, seeing a present chain, resolves through it, fails the
+    // signature, and does not fall back.
+    let (decoy_cert, _decoy_key) = self_signed_ec("trusted-status.example", "ES256");
+    let (_signer_cert, signer_key) = self_signed_ec("status.example", "ES256");
+    let claims = valid_claims();
+    let token = dual_carrier_token(&signer_key, &claims, &decoy_cert);
+
+    // `jwk` policy: the embedded key verifies...
+    let jwk_only = StatusListKeyResolver {
+        source: StatusListKeySource::Jwk,
+    };
+    let verified = verify_token(&token, LIST_URI, &jwk_only, NOW).unwrap();
+    // ...but the evidence carries no chain: the embedded key vouched for
+    // itself, and the decoy chain must not reach go-trust.
+    assert!(
+        verified.issuer.x5c_der.is_empty(),
+        "an embedded-key resolution must not emit chain evidence"
+    );
+
+    // `x5c-or-jwk` on the same token: the header carries a chain, so
+    // resolution goes through it — it does not vouch for the signer — and
+    // the signature fails rather than falling back to the embedded key.
+    let interop = StatusListKeyResolver {
+        source: StatusListKeySource::X5cOrJwk,
+    };
+    let error = verify_token(&token, LIST_URI, &interop, NOW).unwrap_err();
+    assert_eq!(error.code(), "integrity");
+
+    // The resolution-failure leg with a USABLE fallback present: a garbage
+    // `x5c` entry alongside a perfectly good embedded key. The present-but-
+    // unparseable carrier fails resolution, and the usable key must not
+    // rescue it — a broken chain is an error, never a fallthrough.
+    let broken_chain = {
+        use jose_rs::jws::compact::{sign_with_jwk_options, SignOptions};
+        use jose_rs::JoseHeader;
+        let mut header = JoseHeader::new("ES256");
+        header.typ = Some("statuslist+jwt".into());
+        header.x5c = Some(vec!["garbage!!not-a-certificate".into()]);
+        header.jwk = Some(serde_json::to_value(signer_key.to_public_jwk()).unwrap());
+        let opts = SignOptions::new().with_key_reference_headers(true);
+        sign_with_jwk_options(
+            &signer_key,
+            &serde_json::to_vec(&claims).unwrap(),
+            &header,
+            &opts,
+        )
+        .expect("sign")
+    };
+    let error = verify_token(&broken_chain, LIST_URI, &interop, NOW).unwrap_err();
+    assert_eq!(error.code(), "malformed");
+
+    // And the nothing-else leg: no chain, an embedded key no parser accepts —
+    // resolution fails outright with no second carrier to fall through to.
+    let broken = broken_embedded_jwk_token();
+    let error = verify_token(&broken, LIST_URI, &interop, NOW).unwrap_err();
+    assert_eq!(error.code(), "malformed");
+}
+
+/// Mint a `statuslist+jwt` carrying BOTH an embedded signer `jwk` and an
+/// `x5c` chain (leaf first) — the dual-carrier confusion probe: the signature
+/// is the signer's, the chain is the decoy's.
+fn dual_carrier_token(signer: &jose_rs::jwk::Jwk, claims: &Value, decoy_cert_der: &[u8]) -> String {
+    use jose_rs::jws::compact::{sign_with_jwk_options, SignOptions};
+    use jose_rs::JoseHeader;
+    let mut header = JoseHeader::new("ES256");
+    header.typ = Some("statuslist+jwt".into());
+    // `x5c` rides standard base64 — the engine `x5c_chain` decodes with —
+    // unlike the compact segments' base64url.
+    header.x5c = Some(vec![STANDARD.encode(decoy_cert_der)]);
+    header.jwk = Some(serde_json::to_value(signer.to_public_jwk()).unwrap());
+    let opts = SignOptions::new().with_key_reference_headers(true);
+    sign_with_jwk_options(signer, &serde_json::to_vec(claims).unwrap(), &header, &opts)
+        .expect("sign")
+}
+
+/// A token whose embedded `jwk` is not a parseable JWK at all and which
+/// carries no chain: resolution itself must fail, with no other carrier to
+/// fall through to.
+fn broken_embedded_jwk_token() -> String {
+    use jose_rs::jws::compact::{sign_with_jwk_options, SignOptions};
+    use jose_rs::JoseHeader;
+    let (_cert, key) = self_signed_ec("status.example", "ES256");
+    let mut header = JoseHeader::new("ES256");
+    header.typ = Some("statuslist+jwt".into());
+    // `kty` must be a string; this is not a JWK any parser will accept.
+    header.jwk = Some(serde_json::json!({"kty": 42}));
+    let opts = SignOptions::new().with_key_reference_headers(true);
+    sign_with_jwk_options(
+        &key,
+        &serde_json::to_vec(&valid_claims()).unwrap(),
+        &header,
+        &opts,
+    )
+    .expect("sign")
+}
+
+#[test]
+fn a_chain_smuggled_inside_the_jwk_never_reaches_the_trust_query() {
+    // RFC 7517 §4.6: a JWK may carry its own `x5c`. An attacker's embedded
+    // key can therefore embed a foreign, trusted-looking chain inside itself
+    // — one level deeper than the header-level dual-carrier probe. The trust
+    // query's key material is reduced to the key's own members; the only
+    // chain evidence is the resolver's provenance, empty for an embedded key.
+    let (foreign_cert, _foreign_key) = self_signed_ec("trusted-status.example", "ES256");
+    let (_signer_cert, signer_key) = self_signed_ec("status.example", "ES256");
+    let mut smuggled = serde_json::to_value(signer_key.to_public_jwk()).unwrap();
+    smuggled["x5c"] = json!([STANDARD.encode(&foreign_cert)]);
+    let token = {
+        use jose_rs::jws::compact::{sign_with_jwk_options, SignOptions};
+        use jose_rs::JoseHeader;
+        let mut header = JoseHeader::new("ES256");
+        header.typ = Some("statuslist+jwt".into());
+        header.jwk = Some(smuggled);
+        let opts = SignOptions::new().with_key_reference_headers(true);
+        sign_with_jwk_options(
+            &signer_key,
+            &serde_json::to_vec(&valid_claims()).unwrap(),
+            &header,
+            &opts,
+        )
+        .expect("sign")
+    };
+    // The signature verifies under the attacker's embedded key...
+    let jwk_only = StatusListKeyResolver {
+        source: StatusListKeySource::Jwk,
+    };
+    let verified = verify_token(&token, LIST_URI, &jwk_only, NOW).unwrap();
+    // ...the resolver's provenance carries no chain...
+    let query = TrustQuery::for_issuer(&verified.issuer, "status-list-signer", "status-list");
+    assert!(
+        query.x5c.is_empty(),
+        "no chain evidence for an embedded key"
+    );
+    // ...and the AuthZEN query's key material carries the key itself and
+    // nothing smuggled: no x5c, no dereferenceable x5u/jku.
+    let authzen = query.to_authzen();
+    assert_eq!(authzen["resource"]["type"], "jwk");
+    let key = &authzen["resource"]["key"][0];
+    assert!(
+        key.get("x5c").is_none() && key.get("x5u").is_none() && key.get("jku").is_none(),
+        "the smuggled members must not reach go-trust: {key}"
+    );
+    assert_eq!(key["kty"], "EC", "the key itself survives: {key}");
+    assert_eq!(key["crv"], "P-256", "the key parameters survive: {key}");
 }
 
 #[test]

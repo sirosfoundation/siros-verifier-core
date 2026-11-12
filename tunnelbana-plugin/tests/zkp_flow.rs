@@ -287,6 +287,7 @@ fn build_full(
         processing_lease_secs: limits.0,
         processing_deadline_secs: limits.1,
         max_concurrent_verifications: limits.2,
+        status_list_key_source: siros_verifier_core::status_list::StatusListKeySource::default(),
     };
     let mut backend = VpBackend::new_with_zkp(
         "vp",
@@ -398,7 +399,7 @@ async fn start(f: &Fx) -> (State, String) {
 
 async fn start_query(f: &Fx, query: &Value) -> (State, String) {
     let mut ctx = Context::new(req("vp/start", "GET"), State::new());
-    let mut request = InternalData::request("https://rp.example");
+    let mut request = InternalData::request(ui::QR_REQUESTER);
     request.set_attr(
         ui::DCQL_ATTRIBUTE,
         json!({"credentials": [query]}).to_string(),
@@ -551,6 +552,27 @@ async fn complete(f: &Fx, state: &State) -> Result<BackendAction, String> {
         .map_err(|e| e.to_string())
 }
 
+/// A refused flow completes to the failure page carrying its reason — never
+/// the legacy bare `authentication error: <code>` string. `code` rides the page.
+async fn assert_failure_page(f: &Fx, state: &State, code: &str) {
+    match complete(f, state).await {
+        Ok(BackendAction::Respond(response)) => {
+            let body = String::from_utf8_lossy(&response.body).into_owned();
+            assert!(
+                body.contains("Presentation failed"),
+                "not the failure page: {body}"
+            );
+            assert!(
+                body.contains("class=\"siros-failure-description\""),
+                "the page shows the reason: {body}"
+            );
+            assert!(body.contains(code), "the page carries {code}: {body}");
+        }
+        Ok(_) => panic!("a refused flow must complete to a page, not a success"),
+        Err(e) => panic!("a refused flow must show its reason, got the error {e}"),
+    }
+}
+
 #[tokio::test]
 async fn a_pseudonym_login_reaches_the_frontend_as_a_pairwise_subject() {
     let f = fx();
@@ -582,7 +604,7 @@ async fn a_pseudonym_login_reaches_the_frontend_as_a_pairwise_subject() {
     assert_eq!(d.subject_type, SubjectType::Pairwise);
     assert_eq!(d.attr_first("pseudonym"), Some(b64(&pseudonym).as_str()));
     assert_eq!(d.attr_first("ageOver"), Some("true"));
-    assert_eq!(d.requester.as_deref(), Some("https://rp.example"));
+    assert_eq!(d.requester.as_deref(), Some(ui::QR_REQUESTER));
     assert!(d.auth_info.issuer.as_deref().unwrap().starts_with("zkp:"));
     assert_eq!(
         d.auth_info.auth_class_ref.as_deref(),
@@ -627,10 +649,7 @@ async fn an_exhausted_budget_starts_no_zkp_verification() {
         0,
         "no circuit may be loaded"
     );
-    assert_eq!(
-        complete(&f, &state).await.err().unwrap(),
-        "authentication error: processing_deadline"
-    );
+    assert_failure_page(&f, &state, "processing_deadline").await;
 }
 
 #[tokio::test]
@@ -762,11 +781,8 @@ async fn an_abandoned_native_verify_keeps_its_crypto_slot() {
         panic!("expected auth response")
     };
     assert!(data.subject_id.is_some());
-    assert_eq!(
-        complete(&f, &state).await.err().unwrap(),
-        "authentication error: processing_deadline",
-        "the abandoned flow stays refused"
-    );
+    // The abandoned flow stays refused: the page shows the reason.
+    assert_failure_page(&f, &state, "processing_deadline").await;
 }
 
 #[tokio::test]
@@ -812,7 +828,7 @@ async fn inconsistent_sealed_channels_are_refused_before_verification() {
         let (status, body) = post(&f, &id, &jwe).await;
         assert_eq!(status, 500, "{body}");
         assert!(body.contains("verifier_error"), "{body}");
-        assert!(complete(&f, &state).await.is_err());
+        assert_failure_page(&f, &state, "verifier_error").await;
     }
 }
 
@@ -824,7 +840,7 @@ async fn enabling_zkp_preserves_sdjwt_request_dispatch() {
         "meta": {"vct_values": ["urn:eudi:pid:arf-1.8:1"]},
         "claims": [{"path": ["given_name"]}]
     }]});
-    let mut request = InternalData::request("https://rp.example");
+    let mut request = InternalData::request(ui::QR_REQUESTER);
     request.set_attr(ui::DCQL_ATTRIBUTE, query.to_string());
     let mut ctx = Context::new(req("vp/start", "GET"), State::new());
     f.b.start_auth(&mut ctx, request).await.unwrap();
@@ -889,10 +905,16 @@ async fn an_untrusted_issuer_certificate_is_refused_with_the_wallets_code() {
     let (status, body) = post(&f, &id, &jwe).await;
     assert_eq!(status, 400, "a refusal is the wallet's business");
     assert!(body.contains("zkp_req_issuer_not_trusted"), "{body}");
-    assert_eq!(
-        complete(&f, &state).await.err().unwrap(),
-        "authentication error: zkp_req_issuer_not_trusted"
+    // The description is the readable refusal reason, never a wrapped JSON
+    // document: the wallet's error_description and the page both carry the
+    // detail itself.
+    let refusal: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let description = refusal["error_description"].as_str().unwrap();
+    assert!(
+        !description.contains("{\"error"),
+        "the wallet-facing description must not wrap the reason in JSON: {body}"
     );
+    assert_failure_page(&f, &state, "zkp_req_issuer_not_trusted").await;
 }
 
 #[tokio::test]
@@ -954,7 +976,7 @@ async fn an_identity_that_is_not_a_rulebook_verifier_id_is_the_verifiers_fault_n
     let f = build(zcfg(), Some("x509_hash:not-a-rulebook-id")).unwrap();
     let mut ctx = Context::new(req("vp/start", "GET"), State::new());
     let error =
-        f.b.start_auth(&mut ctx, InternalData::request("https://rp.example"))
+        f.b.start_auth(&mut ctx, InternalData::request(ui::QR_REQUESTER))
             .await
             .err()
             .unwrap()

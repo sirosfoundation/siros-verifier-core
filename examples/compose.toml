@@ -65,6 +65,14 @@ name = "vp"
   receipt_audience = "vp"
   max_receipt_ttl_secs = 300
   role = "pid-provider"
+  # Which JOSE header members may carry a status-list token's signing key.
+  # "x5c" (the default): only certificate-chain-bound keys — TSL-style posture.
+  # "jwk": only embedded keys.
+  # "x5c-or-jwk": the x5c leaf when the token carries a chain, otherwise the
+  # embedded jwk — the interop posture. Status-list issuers in the wild (IETF
+  # Token Status List tokens among them) commonly embed the signer as a jwk
+  # with no chain, which "x5c" refuses.
+  status_list_key_source = "x5c-or-jwk"
   request_ttl_secs = 300
   subject_pointer = "/personal_administrative_number"
   dcql = { credentials = [{

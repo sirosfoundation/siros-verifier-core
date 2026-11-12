@@ -10,6 +10,7 @@ use common::ClockBumpingClaimStore;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use siros_verifier_core::session_seal::SessionSealer;
+use siros_verifier_core::status_list::StatusListKeySource;
 use siros_verifier_core::testutil::*;
 use siros_verifier_core_tunnelbana::*;
 use tunnelbana_core::context::Context;
@@ -66,7 +67,10 @@ impl PdpClient for MockPdp {
         if self.go_trust_always_trusted.load(Ordering::SeqCst) {
             return Ok(serde_json::from_str(REAL_ALWAYS_TRUSTED).unwrap());
         }
-        assert_eq!(req["resource"]["type"], "x5c");
+        assert!(
+            matches!(req["resource"]["type"].as_str(), Some("x5c" | "jwk")),
+            "resource type follows the signer's key carrier"
+        );
         Ok(json!({"decision": self.permit.load(Ordering::SeqCst),
                   "context": {"id": format!("dec-{}", self.calls.load(Ordering::SeqCst)),
                               "trust_data": [{"registry": "etsi", "as_of": "2027-01-15T00:00:00Z",
@@ -485,9 +489,16 @@ fn respond_body(a: BackendAction) -> (u16, String) {
 
 /// Browser starts a flow; returns (cookie state, flow id).
 async fn start(f: &Fx) -> (State, String) {
+    start_as(f, ui::QR_REQUESTER).await
+}
+
+/// Start a flow with an explicit requester: the UI frontend's namespace for
+/// browser-launched flows, or the relying party's client id for
+/// RP-initiated ones.
+async fn start_as(f: &Fx, requester: &str) -> (State, String) {
     let mut ctx = Context::new(req("vp/start", "GET"), State::new());
     let page =
-        f.b.start_auth(&mut ctx, InternalData::request("https://rp.example"))
+        f.b.start_auth(&mut ctx, InternalData::request(requester))
             .await
             .unwrap();
     let html = String::from_utf8(page.body).unwrap();
@@ -567,6 +578,44 @@ async fn complete(f: &Fx, state: &State) -> Result<BackendAction, String> {
         .map_err(|e| e.to_string())
 }
 
+/// A refused flow completes to the failure page carrying its human-readable
+/// reason — never a success, and never the legacy bare `authentication
+/// error: <code>` string. `code`, when given, must ride the page.
+async fn assert_failure_page(f: &Fx, state: &State, code: Option<&str>) {
+    match complete(f, state).await {
+        Ok(BackendAction::Respond(response)) => {
+            let body = String::from_utf8_lossy(&response.body).into_owned();
+            assert!(
+                body.contains("Presentation failed"),
+                "not the failure page: {body}"
+            );
+            assert!(
+                body.contains("class=\"siros-failure-description\""),
+                "the page shows the reason: {body}"
+            );
+            if let Some(code) = code {
+                assert!(body.contains(code), "the page carries {code}: {body}");
+            }
+        }
+        Ok(_) => panic!("a refused flow must complete to a page, not a success"),
+        Err(e) => panic!("a refused flow must show its reason, got the error {e}"),
+    }
+}
+
+/// The browser's polling endpoint, as JSON: `status` plus, for a refusal,
+/// the bounded reason the page renders.
+async fn status_json(f: &Fx, state: &State) -> serde_json::Value {
+    let mut ctx = Context::new(req("vp/status", "GET"), state.clone());
+    match f.b.handle_endpoint(&mut ctx, "status").await {
+        Ok(BackendAction::Respond(response)) => {
+            let body = String::from_utf8_lossy(&response.body).into_owned();
+            serde_json::from_str(&body)
+                .unwrap_or_else(|e| panic!("status is not JSON ({e}): {body}"))
+        }
+        _ => panic!("status must answer JSON"),
+    }
+}
+
 #[tokio::test]
 async fn happy_path_delivers_mapped_attributes_once() {
     let f = fx();
@@ -582,7 +631,7 @@ async fn happy_path_delivers_mapped_attributes_once() {
     let BackendAction::AuthResponse(d) = complete(&f, &state).await.unwrap() else {
         panic!("expected auth response")
     };
-    assert_eq!(d.requester.as_deref(), Some("https://rp.example"));
+    assert_eq!(d.requester.as_deref(), Some(ui::QR_REQUESTER));
     assert_eq!(d.subject_id.as_deref(), Some("Lovelace"));
     assert_eq!(d.attr_first("givenName"), Some("Ada"));
     assert_eq!(d.attr_first("l"), Some("London"));
@@ -609,7 +658,7 @@ async fn every_verified_credential_s_claims_reach_the_result() {
     let BackendAction::AuthResponse(d) = complete(&f, &state).await.unwrap() else {
         panic!("expected auth response")
     };
-    assert_eq!(d.requester.as_deref(), Some("https://rp.example"));
+    assert_eq!(d.requester.as_deref(), Some(ui::QR_REQUESTER));
     assert_eq!(d.subject_id.as_deref(), Some("Lovelace"));
     assert_eq!(
         d.auth_info.issuer.as_deref(),
@@ -665,10 +714,7 @@ async fn a_non_scalar_mapped_claim_in_any_credential_fails_the_flow() {
     let jar = fetch_jar(&f, &id).await;
     let (st, _) = post(&f, &id, &wallet_multi(&f, &loyalty, &jar)).await;
     assert_eq!(st, 422);
-    assert_eq!(
-        complete(&f, &state).await.err().unwrap(),
-        "authentication error: attribute_not_scalar"
-    );
+    assert_failure_page(&f, &state, Some("attribute_not_scalar")).await; // was: the bare authn error
 }
 
 #[tokio::test]
@@ -683,10 +729,7 @@ async fn untrusted_issuer_fails_the_flow_and_no_attributes_leak() {
     assert_eq!(error["error"], "issuer_not_trusted");
     assert!(error["error_description"].is_string());
     assert!(!body.contains("Lovelace"));
-    assert_eq!(
-        complete(&f, &state).await.err().unwrap(),
-        "authentication error: issuer_not_trusted"
-    );
+    assert_failure_page(&f, &state, Some("issuer_not_trusted")).await; // was: the bare authn error
 }
 
 #[tokio::test]
@@ -720,7 +763,7 @@ async fn an_untrusted_issuer_cannot_trigger_status_network_activity() {
         "only the issuer permit"
     );
     assert!(!body.contains("Lovelace"));
-    assert!(complete(&f, &state).await.is_err());
+    assert_failure_page(&f, &state, None).await;
 }
 
 #[tokio::test]
@@ -767,7 +810,167 @@ async fn malformed_status_structure_is_rejected_before_signer_evaluation() {
         "only the issuer permit"
     );
     assert!(!body.contains("Lovelace"));
-    assert!(complete(&f, &state).await.is_err());
+    assert_failure_page(&f, &state, None).await;
+}
+
+#[tokio::test]
+async fn an_rp_initiated_refusal_keeps_the_protocol_error_for_the_frontend() {
+    // The relying party's frontend started this flow (the requester is the
+    // RP's client id, not the UI's namespace): the refusal must surface as
+    // the authn error so the frontend returns the authorization error — and
+    // the RP's original state — to the waiting relying party. A 200 failure
+    // page would leave the RP hanging.
+    let f = fx();
+    f.pdp.permit.store(false, Ordering::SeqCst);
+    let (state, id) = start_as(&f, "local-rp").await;
+    let jar = fetch_jar(&f, &id).await;
+    let (st, body) = post(&f, &id, &wallet(&f, &jar)).await;
+    assert_eq!(st, 403, "{body}");
+    let error = complete(&f, &state).await.err().unwrap();
+    assert!(
+        error.contains("issuer_not_trusted"),
+        "the frontend receives the refusal code: {error}"
+    );
+}
+
+#[tokio::test]
+async fn an_embedded_jwk_status_list_needs_the_configured_key_source() {
+    // Status-list tokens in the wild embed the signer as a `jwk` with no
+    // certificate chain — the GDC registry's do, as does the IETF Token
+    // Status List profile. The default `x5c` policy refuses such a token
+    // with the underlying reason in the body, never the code twice; the
+    // `x5c-or-jwk` interop policy accepts it, the signer still faces the
+    // trust gate, and the flow completes.
+    let claims = json!({
+        "sub": "https://status.example/list.jwt", "iat": T0 - 10, "exp": T0 + 1_000,
+        // RFC 1950: zlib-compressed single byte 0x00 — index 0 is unrevoked.
+        "status_list": {"bits": 1, "lst": "eJxjAAAAAQAB"},
+    });
+    let (_status_cert, status_key) = self_signed_ec("status.example", "ES256");
+    let token = sign_raw_embedded_jwk(&status_key, "statuslist+jwt", &claims);
+    let issue_with_status = |f: &mut Fx| {
+        let (issuer_cert, issuer_key) = self_signed_ec("issuer.example", "ES256");
+        let mut spec = IssueSpec::new(json!({
+            "iss": "https://issuer.example", "vct": "urn:eudi:pid:1", "iat": T0 - 10,
+            "exp": T0 + 1_000_000, "given_name": "Ada", "family_name": "Lovelace",
+            "status": {"status_list": {"idx": 0, "uri": "https://status.example/list.jwt"}},
+        }));
+        spec.holder_pub = Some(public_of(&f.holder));
+        spec.x5c_der = vec![issuer_cert];
+        spec.conceal = vec![vec![Seg::Key("given_name")], vec![Seg::Key("family_name")]];
+        f.issued = issue(&issuer_key, &spec).unwrap();
+    };
+
+    // The default policy refuses: the token carries no x5c chain, and the
+    // body says so — the error_description carries the reason.
+    let mut f = fx();
+    issue_with_status(&mut f);
+    f.b = f.b.with_status_list_client(Arc::new(CountingStatusClient {
+        calls: AtomicUsize::new(0),
+        token: Some(token.clone()),
+    }));
+    let (state, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    let (st, body) = post(&f, &id, &wallet(&f, &jar)).await;
+    assert_eq!(st, 400, "{body}");
+    let error: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(error["error"], "invalid_status_list");
+    assert!(
+        error["error_description"]
+            .as_str()
+            .unwrap()
+            .contains("no x5c chain"),
+        "the description must carry the reason: {body}"
+    );
+    // The browser polling /status sees the reason, not just the state...
+    let status = status_json(&f, &state).await;
+    assert_eq!(status["status"], "failed");
+    assert!(
+        status["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no x5c chain"),
+        "the status endpoint must carry the reason: {status}"
+    );
+    // ...and the complete page renders it.
+    assert_failure_page(&f, &state, Some("invalid_status_list")).await;
+
+    // The x5c-or-jwk policy accepts the embedded key, the signer still
+    // faces the trust gate, and the presentation completes.
+    let mut cfg = pid_cfg("/family_name", "get", None, 16);
+    cfg.status_list_key_source = StatusListKeySource::X5cOrJwk;
+    let mut f = assemble(cfg, mock_pdp(100_000, false), pid_parts());
+    issue_with_status(&mut f);
+    f.b = f.b.with_status_list_client(Arc::new(CountingStatusClient {
+        calls: AtomicUsize::new(0),
+        token: Some(token),
+    }));
+    let (state, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    let (st, body) = post(&f, &id, &wallet(&f, &jar)).await;
+    assert_eq!(st, 200, "{body}");
+    assert!(matches!(
+        complete(&f, &state).await.unwrap(),
+        BackendAction::AuthResponse(_)
+    ));
+    assert_eq!(
+        f.pdp.calls.load(Ordering::SeqCst),
+        2,
+        "issuer permit + status-list signer permit"
+    );
+
+    // And the client-visible description carries only the STABLE kind of a
+    // refusal — never parser detail derived from attacker-controlled input.
+    // A token whose embedded jwk is not a JWK produces the fixed reason
+    // 'status list jwk header is not a valid JWK', not the serde parser's
+    // message quoting the hostile input.
+    let hostile = hostile_embedded_jwk_token(&claims);
+    let mut cfg = pid_cfg("/family_name", "get", None, 16);
+    cfg.status_list_key_source = StatusListKeySource::X5cOrJwk;
+    let mut f = assemble(cfg, mock_pdp(100_000, false), pid_parts());
+    issue_with_status(&mut f);
+    f.b = f.b.with_status_list_client(Arc::new(CountingStatusClient {
+        calls: AtomicUsize::new(0),
+        token: Some(hostile),
+    }));
+    let (state, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    let (st, body) = post(&f, &id, &wallet(&f, &jar)).await;
+    assert_eq!(st, 400, "{body}");
+    let error: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(error["error"], "invalid_status_list");
+    let description = error["error_description"].as_str().unwrap();
+    assert!(
+        description.contains("status list jwk header is not a valid JWK"),
+        "the stable kind reaches the client: {description}"
+    );
+    assert!(
+        !description.contains("invalid type") && !description.contains("at line"),
+        "parser detail over hostile input must stay in the server log: {description}"
+    );
+    let status = status_json(&f, &state).await;
+    assert!(
+        status["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("status list jwk header is not a valid JWK"),
+        "the polled status carries the stable kind: {status}"
+    );
+}
+
+/// A `statuslist+jwt` whose embedded `jwk` is not a parseable JWK — signed
+/// with a real key, so the failure is the jwk parse, and the parser's error
+/// message (quoting the hostile input) is what the client description must
+/// NOT carry.
+fn hostile_embedded_jwk_token(claims: &Value) -> String {
+    use jose_rs::jws::compact::{sign_with_jwk_options, SignOptions};
+    use jose_rs::JoseHeader;
+    let (_cert, key) = self_signed_ec("status.example", "ES256");
+    let mut header = JoseHeader::new("ES256");
+    header.typ = Some("statuslist+jwt".into());
+    header.jwk = Some(json!({"kty": 42}));
+    let opts = SignOptions::new().with_key_reference_headers(true);
+    sign_with_jwk_options(&key, &serde_json::to_vec(claims).unwrap(), &header, &opts).expect("sign")
 }
 
 #[tokio::test]
@@ -815,7 +1018,7 @@ async fn revoked_status_is_refused_after_the_signer_permit() {
         "issuer and signer permits"
     );
     assert!(!body.contains("Lovelace"));
-    assert!(complete(&f, &state).await.is_err());
+    assert_failure_page(&f, &state, None).await;
 }
 
 #[tokio::test]
@@ -825,10 +1028,7 @@ async fn pdp_down_with_cold_cache_fails_closed() {
     let (state, id) = start(&f).await;
     let jar = fetch_jar(&f, &id).await;
     assert_eq!(post(&f, &id, &wallet(&f, &jar)).await.0, 503);
-    assert_eq!(
-        complete(&f, &state).await.err().unwrap(),
-        "authentication error: trust_unavailable"
-    );
+    assert_failure_page(&f, &state, Some("trust_unavailable")).await; // was: the bare authn error
 }
 
 #[tokio::test]
@@ -928,11 +1128,9 @@ async fn a_stalled_pdp_fails_the_flow_within_the_processing_deadline() {
     assert_eq!(st, 504, "{body}");
     let error: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(error["error"], "processing_deadline");
-    assert_eq!(
-        complete(&f, &state).await.err().unwrap(),
-        "authentication error: processing_deadline",
-        "the failure is terminal, not a hang until the lease"
-    );
+    // The failure is terminal — the page shows the reason — not a hang
+    // until the lease.
+    assert_failure_page(&f, &state, Some("processing_deadline")).await;
 }
 
 #[tokio::test]
@@ -965,10 +1163,7 @@ async fn the_processing_budget_never_outlives_the_remaining_lease() {
     assert_eq!(st, 504, "{body}");
     let error: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(error["error"], "processing_deadline");
-    assert_eq!(
-        complete(&f, &state).await.err().unwrap(),
-        "authentication error: processing_deadline"
-    );
+    assert_failure_page(&f, &state, Some("processing_deadline")).await; // was: the bare authn error
 
     // With one second of lease left there is no safe processing window at
     // all: verification is never polled, so the stalled PDP is never called.
@@ -997,10 +1192,7 @@ async fn the_processing_budget_never_outlives_the_remaining_lease() {
     .expect("an exhausted window must finalize without polling");
     assert_eq!(st, 504, "{body}");
     assert_eq!(gate_pdp.calls.load(Ordering::SeqCst), 0);
-    assert_eq!(
-        complete(&f, &state).await.err().unwrap(),
-        "authentication error: processing_deadline"
-    );
+    assert_failure_page(&f, &state, Some("processing_deadline")).await; // was: the bare authn error
 }
 
 #[tokio::test]
@@ -1031,10 +1223,7 @@ async fn a_synchronous_overrun_past_the_deadline_is_not_persisted() {
     assert_eq!(st, 504, "{body}");
     let error: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(error["error"], "processing_deadline");
-    assert_eq!(
-        complete(&f, &state).await.err().unwrap(),
-        "authentication error: processing_deadline"
-    );
+    assert_failure_page(&f, &state, Some("processing_deadline")).await; // was: the bare authn error
 }
 
 #[tokio::test]
@@ -1135,10 +1324,7 @@ async fn a_decision_past_the_claims_safe_window_is_not_persisted() {
     assert_eq!(st, 504, "{body}");
     let error: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(error["error"], "processing_deadline");
-    assert_eq!(
-        complete(&f, &state).await.err().unwrap(),
-        "authentication error: processing_deadline"
-    );
+    assert_failure_page(&f, &state, Some("processing_deadline")).await; // was: the bare authn error
 }
 
 #[tokio::test]
@@ -1227,7 +1413,7 @@ async fn response_for_another_flow_does_not_verify() {
     let jwe_for_1 = wallet(&f, &fetch_jar(&f, &id1).await);
     // posted to flow 2: wrong nonce/state/key for that session
     assert_eq!(post(&f, &id2, &jwe_for_1).await.0, 400);
-    assert!(complete(&f, &s2).await.is_err());
+    assert_failure_page(&f, &s2, None).await;
 }
 
 #[tokio::test]
@@ -1312,10 +1498,7 @@ async fn missing_response_parameter_fails_the_flow() {
         respond_body(f.b.handle_endpoint(&mut ctx, "response").await.unwrap()).0,
         400
     );
-    assert_eq!(
-        complete(&f, &state).await.err().unwrap(),
-        "authentication error: missing_response"
-    );
+    assert_failure_page(&f, &state, Some("missing_response")).await; // was: the bare authn error
 }
 
 #[tokio::test]
@@ -1337,10 +1520,7 @@ async fn duplicate_response_parameters_are_rejected() {
     assert_eq!(status, 400);
     let error: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(error["error"], "duplicate_response");
-    assert_eq!(
-        complete(&f, &state).await.err().unwrap(),
-        "authentication error: duplicate_response"
-    );
+    assert_failure_page(&f, &state, Some("duplicate_response")).await; // was: the bare authn error
 }
 
 #[test]
@@ -1627,10 +1807,7 @@ async fn a_credential_without_the_subject_claim_fails_for_that_reason() {
     let (state, id) = start(&f).await;
     let jar = fetch_jar(&f, &id).await;
     assert_eq!(post(&f, &id, &wallet(&f, &jar)).await.0, 422);
-    assert_eq!(
-        complete(&f, &state).await.err().unwrap(),
-        "authentication error: subject_claim_missing"
-    );
+    assert_failure_page(&f, &state, Some("subject_claim_missing")).await; // was: the bare authn error
 }
 
 #[test]
