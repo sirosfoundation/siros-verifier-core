@@ -138,6 +138,30 @@ jobs:
           mvn -B deploy:deploy-file --settings /tmp/siros-maven-settings.xml \
             -DrepositoryId=github -Durl="https://maven.pkg.github.com/${GITHUB_REPOSITORY}" \
             -DpomFile="$pom" -Dfile="$aar" -Dpackaging=aar
+      # Central alongside GitHub Packages: the consumer-facing registry,
+      # readable without a token (GitHub Packages authenticates every read,
+      # even on public packages). The version is the built artifact's own
+      # (from Cargo.toml, the same way the wildcard resolves above).
+      - name: Derive the AAR version
+        run: |
+          set -euo pipefail
+          echo "AAR_VERSION=$(ls target/native-android/siros-verifier-core-ffi-*.aar | sed -E 's/.*ffi-([0-9][^/]*)\.aar$/\1/')" >> "$GITHUB_ENV"
+      - name: Publish the AAR to Maven Central
+        uses: sirosfoundation/siros-sdk-kotlin/.github/actions/central-publish@734063a7d874bb1cb79ebca7e7f642143694ee40
+        with:
+          artifact-id: siros-verifier-core-ffi
+          version: ${{ env.AAR_VERSION }}
+          file: target/native-android/siros-verifier-core-ffi-${{ env.AAR_VERSION }}.aar
+          pom: target/native-android/siros-verifier-core-ffi-${{ env.AAR_VERSION }}.pom
+          sources-dir: .
+          name: siros-verifier-core-ffi
+          description: Native proximity Reader for the SIROS verifier core
+          url: https://github.com/sirosfoundation/siros-verifier-core
+          central-username: ${{ secrets.CENTRAL_USERNAME }}
+          central-password: ${{ secrets.CENTRAL_PASSWORD }}
+          signing-key: ${{ secrets.SIGNING_KEY }}
+          signing-password: ${{ secrets.SIGNING_PASSWORD }}
+
       - uses: actions/upload-artifact@v7
         with:
           name: siros-verifier-core-${{ github.ref_name }}-android

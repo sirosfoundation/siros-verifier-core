@@ -1,0 +1,80 @@
+name: Publish AAR to Maven Central
+
+# The native Android Reader on Maven Central - the consumer-facing
+# registry that needs no token to read (GitHub Packages authenticates
+# every read, even on public packages). Unlike siros-wallet-core's
+# twin workflow, this one BUILDS: the releases cut before this landed
+# (v0.1.2) attached no AAR to the release page, so there are no
+# release assets to republish - the AAR is rebuilt from the tag with
+# the same ffi/scripts/android-aar.sh the release workflow uses, and
+# pushed through siros-sdk-kotlin's central-publish action (the one
+# the SDK's native crates publish through).
+#
+# Central rejects a version that already exists, so running this twice
+# for one version fails at the upload and changes nothing.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The release tag (e.g. v0.1.2) whose AAR to publish
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish siros-verifier-core-ffi AAR to Maven Central
+    runs-on: ubuntu-latest
+    env:
+      NDK_VERSION: 27.3.13750724
+      KOTLIN_VERSION: 2.1.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
+        with:
+          packages: "ndk;${{ env.NDK_VERSION }}"
+      - uses: actions/setup-java@b6effb05e454b25005698d91660bdc6ffcbf961 # v5
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+      - name: Prepare Kotlin and JNA build tools
+        run: |
+          set -euo pipefail
+          mkdir -p target/native-tools
+          curl --proto '=https' --proto-redir '=https' -fsSL "https://github.com/JetBrains/kotlin/releases/download/v${KOTLIN_VERSION}/kotlin-compiler-${KOTLIN_VERSION}.zip" -o target/native-tools/kotlin.zip
+          unzip -q target/native-tools/kotlin.zip -d target/native-tools
+          curl --proto '=https' --proto-redir '=https' -fsSL "https://repo1.maven.org/maven2/net/java/dev/jna/jna/5.14.0/jna-5.14.0.jar" -o target/native-tools/jna.jar
+          curl --proto '=https' --proto-redir '=https' -fsSL "https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-stdlib/${KOTLIN_VERSION}/kotlin-stdlib-${KOTLIN_VERSION}.jar" -o target/native-tools/kotlin-stdlib.jar
+          echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT:-$ANDROID_HOME}/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+          echo "ANDROID_API=28" >> "$GITHUB_ENV"
+          echo "KOTLINC=$PWD/target/native-tools/kotlinc/bin/kotlinc" >> "$GITHUB_ENV"
+          echo "JNA_JAR=$PWD/target/native-tools/jna.jar" >> "$GITHUB_ENV"
+          echo "KOTLIN_STDLIB_JAR=$PWD/target/native-tools/kotlin-stdlib.jar" >> "$GITHUB_ENV"
+      - run: ffi/scripts/android-aar.sh target/native-android
+      - name: Derive the AAR version
+        run: |
+          set -euo pipefail
+          echo "AAR_VERSION=$(ls target/native-android/siros-verifier-core-ffi-*.aar | sed -E 's/.*ffi-([0-9][^/]*)\.aar$/\1/')" >> "$GITHUB_ENV"
+      - uses: sirosfoundation/siros-sdk-kotlin/.github/actions/central-publish@734063a7d874bb1cb79ebca7e7f642143694ee40
+        with:
+          artifact-id: siros-verifier-core-ffi
+          version: ${{ env.AAR_VERSION }}
+          file: target/native-android/siros-verifier-core-ffi-${{ env.AAR_VERSION }}.aar
+          pom: target/native-android/siros-verifier-core-ffi-${{ env.AAR_VERSION }}.pom
+          sources-dir: .
+          name: siros-verifier-core-ffi
+          description: Native proximity Reader for the SIROS verifier core
+          url: https://github.com/sirosfoundation/siros-verifier-core
+          central-username: ${{ secrets.CENTRAL_USERNAME }}
+          central-password: ${{ secrets.CENTRAL_PASSWORD }}
+          signing-key: ${{ secrets.SIGNING_KEY }}
+          signing-password: ${{ secrets.SIGNING_PASSWORD }}
