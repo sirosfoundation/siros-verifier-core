@@ -893,6 +893,66 @@ fn is_zkp_query(query: &Value) -> bool {
         })
 }
 
+/// The full ISO 639-1 two-letter registry plus `und` — the finite, stable set
+/// of BCP-47 primary language subtags — mirroring the client-side
+/// `presentation-flow.js` claim-label logic (#47). A pattern like "2-3
+/// lowercase letters" would also strip real claim names (mdoc's `sex`,
+/// `age`, neither a registered 639-1 code), so membership is checked against
+/// this list; regional and script variants (`nl-BE`, `en-Latn`) split at the
+/// first hyphen, the primary must be in the set and the remainder subtag-shaped.
+const ISO_639_1: &[&str] = &[
+    "aa", "ab", "ae", "af", "ak", "am", "an", "ar", "as", "av", "ay", "az", "ba", "be", "bg", "bh",
+    "bi", "bm", "bn", "bo", "br", "bs", "ca", "ce", "ch", "co", "cr", "cs", "cu", "cv", "cy", "da",
+    "de", "dv", "dz", "ee", "el", "en", "eo", "es", "et", "eu", "fa", "ff", "fi", "fj", "fo", "fr",
+    "fy", "ga", "gd", "gl", "gn", "gu", "gv", "ha", "he", "hi", "ho", "hr", "ht", "hu", "hy", "hz",
+    "ia", "id", "ie", "ig", "ii", "ik", "io", "is", "it", "iu", "ja", "jv", "ka", "kg", "ki", "kj",
+    "kk", "kl", "km", "kn", "ko", "kr", "ks", "ku", "kv", "kw", "ky", "la", "lb", "lg", "li", "ln",
+    "lo", "lt", "lu", "lv", "mg", "mh", "mi", "mk", "ml", "mn", "mr", "ms", "mt", "my", "na", "nb",
+    "ne", "ng", "nl", "nn", "no", "nr", "nv", "ny", "oc", "oj", "om", "or", "os", "pa", "pi", "pl",
+    "ps", "pt", "qu", "rm", "rn", "ro", "ru", "rw", "sa", "sc", "sd", "se", "sg", "si", "sk", "sl",
+    "sm", "sn", "so", "sq", "sr", "ss", "st", "su", "sv", "sw", "ta", "te", "tg", "th", "ti", "tk",
+    "tl", "tn", "to", "tr", "ts", "tt", "tw", "ty", "ug", "uk", "ur", "uz", "ve", "vi", "vo", "wa",
+    "wo", "xh", "yi", "yo", "za", "zh", "zu",
+];
+
+/// True when the path segment is a BCP-47 language tag — a JSON-LD
+/// language-map key, not a claim type. Mirrors the client-side
+/// `isLanguageTag` (#47).
+fn is_language_tag(segment: &str) -> bool {
+    let (primary, subtags) = match segment.split_once('-') {
+        Some((p, rest)) => (p, rest.split('-').collect::<Vec<_>>()),
+        None => (segment, Vec::new()),
+    };
+    (primary == "und" || ISO_639_1.contains(&primary))
+        && subtags
+            .iter()
+            .all(|subtag| !subtag.is_empty() && subtag.chars().all(|c| c.is_ascii_alphanumeric()))
+}
+
+/// The attribute-name fallback for a DCQL claim without an id: the last path
+/// segment, skipping trailing BCP-47 language tags. The registry's catalog
+/// DCQL carries no claim ids and descends into JSON-LD language maps
+/// (`["credentialSubject","hasClaim","awardedBy","awardingBody","legalName","nl"]`),
+/// so the raw last segment names the attribute after the LANGUAGE (`nl`),
+/// not the claim (`legalName`) — the result page then renders `nl: ArtEZ`
+/// instead of `legalName: ArtEZ`. The skip walks trailing tags while a claim
+/// name remains beneath them (index > 1: a language map always descends
+/// under a claim name, root → claimName → tag); a two-segment scalar path
+/// (`["credentialSubject","id"]`) keeps its final segment even when it
+/// collides with a language code ("id" is Indonesian in ISO 639-1).
+fn last_non_language_segment(path: &[Value]) -> Option<String> {
+    let mut idx = path.len().checked_sub(1)?;
+    while idx > 1
+        && path
+            .get(idx)
+            .and_then(Value::as_str)
+            .is_some_and(is_language_tag)
+    {
+        idx -= 1;
+    }
+    path.get(idx).and_then(Value::as_str).map(str::to_owned)
+}
+
 fn request_profile(
     request: &InternalData,
     defaults: &VpBackendConfig,
@@ -944,9 +1004,13 @@ fn request_profile(
                 .filter(|id| !id.is_empty())
                 .map(str::to_owned)
                 .or_else(|| {
-                    path.iter()
-                        .rev()
-                        .find_map(|segment| segment.as_str().map(str::to_owned))
+                    // The nameless-claim fallback skips trailing language
+                    // tags: the registry's language-map paths name the
+                    // attribute after the claim type (legalName), never the
+                    // language (nl). Claim ids, when the registry data
+                    // carries them, still win — and remain the real fix at
+                    // the data layer (#43's registry half).
+                    last_non_language_segment(path)
                 })
                 .expect("validated non-empty path");
             let mut name = base.clone();
@@ -2202,6 +2266,152 @@ pub fn register(registry: &mut Registry) {
     registry.register_backend("openid4vp", |_bx: &BuildContext| {
         Err(Error::Config("openid4vp backend must be constructed with VpBackend::new (needs keys and a PDP client)".into()))
     });
+}
+
+#[cfg(test)]
+mod request_profile_name_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn path(segments: &[&str]) -> Vec<Value> {
+        segments.iter().map(|s| json!(s)).collect()
+    }
+
+    #[test]
+    fn the_attribute_name_fallback_skips_trailing_language_tags() {
+        // The registry's catalog DCQL: no claim ids, paths descending into
+        // JSON-LD language maps. The result page's attribute names must be
+        // the claim types, never the language tags — the live GDC drill
+        // rendered `nl: ArtEZ` where the request targeted `legalName`.
+        assert_eq!(
+            last_non_language_segment(&path(&["credentialSubject", "givenName", "und"])).as_deref(),
+            Some("givenName")
+        );
+        assert_eq!(
+            last_non_language_segment(&path(&["credentialSubject", "hasClaim", "title", "nl"]))
+                .as_deref(),
+            Some("title")
+        );
+        assert_eq!(
+            last_non_language_segment(&path(&[
+                "credentialSubject",
+                "hasClaim",
+                "awardedBy",
+                "awardingBody",
+                "legalName",
+                "nl"
+            ]))
+            .as_deref(),
+            Some("legalName")
+        );
+        // Regional and script variants split at the first hyphen.
+        assert_eq!(
+            last_non_language_segment(&path(&["credentialSubject", "givenName", "en-US"]))
+                .as_deref(),
+            Some("givenName")
+        );
+        assert_eq!(
+            last_non_language_segment(&path(&["credentialSubject", "title", "nl-BE"])).as_deref(),
+            Some("title")
+        );
+        assert_eq!(
+            last_non_language_segment(&path(&["credentialSubject", "prefLabel", "en-Latn"]))
+                .as_deref(),
+            Some("prefLabel")
+        );
+        // Consecutive tags all skip.
+        assert_eq!(
+            last_non_language_segment(&path(&["credentialSubject", "givenName", "und", "nl"]))
+                .as_deref(),
+            Some("givenName")
+        );
+        // Non-EU codes — the full ISO 639-1 registry, not a curated list.
+        assert_eq!(
+            last_non_language_segment(&path(&["credentialSubject", "familyName", "nb"])).as_deref(),
+            Some("familyName")
+        );
+        assert_eq!(
+            last_non_language_segment(&path(&["credentialSubject", "name", "zh-Hant"])).as_deref(),
+            Some("name")
+        );
+    }
+
+    #[test]
+    fn the_attribute_name_fallback_keeps_scalar_claims_that_collide_with_language_codes() {
+        // A two-segment scalar path is root → claimName: the final segment
+        // IS the claim name, even when it collides with a language code —
+        // "id" is Indonesian in ISO 639-1, "en" is English. A language map
+        // always descends under a claim name (root → claimName → tag), so
+        // the skip never reaches below index 1.
+        assert_eq!(
+            last_non_language_segment(&path(&["credentialSubject", "id"])).as_deref(),
+            Some("id")
+        );
+        assert_eq!(
+            last_non_language_segment(&path(&["credentialSubject", "en"])).as_deref(),
+            Some("en")
+        );
+        assert_eq!(
+            last_non_language_segment(&path(&["org.iso.18013.5.1", "sex"])).as_deref(),
+            Some("sex")
+        );
+        // Singleton and empty paths never collapse past the first segment.
+        assert_eq!(
+            last_non_language_segment(&path(&["en"])).as_deref(),
+            Some("en")
+        );
+        assert_eq!(last_non_language_segment(&path(&[])), None);
+        // A non-string segment yields no name at all rather than a guess.
+        // Unreachable in practice: validate_dcql_query rejects non-string
+        // path members before request_profile ever runs.
+        assert_eq!(
+            last_non_language_segment(&[json!("credentialSubject"), json!(0)]),
+            None
+        );
+    }
+
+    fn test_defaults() -> VpBackendConfig {
+        serde_json::from_value(serde_json::json!({
+            "dcql": {"credentials": []},
+            "attribute_map": {"givenname": "/given_name"},
+            "subject_pointer": "/family_name",
+            "role": "pid-provider"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_dc_api_attribute_map_carries_claim_types_for_language_map_paths() {
+        // The end-to-end derivation: a registry-shaped DC-API query produces
+        // an attribute map whose names are the claim types (the result page
+        // renders these), with the dedup loop separating same-named leaves.
+        let raw = r#"{"credentials":[{"id":"diploma","format":"dc+sd-jwt",
+            "meta":{"vct_values":["urn:eudi:diploma:1"]},
+            "claims":[
+              {"path":["credentialSubject","givenName","und"]},
+              {"path":["credentialSubject","hasClaim","title","nl"]},
+              {"path":["credentialSubject","hasClaim","awardedBy","awardingBody","legalName","nl"]}
+            ]}]}"#;
+        let request = {
+            let mut r = InternalData::request(crate::ui::DC_API_REQUESTER);
+            r.set_attr(crate::ui::DCQL_ATTRIBUTE, raw.to_owned());
+            r
+        };
+        let (dcql, attributes, subject_pointer) =
+            request_profile(&request, &test_defaults()).expect("the query is valid");
+        assert_eq!(dcql["credentials"][0]["id"], "diploma");
+        // BTreeMap iteration is ordered; assert by membership, not order.
+        let names: Vec<&String> = attributes.keys().collect();
+        assert_eq!(names, vec!["givenName", "legalName", "title"]);
+        // The first claim's pointer is the subject candidate, verbatim —
+        // the skip applies to NAMES, never to the pointers the values
+        // resolve through (the nl leaf is what was requested).
+        assert_eq!(subject_pointer, "/credentialSubject/givenName/und");
+        assert_eq!(
+            attributes["legalName"],
+            "/credentialSubject/hasClaim/awardedBy/awardingBody/legalName/nl"
+        );
+    }
 }
 
 #[cfg(test)]
