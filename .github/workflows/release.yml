@@ -74,7 +74,7 @@ jobs:
   sbom:
     name: Generate signed source and image SBOMs
     needs: docker
-    uses: sirosfoundation/.github/.github/workflows/sbom.yml@e9052f30ef341824ced5172cbc14f0eaeb97294c # main (cosign v3 SBOM signing + container-SBOM signature, sirosfoundation/.github#39, #40)
+    uses: sirosfoundation/.github/.github/workflows/sbom.yml@79c3a60b794f663deeec55ba2ca3c0244b3dd020 # main (cosign v3 SBOM signing + container-SBOM signature, .github#39/#40; race-free release attach, .github#41)
     permissions:
       contents: write
       id-token: write
