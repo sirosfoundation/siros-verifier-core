@@ -41,6 +41,19 @@ pub struct RequestConfig {
     /// Explicit client ID for formats that require a different scheme from the
     /// default x509_hash. `zkp_req` uses x509_san_dns or semantic_id.
     pub client_id: Option<String>,
+    /// The ETSI TS 119 472-2 §6.3.2.2 EAAP profile's registrar dataset (the
+    /// `verifier_info` registrar_dataset element, RO-02..12): the RP
+    /// Registrar-provided data as the B.2 JSON members. `None` sends no
+    /// `verifier_info` at all — the request stays the pre-EAAP shape and the
+    /// OIDF conformance surfaces are unaffected.
+    pub verifier_info: Option<Value>,
+    /// The serialized WRPRC (`rc-wrp+jwt` per ETSI TS 119 475 §5.2), parsed
+    /// and signature-checked at arm — a malformed one fails the arm — and
+    /// carried as the `registration_cert` element (RO-13..16). The WRPRC's
+    /// subject is always the FINAL relying party (GEN-5.2.4 NOTE 2), never
+    /// the presenting intermediary; the intermediary's own credential is the
+    /// WRPAC (ETSI TS 119 411-8), later increments.
+    pub wrprc: Option<String>,
 }
 
 /// Everything the verifier must remember between request and response.
@@ -451,6 +464,20 @@ fn create_request_with_response_mode(
         payload["expected_origins"] = json!([origin]);
     } else {
         payload["response_uri"] = json!(cfg.response_uri);
+    }
+    // The 472-2 EAAP profile's registrar surface (RO-01): when the
+    // deployment configures a registrar dataset and/or a WRPRC, the
+    // request object carries `verifier_info` — parsed strictly at arm, so
+    // a malformed WRPRC fails the arm rather than riding a request the
+    // wallet can only reject. Unconfigured, the member is absent and the
+    // request is byte-identical to the pre-EAAP shape.
+    if let Some(wrprc) = &cfg.wrprc {
+        crate::wrprc::parse_wrprc(wrprc, now)?;
+    }
+    if let Some(elements) =
+        crate::wrprc::build_verifier_info(cfg.verifier_info.as_ref(), cfg.wrprc.as_deref())?
+    {
+        payload["verifier_info"] = elements;
     }
     let mut header = JoseHeader::new(alg);
     header.typ = Some("oauth-authz-req+jwt".into());
