@@ -218,6 +218,56 @@ fn broken_embedded_jwk_token() -> String {
 }
 
 #[test]
+fn a_chain_smuggled_inside_the_jwk_never_reaches_the_trust_query() {
+    // RFC 7517 §4.6: a JWK may carry its own `x5c`. An attacker's embedded
+    // key can therefore embed a foreign, trusted-looking chain inside itself
+    // — one level deeper than the header-level dual-carrier probe. The trust
+    // query's key material is reduced to the key's own members; the only
+    // chain evidence is the resolver's provenance, empty for an embedded key.
+    let (foreign_cert, _foreign_key) = self_signed_ec("trusted-status.example", "ES256");
+    let (_signer_cert, signer_key) = self_signed_ec("status.example", "ES256");
+    let mut smuggled = serde_json::to_value(signer_key.to_public_jwk()).unwrap();
+    smuggled["x5c"] = json!([STANDARD.encode(&foreign_cert)]);
+    let token = {
+        use jose_rs::jws::compact::{sign_with_jwk_options, SignOptions};
+        use jose_rs::JoseHeader;
+        let mut header = JoseHeader::new("ES256");
+        header.typ = Some("statuslist+jwt".into());
+        header.jwk = Some(smuggled);
+        let opts = SignOptions::new().with_key_reference_headers(true);
+        sign_with_jwk_options(
+            &signer_key,
+            &serde_json::to_vec(&valid_claims()).unwrap(),
+            &header,
+            &opts,
+        )
+        .expect("sign")
+    };
+    // The signature verifies under the attacker's embedded key...
+    let jwk_only = StatusListKeyResolver {
+        source: StatusListKeySource::Jwk,
+    };
+    let verified = verify_token(&token, LIST_URI, &jwk_only, NOW).unwrap();
+    // ...the resolver's provenance carries no chain...
+    let query = TrustQuery::for_issuer(&verified.issuer, "status-list-signer", "status-list");
+    assert!(
+        query.x5c.is_empty(),
+        "no chain evidence for an embedded key"
+    );
+    // ...and the AuthZEN query's key material carries the key itself and
+    // nothing smuggled: no x5c, no dereferenceable x5u/jku.
+    let authzen = query.to_authzen();
+    assert_eq!(authzen["resource"]["type"], "jwk");
+    let key = &authzen["resource"]["key"][0];
+    assert!(
+        key.get("x5c").is_none() && key.get("x5u").is_none() && key.get("jku").is_none(),
+        "the smuggled members must not reach go-trust: {key}"
+    );
+    assert_eq!(key["kty"], "EC", "the key itself survives: {key}");
+    assert_eq!(key["crv"], "P-256", "the key parameters survive: {key}");
+}
+
+#[test]
 fn non_integer_time_claims_are_rejected_even_with_valid_signatures() {
     let (cert, key) = self_signed_ec("status.example", "ES256");
     for (name, value) in [

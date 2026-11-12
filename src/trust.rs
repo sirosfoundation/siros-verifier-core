@@ -8,8 +8,32 @@
 use crate::sdjwt::IssuerEvidence;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
+use jose_rs::jwk::Jwk;
 use serde_json::{json, Value};
 use x509_cert::der::Decode;
+
+/// The trust query's key material, reduced to the members that identify the
+/// key itself: `kty`, the key parameters (`crv`/`x`/`y`, `n`/`e`), `alg` and
+/// `kid`.
+///
+/// A JWK may legally carry `x5c`, `x5u` and `jku` members (RFC 7517 §4.6-4.8)
+/// — certificate chains and dereferenceable URLs — and a JWK under attacker
+/// control can embed a foreign, trusted-looking chain inside itself. The
+/// chain evidence the trust layer sees is the resolver's own `x5c_der`,
+/// never anything smuggled inside the key, so those members never leave the
+/// verifier.
+fn minimal_public_jwk(jwk: &Jwk) -> Value {
+    let mut full = serde_json::to_value(jwk.to_public_jwk()).expect("jwk serializes");
+    if let Value::Object(members) = &mut full {
+        members.retain(|name, _| {
+            matches!(
+                name.as_str(),
+                "kty" | "crv" | "x" | "y" | "n" | "e" | "alg" | "kid"
+            )
+        });
+    }
+    full
+}
 
 #[derive(Clone, Debug)]
 pub struct TrustQuery {
@@ -28,7 +52,7 @@ impl TrustQuery {
         Self {
             subject_id: ev.iss.clone(),
             x5c: ev.x5c_der.iter().map(|d| B64.encode(d)).collect(),
-            jwk: serde_json::to_value(ev.jwk.to_public_jwk()).expect("jwk serializes"),
+            jwk: minimal_public_jwk(&ev.jwk),
             role: role.to_owned(),
             credential_types: vec![vct.to_owned()],
             as_of: None,
