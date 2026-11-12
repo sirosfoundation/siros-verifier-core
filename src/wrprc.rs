@@ -148,28 +148,36 @@ pub fn parse_wrprc(token: &str, now: i64) -> Result<Wrprc> {
     if entitlements.iter().any(|e| e.as_str().is_none()) {
         return Err(malformed("wrprc_entitlements_not_strings"));
     }
-    // Table 7: `srv_description` — one or more localized service
-    // descriptions, each a MultiLangString (lang + value).
+    // Table 7: `srv_description` — the registrar's per-registered-service
+    // localized descriptions: an array of service groups, each an array of
+    // MultiLangString entries (lang + value) — the producer's shape
+    // (siros-wrpac-tool's `[][]MultiLangString`).
     let description = claims
         .get("srv_description")
         .and_then(Value::as_array)
         .filter(|list| !list.is_empty())
         .ok_or_else(|| malformed("wrprc_missing_srv_description"))?;
-    for entry in description {
-        let object = entry
-            .as_object()
-            .ok_or_else(|| malformed("wrprc_srv_description_entry"))?;
-        let lang = object
-            .get("lang")
-            .and_then(Value::as_str)
-            .filter(|lang| !lang.is_empty())
-            .ok_or_else(|| malformed("wrprc_srv_description_lang"))?;
-        let value = object
-            .get("value")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| malformed("wrprc_srv_description_value"))?;
-        let _ = (lang, value);
+    for group in description {
+        let group = group
+            .as_array()
+            .filter(|list| !list.is_empty())
+            .ok_or_else(|| malformed("wrprc_srv_description_group"))?;
+        for entry in group {
+            let object = entry
+                .as_object()
+                .ok_or_else(|| malformed("wrprc_srv_description_entry"))?;
+            let lang = object
+                .get("lang")
+                .and_then(Value::as_str)
+                .filter(|lang| !lang.is_empty())
+                .ok_or_else(|| malformed("wrprc_srv_description_lang"))?;
+            let value = object
+                .get("value")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| malformed("wrprc_srv_description_value"))?;
+            let _ = (lang, value);
+        }
     }
     // Table 7's technical members. `iat` is required; `exp` is not in the
     // table but is validated when a registrar includes it. The future skew
@@ -190,7 +198,10 @@ pub fn parse_wrprc(token: &str, now: i64) -> Result<Wrprc> {
         }
     }
     // Table 7's optional members: type-checked when present, never required
-    // — the registrar decides which the register carries.
+    // — the registrar decides which the register carries. The shapes are
+    // the producer's (siros-wrpac-tool's claims.go, the pinned registrar):
+    // `policy_id` an array of strings, `status` the TSL-pointing object
+    // ({status_list: {idx, uri}}), the person names and URIs plain strings.
     for name in [
         "country",
         "sub_ln",
@@ -198,9 +209,7 @@ pub fn parse_wrprc(token: &str, now: i64) -> Result<Wrprc> {
         "sub_fn",
         "info_uri",
         "support_uri",
-        "policy_id",
         "certificate_policy",
-        "status",
     ] {
         if let Some(value) = claims.get(name) {
             if !value.is_string() {
@@ -208,9 +217,94 @@ pub fn parse_wrprc(token: &str, now: i64) -> Result<Wrprc> {
             }
         }
     }
+    if let Some(policy_id) = claims.get("policy_id") {
+        let list = policy_id
+            .as_array()
+            .filter(|list| !list.is_empty())
+            .ok_or_else(|| malformed("wrprc_policy_id_not_string_array"))?;
+        if list.iter().any(|id| id.as_str().is_none()) {
+            return Err(malformed("wrprc_policy_id_entry_not_string"));
+        }
+    }
+    if let Some(status) = claims.get("status") {
+        // NOTE 5: the IETF Token Status List pointer — the same shape the
+        // credential status references use.
+        let object = status
+            .as_object()
+            .ok_or_else(|| malformed("wrprc_status_not_object"))?;
+        let status_list = object
+            .get("status_list")
+            .and_then(Value::as_object)
+            .ok_or_else(|| malformed("wrprc_status_missing_status_list"))?;
+        let idx = status_list
+            .get("idx")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| malformed("wrprc_status_idx_not_integer"))?;
+        let uri = status_list
+            .get("uri")
+            .and_then(Value::as_str)
+            .filter(|uri| !uri.is_empty())
+            .ok_or_else(|| malformed("wrprc_status_missing_uri"))?;
+        let _ = (idx, uri);
+    }
+    // `purpose` (Table 7): the registered purposes, a flat array of
+    // MultiLangStrings.
+    if let Some(purpose) = claims.get("purpose") {
+        let list = purpose
+            .as_array()
+            .filter(|list| !list.is_empty())
+            .ok_or_else(|| malformed("wrprc_purpose_not_array"))?;
+        for entry in list {
+            let object = entry
+                .as_object()
+                .ok_or_else(|| malformed("wrprc_purpose_entry_not_object"))?;
+            let lang = object
+                .get("lang")
+                .and_then(Value::as_str)
+                .filter(|lang| !lang.is_empty())
+                .ok_or_else(|| malformed("wrprc_purpose_lang"))?;
+            let value = object
+                .get("value")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| malformed("wrprc_purpose_value"))?;
+            let _ = (lang, value);
+        }
+    }
     if let Some(authority) = claims.get("supervisory_authority") {
         if !authority.is_object() {
             return Err(malformed("wrprc_supervisory_authority_not_object"));
+        }
+    }
+    // Tables 8/9: the provider/service credential arrays — each entry a
+    // Credential object ({format, meta, claim}).
+    for name in ["credentials", "provides_attestations"] {
+        if let Some(list) = claims.get(name) {
+            let list = list
+                .as_array()
+                .filter(|list| !list.is_empty())
+                .ok_or_else(|| malformed(format!("wrprc_{name}_not_array")))?;
+            for entry in list {
+                let object = entry
+                    .as_object()
+                    .ok_or_else(|| malformed(format!("wrprc_{name}_entry_not_object")))?;
+                let format = object
+                    .get("format")
+                    .and_then(Value::as_str)
+                    .filter(|format| !format.is_empty())
+                    .ok_or_else(|| malformed(format!("wrprc_{name}_format")))?;
+                let _ = format;
+                if let Some(meta) = object.get("meta") {
+                    if !meta.is_object() {
+                        return Err(malformed(format!("wrprc_{name}_meta_not_object")));
+                    }
+                }
+                if let Some(claim) = object.get("claim") {
+                    if !claim.is_array() {
+                        return Err(malformed(format!("wrprc_{name}_claim_not_array")));
+                    }
+                }
+            }
         }
     }
     Ok(Wrprc {

@@ -29,7 +29,10 @@ fn verifier() -> (Vec<u8>, jose_rs::jwk::Jwk) {
     self_signed_ec("verifier.example", "ES256")
 }
 
-/// The Table 7 register payload: every member a complete register carries.
+/// The Table 7 register payload: every member a complete register carries,
+/// in the registrar's shapes (siros-wrpac-tool's claims.go — the pinned
+/// producer: `srv_description` a nested per-service array, `policy_id` a
+/// string array, `status` the TSL-pointing object).
 fn register_claims() -> Value {
     json!({
         // GEN-5.2.4-02 / NOTE 2: the subject is the registered — always the
@@ -39,12 +42,16 @@ fn register_claims() -> Value {
         "country": "SE",
         "sub_ln": "Arbetsformedlingen",
         "registry_uri": "https://registrar.example/api/5561234567",
+        // The producer's [][]MultiLangString: per-registered-service groups.
         "srv_description": [
-            {"lang": "sv", "value": "Arbetsformedlingens tjänst"},
-            {"lang": "en", "value": "The Swedish Public Employment Service"},
+            [
+                {"lang": "sv", "value": "Arbetsformedlingens tjänst"},
+                {"lang": "en", "value": "The Swedish Public Employment Service"},
+            ],
         ],
         // GEN-5.2.4-03: at least one clause A.2 entitlement.
         "entitlements": ["pid_provision", "qeaaprovider"],
+        "purpose": [{"lang": "sv", "value": "Verifiera arbetslöshetsstatus"}],
         "privacy_policy": "https://arbetsformedlingen.example/privacy",
         "info_uri": "https://arbetsformedlingen.example/info",
         "support_uri": "https://arbetsformedlingen.example/support",
@@ -52,10 +59,15 @@ fn register_claims() -> Value {
             "email": "imy@imy.se",
             "uri": "https://imy.example",
         },
-        "policy_id": "https://registrar.example/policies/wrp",
+        // The producer's []string.
+        "policy_id": ["https://registrar.example/policies/wrp"],
         "certificate_policy": "https://registrar.example/cps",
-        // NOTE 5: the IETF Token Status List URI.
-        "status": "https://registrar.example/statuslists/9",
+        // NOTE 5: the IETF Token Status List, the credential-reference shape.
+        "status": {"status_list": {"idx": 9, "uri": "https://registrar.example/statuslists/9"}},
+        // Table 9: the service-provider credentials — what the WRP may request.
+        "credentials": [
+            {"format": "dc+sd-jwt", "meta": {"vct_values": ["urn:eudi:pid:arf-1.8:1"]}, "claim": [{"path": ["given_name"]}]},
+        ],
     })
 }
 
@@ -181,6 +193,51 @@ fn the_wrprc_payload_is_held_to_table_7() {
     claims["country"] = json!(42);
     let error = parse_wrprc(&mint_wrprc(&claims), NOW).unwrap_err();
     assert!(error.to_string().contains("wrprc_country_not_string"));
+    // The registrar's own shapes, held: the nested srv_description groups,
+    // the string-array policy_id, the status object.
+    let mut claims = register_claims();
+    claims["srv_description"] = json!([{"lang": "sv", "value": "flat"}]);
+    let error = parse_wrprc(&mint_wrprc(&claims), NOW).unwrap_err();
+    assert!(
+        error.to_string().contains("wrprc_srv_description_group"),
+        "{error}"
+    );
+    let mut claims = register_claims();
+    claims["policy_id"] = json!("https://registrar.example/policies/wrp");
+    let error = parse_wrprc(&mint_wrprc(&claims), NOW).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("wrprc_policy_id_not_string_array"),
+        "{error}"
+    );
+    let mut claims = register_claims();
+    claims["status"] = json!("https://registrar.example/statuslists/9");
+    let error = parse_wrprc(&mint_wrprc(&claims), NOW).unwrap_err();
+    assert!(
+        error.to_string().contains("wrprc_status_not_object"),
+        "{error}"
+    );
+    let mut claims = register_claims();
+    claims["status"] = json!({"status_list": {"idx": "nine", "uri": "https://x"}});
+    let error = parse_wrprc(&mint_wrprc(&claims), NOW).unwrap_err();
+    assert!(
+        error.to_string().contains("wrprc_status_idx_not_integer"),
+        "{error}"
+    );
+    // The default-Mint token (policy_id the only optional member) parses:
+    // the producer's minimal output is accepted, not just the full register.
+    let mut minimal = json!({
+        "sub": "urn:glas:se:registrar:5561234567",
+        "iat": NOW - 1_000,
+        "registry_uri": "https://registrar.example/api/5561234567",
+        "srv_description": [[{"lang": "sv", "value": "Tjänst"}]],
+        "entitlements": ["pid_provision"],
+        "privacy_policy": "https://example.com/privacy",
+        "policy_id": ["https://registrar.example/policies/wrp"],
+    });
+    let _ = &mut minimal;
+    parse_wrprc(&mint_wrprc(&minimal), NOW).expect("the registrar's minimal Mint shape parses");
 }
 
 #[test]
