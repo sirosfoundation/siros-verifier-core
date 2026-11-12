@@ -489,9 +489,16 @@ fn respond_body(a: BackendAction) -> (u16, String) {
 
 /// Browser starts a flow; returns (cookie state, flow id).
 async fn start(f: &Fx) -> (State, String) {
+    start_as(f, ui::QR_REQUESTER).await
+}
+
+/// Start a flow with an explicit requester: the UI frontend's namespace for
+/// browser-launched flows, or the relying party's client id for
+/// RP-initiated ones.
+async fn start_as(f: &Fx, requester: &str) -> (State, String) {
     let mut ctx = Context::new(req("vp/start", "GET"), State::new());
     let page =
-        f.b.start_auth(&mut ctx, InternalData::request("https://rp.example"))
+        f.b.start_auth(&mut ctx, InternalData::request(requester))
             .await
             .unwrap();
     let html = String::from_utf8(page.body).unwrap();
@@ -624,7 +631,7 @@ async fn happy_path_delivers_mapped_attributes_once() {
     let BackendAction::AuthResponse(d) = complete(&f, &state).await.unwrap() else {
         panic!("expected auth response")
     };
-    assert_eq!(d.requester.as_deref(), Some("https://rp.example"));
+    assert_eq!(d.requester.as_deref(), Some(ui::QR_REQUESTER));
     assert_eq!(d.subject_id.as_deref(), Some("Lovelace"));
     assert_eq!(d.attr_first("givenName"), Some("Ada"));
     assert_eq!(d.attr_first("l"), Some("London"));
@@ -651,7 +658,7 @@ async fn every_verified_credential_s_claims_reach_the_result() {
     let BackendAction::AuthResponse(d) = complete(&f, &state).await.unwrap() else {
         panic!("expected auth response")
     };
-    assert_eq!(d.requester.as_deref(), Some("https://rp.example"));
+    assert_eq!(d.requester.as_deref(), Some(ui::QR_REQUESTER));
     assert_eq!(d.subject_id.as_deref(), Some("Lovelace"));
     assert_eq!(
         d.auth_info.issuer.as_deref(),
@@ -804,6 +811,26 @@ async fn malformed_status_structure_is_rejected_before_signer_evaluation() {
     );
     assert!(!body.contains("Lovelace"));
     assert_failure_page(&f, &state, None).await;
+}
+
+#[tokio::test]
+async fn an_rp_initiated_refusal_keeps_the_protocol_error_for_the_frontend() {
+    // The relying party's frontend started this flow (the requester is the
+    // RP's client id, not the UI's namespace): the refusal must surface as
+    // the authn error so the frontend returns the authorization error — and
+    // the RP's original state — to the waiting relying party. A 200 failure
+    // page would leave the RP hanging.
+    let f = fx();
+    f.pdp.permit.store(false, Ordering::SeqCst);
+    let (state, id) = start_as(&f, "local-rp").await;
+    let jar = fetch_jar(&f, &id).await;
+    let (st, body) = post(&f, &id, &wallet(&f, &jar)).await;
+    assert_eq!(st, 403, "{body}");
+    let error = complete(&f, &state).await.err().unwrap();
+    assert!(
+        error.contains("issuer_not_trusted"),
+        "the frontend receives the refusal code: {error}"
+    );
 }
 
 #[tokio::test]

@@ -1884,14 +1884,22 @@ impl VpBackend {
                 Ok(BackendAction::Respond(waiting_page(&self.module_base)))
             }
             Ok(CollectResult::Expired) => Err(Error::Authn("flow_expired".into())),
-            Ok(CollectResult::Failed { code, description }) => {
-                // A refusal with a reason renders the reason on the page —
-                // the browser user sees why, not just the code. Legacy flows
-                // without a description keep the bare authn error.
-                if description.is_empty() {
-                    Err(Error::Authn(code))
-                } else {
+            Ok(CollectResult::Failed {
+                code,
+                description,
+                browser_launched,
+            }) => {
+                // A flow the browser launched directly through the UI
+                // renders the refusal's reason on the page — the browser
+                // user sees why. An RP-initiated flow keeps the protocol
+                // error, so the frontend returns the authorization error
+                // and the original state to the waiting relying party; a
+                // 200 page would leave the RP hanging. Legacy flows without
+                // a description keep the bare authn error either way.
+                if browser_launched && !description.is_empty() {
                     Ok(BackendAction::Respond(failure_page(&code, &description)))
+                } else {
+                    Err(Error::Authn(code))
                 }
             }
             Ok(CollectResult::Done(sealed_result)) => {

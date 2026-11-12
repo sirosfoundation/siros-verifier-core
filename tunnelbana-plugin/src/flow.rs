@@ -114,11 +114,16 @@ pub enum CollectResult {
     Pending,
     Expired,
     Done(String),
-    /// The stable machine refusal code plus the bounded, client-safe reason
-    /// for the result page.
+    /// The stable machine refusal code plus the bounded, client-safe reason.
+    /// `browser_launched` marks a flow the browser started directly through
+    /// the UI frontend: its refusal renders on the failure page. RP-initiated
+    /// flows keep the protocol error instead, so the frontend returns the
+    /// authorization error — and the original state — to the waiting relying
+    /// party rather than leaving it on a 200 page.
     Failed {
         code: String,
         description: String,
+        browser_launched: bool,
     },
 }
 
@@ -266,6 +271,7 @@ impl FlowStore for MemoryFlowStore {
             Outcome::Failed(code) => CollectResult::Failed {
                 code: code.clone(),
                 description: flow.failure_description.clone(),
+                browser_launched: crate::ui::is_ui_requester(flow.requester.as_deref()),
             },
             Outcome::Collected => return Ok(CollectResult::Unknown),
         };

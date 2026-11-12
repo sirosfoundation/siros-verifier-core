@@ -17,6 +17,16 @@ use tunnelbana_core::plugin::{BuildContext, Frontend, FrontendAction, Route};
 
 pub const QR_REQUESTER: &str = "siros-verifier-ui:qr";
 pub const DC_API_REQUESTER: &str = "siros-verifier-ui:dc-api";
+
+/// True when the flow was launched directly by the browser through this UI
+/// frontend (the `siros-verifier-ui:*` requester namespace). UI-launched
+/// flows render a refusal's reason on the failure page; RP-initiated flows —
+/// whose requester is the relying party's client id — must instead surface
+/// the protocol error, so the frontend returns the authorization error and
+/// the original state to the waiting RP.
+pub fn is_ui_requester(requester: Option<&str>) -> bool {
+    requester.is_some_and(|r| r.starts_with("siros-verifier-ui:"))
+}
 /// Request-local attributes used only to hand the user's launch profile from
 /// the UI frontend to the backend; they are never emitted as verified claims.
 pub const DCQL_ATTRIBUTE: &str = "_siros_dcql";

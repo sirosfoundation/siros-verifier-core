@@ -250,11 +250,14 @@ impl FlowStore for MongoFlowStore {
         if let Some(flow) = collected {
             let expired = flow.expired(now);
             let failure_description = flow.failure_description.clone();
+            let browser_launched =
+                siros_verifier_core_tunnelbana::ui::is_ui_requester(flow.requester.as_deref());
             return match flow.outcome {
                 Outcome::Done(result) => Ok(CollectResult::Done(result)),
                 Outcome::Failed(code) => Ok(CollectResult::Failed {
                     code,
                     description: failure_description,
+                    browser_launched,
                 }),
                 Outcome::Pending if expired => Ok(CollectResult::Expired),
                 _ => Err(FlowStoreError("invalid MongoDB collect transition".into())),

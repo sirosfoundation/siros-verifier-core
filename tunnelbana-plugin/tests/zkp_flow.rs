@@ -399,7 +399,7 @@ async fn start(f: &Fx) -> (State, String) {
 
 async fn start_query(f: &Fx, query: &Value) -> (State, String) {
     let mut ctx = Context::new(req("vp/start", "GET"), State::new());
-    let mut request = InternalData::request("https://rp.example");
+    let mut request = InternalData::request(ui::QR_REQUESTER);
     request.set_attr(
         ui::DCQL_ATTRIBUTE,
         json!({"credentials": [query]}).to_string(),
@@ -604,7 +604,7 @@ async fn a_pseudonym_login_reaches_the_frontend_as_a_pairwise_subject() {
     assert_eq!(d.subject_type, SubjectType::Pairwise);
     assert_eq!(d.attr_first("pseudonym"), Some(b64(&pseudonym).as_str()));
     assert_eq!(d.attr_first("ageOver"), Some("true"));
-    assert_eq!(d.requester.as_deref(), Some("https://rp.example"));
+    assert_eq!(d.requester.as_deref(), Some(ui::QR_REQUESTER));
     assert!(d.auth_info.issuer.as_deref().unwrap().starts_with("zkp:"));
     assert_eq!(
         d.auth_info.auth_class_ref.as_deref(),
@@ -840,7 +840,7 @@ async fn enabling_zkp_preserves_sdjwt_request_dispatch() {
         "meta": {"vct_values": ["urn:eudi:pid:arf-1.8:1"]},
         "claims": [{"path": ["given_name"]}]
     }]});
-    let mut request = InternalData::request("https://rp.example");
+    let mut request = InternalData::request(ui::QR_REQUESTER);
     request.set_attr(ui::DCQL_ATTRIBUTE, query.to_string());
     let mut ctx = Context::new(req("vp/start", "GET"), State::new());
     f.b.start_auth(&mut ctx, request).await.unwrap();
@@ -976,7 +976,7 @@ async fn an_identity_that_is_not_a_rulebook_verifier_id_is_the_verifiers_fault_n
     let f = build(zcfg(), Some("x509_hash:not-a-rulebook-id")).unwrap();
     let mut ctx = Context::new(req("vp/start", "GET"), State::new());
     let error =
-        f.b.start_auth(&mut ctx, InternalData::request("https://rp.example"))
+        f.b.start_auth(&mut ctx, InternalData::request(ui::QR_REQUESTER))
             .await
             .err()
             .unwrap()
