@@ -149,9 +149,31 @@ fn an_embedded_key_never_parades_a_header_chain_as_trust_evidence() {
     let error = verify_token(&token, LIST_URI, &interop, NOW).unwrap_err();
     assert_eq!(error.code(), "integrity");
 
-    // And the resolution-failure leg of the no-fallback guarantee: a token
-    // with NO x5c and a malformed embedded jwk fails resolution outright —
-    // there is no second carrier to fall through to.
+    // The resolution-failure leg with a USABLE fallback present: a garbage
+    // `x5c` entry alongside a perfectly good embedded key. The present-but-
+    // unparseable carrier fails resolution, and the usable key must not
+    // rescue it — a broken chain is an error, never a fallthrough.
+    let broken_chain = {
+        use jose_rs::jws::compact::{sign_with_jwk_options, SignOptions};
+        use jose_rs::JoseHeader;
+        let mut header = JoseHeader::new("ES256");
+        header.typ = Some("statuslist+jwt".into());
+        header.x5c = Some(vec!["garbage!!not-a-certificate".into()]);
+        header.jwk = Some(serde_json::to_value(signer_key.to_public_jwk()).unwrap());
+        let opts = SignOptions::new().with_key_reference_headers(true);
+        sign_with_jwk_options(
+            &signer_key,
+            &serde_json::to_vec(&claims).unwrap(),
+            &header,
+            &opts,
+        )
+        .expect("sign")
+    };
+    let error = verify_token(&broken_chain, LIST_URI, &interop, NOW).unwrap_err();
+    assert_eq!(error.code(), "malformed");
+
+    // And the nothing-else leg: no chain, an embedded key no parser accepts —
+    // resolution fails outright with no second carrier to fall through to.
     let broken = broken_embedded_jwk_token();
     let error = verify_token(&broken, LIST_URI, &interop, NOW).unwrap_err();
     assert_eq!(error.code(), "malformed");

@@ -126,6 +126,38 @@ class FakeElement {
   close() { this.open = false; }
 }
 
+test("the poll polls through transient errors and stops on a terminal status with its reason", async () => {
+  const previousFetch = globalThis.fetch;
+  const previousWindow = globalThis.window;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    if (calls === 1) throw new TypeError("network down"); // transient: poll on
+    return {
+      ok: true,
+      json: async () => ({
+        status: "failed",
+        description: "the credential's status list could not be verified: status list token carries no x5c chain",
+      }),
+    };
+  };
+  globalThis.window = {setTimeout: (resolve) => resolve()};
+  try {
+    const flow = Object.create(PresentationFlow.prototype);
+    flow.runId = 0;
+    flow.pollMs = 0;
+    await assert.rejects(
+      flow.poll("/status", 0),
+      /status list token carries no x5c chain/,
+      "the verifier's reason surfaces, not a generic message",
+    );
+    assert.equal(calls, 2, "one transient error polled through; the terminal status stopped the poll");
+  } finally {
+    globalThis.fetch = previousFetch;
+    globalThis.window = previousWindow;
+  }
+});
+
 test("QR launches reuse one modal and completion uses the complete page", () => {
   const previousDocument = globalThis.document;
   const previousWindow = globalThis.window;

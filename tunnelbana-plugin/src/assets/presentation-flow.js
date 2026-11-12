@@ -422,13 +422,18 @@ export class PresentationFlow {
             return result;
           }
           if (["failed", "expired", "unknown"].includes(result.status)) {
-            // The verifier's bounded, human-readable reason when it has one —
-            // e.g. why a status list was refused — otherwise the bare state.
-            throw new Error(result.description || `Presentation ${result.status}; start a new request`);
+            // Terminal: the verifier's bounded, human-readable reason when it
+            // has one — e.g. why a status list was refused — otherwise the
+            // bare state. The flag is structural: the catch below rethrows
+            // terminal outcomes instead of polling on them as if they were
+            // transient network errors.
+            const failure = new Error(result.description || `Presentation ${result.status}; start a new request`);
+            failure.terminal = true;
+            throw failure;
           }
         }
       } catch (error) {
-        if (error.message.startsWith("Presentation ")) throw error;
+        if (error.terminal || error.message.startsWith("Presentation ")) throw error;
         // Keep polling through transient network errors; request expiry is authoritative.
       }
       await new Promise((resolve) => window.setTimeout(resolve, this.pollMs));

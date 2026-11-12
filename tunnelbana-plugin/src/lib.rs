@@ -1887,11 +1887,7 @@ impl VpBackend {
                 if description.is_empty() {
                     Err(Error::Authn(code))
                 } else {
-                    Ok(BackendAction::Respond(failure_page(
-                        &self.module_base,
-                        &code,
-                        &description,
-                    )))
+                    Ok(BackendAction::Respond(failure_page(&code, &description)))
                 }
             }
             Ok(CollectResult::Done(sealed_result)) => {
@@ -1946,16 +1942,17 @@ fn waiting_page(module_base: &str) -> Response {
 
 /// The terminal failure page: the stable refusal code for support and logs,
 /// and the human-readable reason the presentation was refused. Reached from
-/// `/complete` after a refused wallet response.
-fn failure_page(module_base: &str, code: &str, description: &str) -> Response {
+/// `/complete` after a refused wallet response. The retry link is the UI
+/// frontend's root — the wallet backend registers only its protocol routes,
+/// so the backend base itself is not a page.
+fn failure_page(code: &str, description: &str) -> Response {
     let body = format!(
         r#"<h1>Presentation failed</h1>
 <p class="siros-failure-description">{}</p>
 <p><code>{}</code></p>
-<p><a href="{}/">Start a new request</a></p>"#,
+<p><a href="/">Start a new request</a></p>"#,
         html_escape(description),
-        html_escape(code),
-        html_escape(module_base)
+        html_escape(code)
     );
     Response::html(ui::page("Presentation failed", &body))
 }
