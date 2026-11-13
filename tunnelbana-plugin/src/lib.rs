@@ -310,6 +310,28 @@ fn default_max_concurrent_verifications() -> usize {
 /// verification phase and finalized by the caller in a single bounded write,
 /// so a cancelled verification can never replace or duplicate a terminal
 /// outcome.
+/// The per-step wall-clock split of one wallet response, emitted as ONE
+/// structured log line when the response completes: the operational answer
+/// to "where did the time go", readable straight from the deployment's logs.
+/// Milliseconds; every field defaults to zero and is only written when its
+/// step actually ran, so early refusals show exactly which steps fired.
+#[derive(Default)]
+struct ResponseTimings {
+    claim_ms: u64,
+    admission_ms: u64,
+    unseal_ms: u64,
+    crypto_ms: u64,
+    trust_ms: u64,
+    status_ms: u64,
+    status_fetch_ms: u64,
+    finalize_ms: u64,
+}
+
+/// Elapsed whole milliseconds since the given instant.
+fn elapsed_ms(started: std::time::Instant) -> u64 {
+    started.elapsed().as_millis() as u64
+}
+
 struct Decision {
     outcome: TerminalOutcome,
     response: Response,
@@ -1415,6 +1437,7 @@ impl VpBackend {
         &self,
         verified: &CryptoVerified,
         now: i64,
+        timings: &mut ResponseTimings,
     ) -> std::result::Result<(), StatusListRefusal> {
         let Some(reference) = &verified.status else {
             return Ok(());
@@ -1426,6 +1449,7 @@ impl VpBackend {
                 description: "this verifier has no status list endpoint configured".into(),
             });
         };
+        let fetch_started = std::time::Instant::now();
         let token = client.fetch(&reference.uri).await.map_err(|e| {
             // The URI (which may carry a per-credential identifier) belongs in
             // the operator's log, never in a client-visible description.
@@ -1436,6 +1460,7 @@ impl VpBackend {
                 description: "the credential's status list could not be fetched".into(),
             }
         })?;
+        timings.status_fetch_ms += elapsed_ms(fetch_started);
         let resolver = StatusListKeyResolver {
             source: self.cfg.status_list_key_source,
         };
@@ -1497,6 +1522,7 @@ impl VpBackend {
         }
         let now = (self.clock)();
         let claim_id = new_flow_id();
+        let claim_started = std::time::Instant::now();
         let flow = match self
             .store
             .claim(&id, now, &claim_id, self.cfg.processing_lease_secs)
@@ -1512,6 +1538,10 @@ impl VpBackend {
                 tracing::error!(error = %e, flow = %id, "flow store claim failed");
                 return Ok(Response::text(503, "flow store unavailable"));
             }
+        };
+        let mut timings = ResponseTimings {
+            claim_ms: elapsed_ms(claim_started),
+            ..Default::default()
         };
         // The budget never takes more of the lease than leaves room to
         // persist the terminal outcome while this claim is still held; a
@@ -1531,8 +1561,11 @@ impl VpBackend {
         let decided = if budget <= 0 {
             Self::deadline_decision()?
         } else {
-            match tokio::time::timeout(deadline, self.process_claim(ctx, id.clone(), now, flow))
-                .await
+            match tokio::time::timeout(
+                deadline,
+                self.process_claim(ctx, id.clone(), now, flow, &mut timings),
+            )
+            .await
             {
                 Ok(decided) => decided?,
                 Err(_) => Self::deadline_decision()?,
@@ -1555,8 +1588,32 @@ impl VpBackend {
         // Single bounded terminal write, outside the cancellable verification
         // phase: a cancelled verification can never replace or duplicate a
         // committed terminal outcome.
-        self.finish_response(&id, &claim_id, decision.outcome, decision.response)
-            .await
+        let result_code = match &decision.outcome {
+            TerminalOutcome::Done(_) => "ok".to_owned(),
+            TerminalOutcome::Failed { code, .. } => code.clone(),
+        };
+        let finalize_started = std::time::Instant::now();
+        let finished = self
+            .finish_response(&id, &claim_id, decision.outcome, decision.response)
+            .await;
+        timings.finalize_ms = elapsed_ms(finalize_started);
+        // One line per presentation, with the full step split: the drill
+        // logs answer "where did the time go" without any extra tooling.
+        tracing::info!(
+            flow = %id,
+            result = result_code,
+            total_ms = elapsed_ms(started),
+            claim_ms = timings.claim_ms,
+            admission_ms = timings.admission_ms,
+            unseal_ms = timings.unseal_ms,
+            crypto_ms = timings.crypto_ms,
+            trust_ms = timings.trust_ms,
+            status_ms = timings.status_ms,
+            status_fetch_ms = timings.status_fetch_ms,
+            finalize_ms = timings.finalize_ms,
+            "wallet response processed"
+        );
+        finished
     }
 
     /// Decide the terminal outcome for one claimed wallet response without
@@ -1568,6 +1625,7 @@ impl VpBackend {
         id: String,
         now: i64,
         flow: Flow,
+        timings: &mut ResponseTimings,
     ) -> Result<Decision> {
         let Flow {
             sealed_session,
@@ -1583,12 +1641,15 @@ impl VpBackend {
         // so sustained overload cannot accumulate unbounded verification
         // work. The millisecond crypto job a dropped caller leaves on the
         // blocking pool is bounded by that pool.
+        let admission_started = std::time::Instant::now();
         let _admission = match self.verification_permits.clone().acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => {
                 return Decision::failed("verifier_error", Response::text(500, "verifier error"));
             }
         };
+        timings.admission_ms = elapsed_ms(admission_started);
+        let unseal_started = std::time::Instant::now();
         let session = match self.sealer.unseal(&sealed_session, id.as_bytes()) {
             Ok(s) => s,
             Err(e) => {
@@ -1598,6 +1659,7 @@ impl VpBackend {
                 );
             }
         };
+        timings.unseal_ms = elapsed_ms(unseal_started);
         // RFC 6749 section 3.1 prohibits repeated request/response parameters.
         // The HTTP adapter preserves form pairs so this boundary must not
         // silently accept a last-write-wins interpretation.
@@ -1621,15 +1683,21 @@ impl VpBackend {
             let Some(z) = &self.zkp else {
                 return Decision::failed("verifier_error", Response::text(500, "verifier error"));
             };
-            return self
+            let zkp_started = std::time::Instant::now();
+            let decided = self
                 .on_zkp_response(&id, z, &session, &jwe, requester, now)
                 .await;
+            // The native pipeline (decrypt, proof verify, polling) is the
+            // cryptographic cost on this path.
+            timings.crypto_ms += elapsed_ms(zkp_started);
+            return decided;
         }
         // Synchronous cryptographic verification runs on the blocking pool so
         // it cannot stall the async workers polling other requests. Its
         // permit moves into the job and is held until the job finishes —
         // even a caller-abandoned job keeps its slot, so neither the
         // running set nor the pool's queue can exceed the cap.
+        let crypto_started = std::time::Instant::now();
         let crypto_permit = match self.crypto_permits.clone().acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => {
@@ -1650,6 +1718,7 @@ impl VpBackend {
                 return Decision::failed("verifier_error", Response::text(500, "verifier error"));
             }
         };
+        timings.crypto_ms = elapsed_ms(crypto_started);
         // Every presented credential's issuer must be trusted; a single denial fails the flow.
         if verified.is_empty() {
             return Decision::failed("no_presentation", Response::text(400, "no presentation"));
@@ -1670,7 +1739,10 @@ impl VpBackend {
                 .verified
                 .trust_query(&self.cfg.role, &self.cfg.mdoc_role)
                 .to_authzen();
-            match self.gate.permits(&q, now).await {
+            let trust_started = std::time::Instant::now();
+            let permitted = self.gate.permits(&q, now).await;
+            timings.trust_ms += elapsed_ms(trust_started);
+            match permitted {
                 Ok(true) => {}
                 Ok(false) => {
                     return Decision::failed(
@@ -1687,7 +1759,10 @@ impl VpBackend {
                 }
             }
             if let oid4vp::VerifiedCredential::SdJwt(credential) = &p.verified {
-                if let Err(refusal) = self.check_sd_jwt_status(credential, now).await {
+                let status_started = std::time::Instant::now();
+                let status_result = self.check_sd_jwt_status(credential, now, timings).await;
+                timings.status_ms += elapsed_ms(status_started);
+                if let Err(refusal) = status_result {
                     return Decision::failed(
                         refusal.code,
                         Response::text(refusal.status, &refusal.description),
