@@ -1804,14 +1804,13 @@ impl VpBackend {
             let Some(z) = &self.zkp else {
                 return Decision::failed("verifier_error", Response::text(500, "verifier error"));
             };
-            // The native pipeline (decrypt, proof verify, polling) is the
-            // cryptographic cost on this path.
-            let _zkp_timer = StepTimer::start(&mut timings.crypto_ms);
-            let decided = self
-                .on_zkp_response(&id, z, &session, &jwe, requester, now)
+            // The handler times its own phases: decrypt/parse and the
+            // native verification land in crypto_ms, the trust evaluations
+            // in trust_ms - a slow PDP must not read as slow proof
+            // verification.
+            return self
+                .on_zkp_response(&id, z, &session, &jwe, requester, now, timings)
                 .await;
-            drop(_zkp_timer);
-            return decided;
         }
         // Synchronous cryptographic verification runs on the blocking pool so
         // it cannot stall the async workers polling other requests. Its
@@ -1935,6 +1934,7 @@ impl VpBackend {
         Decision::done(sealed_result)
     }
 
+    #[allow(clippy::too_many_arguments)] // the signature mirrors the response's own shape
     async fn on_zkp_response(
         &self,
         id: &str,
@@ -1943,7 +1943,13 @@ impl VpBackend {
         jwe: &str,
         requester: Option<String>,
         now: i64,
+        timings: &mut ResponseTimings,
     ) -> Result<Decision> {
+        // Phase one - decrypt, parse, exchange setup - is crypto; the trust
+        // loop below is the PDP round-trip, and the native finish after it
+        // is crypto again. Timing them apart keeps a slow trust endpoint
+        // from reading as slow proof verification.
+        let _phase_one_timer = StepTimer::start(&mut timings.crypto_ms);
         let opened = match oid4vp::open_response(session, jwe, now) {
             Ok(o) => o,
             Err(e) => {
@@ -1994,13 +2000,21 @@ impl VpBackend {
             Ok(p) => p,
             Err(e) => return self.zkp_failure(&e),
         };
+        drop(_phase_one_timer);
         let mut verdicts = Vec::new();
         for queries in pending.trust_queries() {
             let mut per = Vec::with_capacity(queries.len());
             for q in queries {
+                let _now_timer = StepTimer::start(&mut timings.trust_ms);
                 let now_ok = self.gate.permits(&q.now.to_authzen(), now).await;
+                drop(_now_timer);
                 let at_expiry = match &q.at_expiry {
-                    Some(x) => Some(self.gate.permits(&x.to_authzen(), now).await),
+                    Some(x) => {
+                        let _expiry_timer = StepTimer::start(&mut timings.trust_ms);
+                        let permitted = self.gate.permits(&x.to_authzen(), now).await;
+                        drop(_expiry_timer);
+                        Some(permitted)
+                    }
                     None => None,
                 };
                 match (now_ok, at_expiry) {
@@ -2036,6 +2050,7 @@ impl VpBackend {
         // the cap. The bounded parse and decrypt of phase one stay inline:
         // they make no native calls and are already bounded by the body
         // limits.
+        let _native_timer = StepTimer::start(&mut timings.crypto_ms);
         let crypto_permit = match self.crypto_permits.clone().acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => {
@@ -2054,6 +2069,7 @@ impl VpBackend {
                 return Decision::failed("verifier_error", Response::text(500, "verifier error"));
             }
         };
+        drop(_native_timer);
         let Some(first) = verified.first() else {
             return Decision::failed("no_presentation", Response::text(400, "no presentation"));
         };
