@@ -15,6 +15,9 @@ fn session() -> siros_verifier_core::oid4vp::Session {
         ttl_secs: 300,
         vp_formats_supported: None,
         client_id: None,
+
+        verifier_info: None,
+        wrprc: None,
     };
     create_request(&cfg, &signer, "ES256", &[cert], NOW)
         .unwrap()

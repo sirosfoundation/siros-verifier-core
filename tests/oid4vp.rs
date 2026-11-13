@@ -64,6 +64,9 @@ fn start(w: &World, q: Value) -> (String, Session) {
         ttl_secs: 300,
         vp_formats_supported: None,
         client_id: None,
+
+        verifier_info: None,
+        wrprc: None,
     };
     create_request(
         &cfg,
@@ -209,6 +212,9 @@ fn dc_api_uses_the_browser_origin_for_holder_binding() {
         ttl_secs: 300,
         vp_formats_supported: None,
         client_id: None,
+
+        verifier_info: None,
+        wrprc: None,
     };
     let origin = "https://verify.example";
     let (jar, session) = create_dc_api_request(
@@ -260,6 +266,9 @@ fn dc_api_origin_must_be_a_bare_http_origin() {
         ttl_secs: 300,
         vp_formats_supported: None,
         client_id: None,
+
+        verifier_info: None,
+        wrprc: None,
     };
     for origin in [
         "https://verify.example/path",
@@ -834,6 +843,9 @@ fn start_mdoc(w: &World, dc_api: bool) -> (String, Session) {
         ttl_secs: 300,
         vp_formats_supported: None,
         client_id: None,
+
+        verifier_info: None,
+        wrprc: None,
     };
     if dc_api {
         create_dc_api_request(
@@ -923,6 +935,9 @@ fn mixed_sd_jwt_and_mdoc_presentations_stay_distinct() {
         ttl_secs: 300,
         vp_formats_supported: None,
         client_id: None,
+
+        verifier_info: None,
+        wrprc: None,
     };
     let (jar, session) = create_request(
         &cfg,
@@ -983,6 +998,9 @@ fn mdoc_rejects_wrong_doctype_missing_claims_and_wrong_handover() {
         ttl_secs: 300,
         vp_formats_supported: None,
         client_id: None,
+
+        verifier_info: None,
+        wrprc: None,
     };
     let (_jar, wrong_session) = create_request(
         &cfg,
@@ -1022,6 +1040,9 @@ fn mdoc_rejects_missing_claim_and_remote_device_mac() {
         ttl_secs: 300,
         vp_formats_supported: None,
         client_id: None,
+
+        verifier_info: None,
+        wrprc: None,
     };
     let (_jar, session) = create_request(
         &cfg,
@@ -1079,6 +1100,9 @@ fn encrypted_response_metadata_matches_openid4vp_1_0() {
         ttl_secs: 300,
         vp_formats_supported: None,
         client_id: None,
+
+        verifier_info: None,
+        wrprc: None,
     };
     let (jar, _session) =
         create_request(&cfg, &signer, "ES256", &[w.verifier_cert], NOW).expect("the request arms");

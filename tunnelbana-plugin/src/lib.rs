@@ -2150,6 +2150,11 @@ impl Backend for VpBackend {
             ttl_secs: self.cfg.request_ttl_secs,
             vp_formats_supported: zkp.map(|z| z.vp_formats.clone()),
             client_id: zkp.map(|z| z.cfg.verifier_id.clone()),
+            // Increment 2 (#39) wires the EAAP members from the backend
+            // config; increment 1's carrier is the core's, unconfigured
+            // here — the pre-EAAP request shape is unchanged.
+            verifier_info: None,
+            wrprc: None,
         };
         let dc_api = request.requester.as_deref() == Some(ui::DC_API_REQUESTER);
         let (jar, session) = if dc_api {

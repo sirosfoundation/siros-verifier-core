@@ -27,6 +27,7 @@ pub mod status_list;
 pub mod testutil;
 pub mod trust;
 pub mod ts11;
+pub mod wrprc;
 
 pub use error::{Error, Result};
 
