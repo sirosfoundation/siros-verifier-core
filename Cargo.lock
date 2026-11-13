@@ -4966,6 +4966,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "tracing-subscriber",
  "tunnelbana-core",
  "url",
 ]

@@ -310,6 +310,61 @@ fn default_max_concurrent_verifications() -> usize {
 /// verification phase and finalized by the caller in a single bounded write,
 /// so a cancelled verification can never replace or duplicate a terminal
 /// outcome.
+/// The per-step wall-clock split of one wallet response, emitted as ONE
+/// structured log line when the response completes: the operational answer
+/// to "where did the time go", readable straight from the deployment's logs.
+/// Milliseconds; every field defaults to zero and is only written when its
+/// step actually ran, so early refusals show exactly which steps fired.
+#[derive(Default)]
+struct ResponseTimings {
+    claim_ms: u64,
+    admission_ms: u64,
+    unseal_ms: u64,
+    crypto_ms: u64,
+    trust_ms: u64,
+    status_ms: u64,
+    status_fetch_ms: u64,
+    finalize_ms: u64,
+}
+
+/// Elapsed whole milliseconds since the given instant.
+fn elapsed_ms(started: std::time::Instant) -> u64 {
+    started.elapsed().as_millis() as u64
+}
+
+/// A cancellation-safe step timer: the elapsed time lands in its field when
+/// the guard DROPS — normally when the step's scope ends, but also when the
+/// processing budget's timeout cancels the whole future, so a deadline
+/// failure still shows which step was the bottleneck. Errors that return
+/// early from the step are covered by the same drop.
+struct StepTimer<'a> {
+    started: std::time::Instant,
+    record: &'a mut u64,
+}
+
+impl<'a> StepTimer<'a> {
+    fn start(record: &'a mut u64) -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            record,
+        }
+    }
+}
+
+impl Drop for StepTimer<'_> {
+    fn drop(&mut self) {
+        *self.record += elapsed_ms(self.started);
+    }
+}
+
+/// What the terminal write actually achieved: the decision's own response
+/// and refusal code stand only when the outcome persisted as decided.
+enum FinalizeOutcome {
+    Persisted,
+    Conflict,
+    StoreError,
+}
+
 struct Decision {
     outcome: TerminalOutcome,
     response: Response,
@@ -1367,23 +1422,56 @@ impl VpBackend {
         Ok(())
     }
 
+    /// The completion event for a response that never got past the store
+    /// claim: the claim's own cost is the whole story, later steps are zero,
+    /// and the flow is never finalized (the claim was not acquired).
+    fn claim_refusal(
+        id: &str,
+        code: &str,
+        started: std::time::Instant,
+        timings: &ResponseTimings,
+        response: Response,
+    ) -> Response {
+        tracing::info!(
+            flow = %id,
+            result = code,
+            total_ms = elapsed_ms(started),
+            claim_ms = timings.claim_ms,
+            admission_ms = timings.admission_ms,
+            unseal_ms = timings.unseal_ms,
+            crypto_ms = timings.crypto_ms,
+            trust_ms = timings.trust_ms,
+            status_ms = timings.status_ms,
+            status_fetch_ms = timings.status_fetch_ms,
+            finalize_ms = timings.finalize_ms,
+            "wallet response processed"
+        );
+        response
+    }
+
     async fn finish_response(
         &self,
         id: &str,
         claim_id: &str,
         outcome: TerminalOutcome,
         response: Response,
-    ) -> Result<Response> {
+    ) -> Result<(Response, FinalizeOutcome)> {
         match self
             .store
             .finish(id, (self.clock)(), claim_id, outcome)
             .await
         {
-            Ok(FinishResult::Finished) => Ok(response),
-            Ok(FinishResult::Conflict) => Ok(Response::text(409, "flow completion conflict")),
+            Ok(FinishResult::Finished) => Ok((response, FinalizeOutcome::Persisted)),
+            Ok(FinishResult::Conflict) => Ok((
+                Response::text(409, "flow completion conflict"),
+                FinalizeOutcome::Conflict,
+            )),
             Err(e) => {
                 tracing::error!(error = %e, flow = %id, "flow store finish failed");
-                Ok(Response::text(503, "flow store unavailable"))
+                Ok((
+                    Response::text(503, "flow store unavailable"),
+                    FinalizeOutcome::StoreError,
+                ))
             }
         }
     }
@@ -1415,6 +1503,8 @@ impl VpBackend {
         &self,
         verified: &CryptoVerified,
         now: i64,
+        status_fetch_ms: &mut u64,
+        trust_ms: &mut u64,
     ) -> std::result::Result<(), StatusListRefusal> {
         let Some(reference) = &verified.status else {
             return Ok(());
@@ -1426,6 +1516,7 @@ impl VpBackend {
                 description: "this verifier has no status list endpoint configured".into(),
             });
         };
+        let _fetch_timer = StepTimer::start(status_fetch_ms);
         let token = client.fetch(&reference.uri).await.map_err(|e| {
             // The URI (which may carry a per-credential identifier) belongs in
             // the operator's log, never in a client-visible description.
@@ -1436,6 +1527,7 @@ impl VpBackend {
                 description: "the credential's status list could not be fetched".into(),
             }
         })?;
+        drop(_fetch_timer);
         let resolver = StatusListKeyResolver {
             source: self.cfg.status_list_key_source,
         };
@@ -1459,7 +1551,13 @@ impl VpBackend {
                 }
             })?;
         let query = TrustQuery::for_issuer(&token.issuer, "status-list-signer", "status-list");
-        match self.gate.permits(&query.to_authzen(), now).await {
+        // The signer's trust evaluation is a PDP round-trip like every
+        // other: it accumulates into trust_ms as well, or a slow go-trust
+        // hides inside status_ms and the trust total understates it.
+        let _signer_trust_timer = StepTimer::start(trust_ms);
+        let permitted = self.gate.permits(&query.to_authzen(), now).await;
+        drop(_signer_trust_timer);
+        match permitted {
             Ok(true) => {}
             Ok(false) => {
                 return Err(StatusListRefusal {
@@ -1497,20 +1595,61 @@ impl VpBackend {
         }
         let now = (self.clock)();
         let claim_id = new_flow_id();
+        let claim_started = std::time::Instant::now();
+        // The timings exist BEFORE the claim: a slow claim that fails is a
+        // latency story too, and its refusal emits the same completion
+        // event with the claim's own cost and every later step at zero.
+        let mut timings = ResponseTimings::default();
+        let _claim_timer = StepTimer::start(&mut timings.claim_ms);
         let flow = match self
             .store
             .claim(&id, now, &claim_id, self.cfg.processing_lease_secs)
             .await
         {
-            Ok(ClaimResult::Claimed(flow)) => *flow,
-            Ok(ClaimResult::Unknown) => return Ok(Response::text(404, "unknown flow")),
-            Ok(ClaimResult::Expired) => return Ok(Response::text(400, "expired flow")),
+            Ok(ClaimResult::Claimed(flow)) => {
+                drop(_claim_timer);
+                *flow
+            }
+            Ok(ClaimResult::Unknown) => {
+                drop(_claim_timer);
+                return Ok(Self::claim_refusal(
+                    &id,
+                    "unknown_flow",
+                    claim_started,
+                    &timings,
+                    Response::text(404, "unknown flow"),
+                ));
+            }
+            Ok(ClaimResult::Expired) => {
+                drop(_claim_timer);
+                return Ok(Self::claim_refusal(
+                    &id,
+                    "expired_flow",
+                    claim_started,
+                    &timings,
+                    Response::text(400, "expired flow"),
+                ));
+            }
             Ok(ClaimResult::Replay) => {
-                return Ok(Response::text(409, "response already received"));
+                drop(_claim_timer);
+                return Ok(Self::claim_refusal(
+                    &id,
+                    "duplicate_response",
+                    claim_started,
+                    &timings,
+                    Response::text(409, "response already received"),
+                ));
             }
             Err(e) => {
+                drop(_claim_timer);
                 tracing::error!(error = %e, flow = %id, "flow store claim failed");
-                return Ok(Response::text(503, "flow store unavailable"));
+                return Ok(Self::claim_refusal(
+                    &id,
+                    "claim_store_error",
+                    claim_started,
+                    &timings,
+                    Response::text(503, "flow store unavailable"),
+                ));
             }
         };
         // The budget never takes more of the lease than leaves room to
@@ -1531,8 +1670,11 @@ impl VpBackend {
         let decided = if budget <= 0 {
             Self::deadline_decision()?
         } else {
-            match tokio::time::timeout(deadline, self.process_claim(ctx, id.clone(), now, flow))
-                .await
+            match tokio::time::timeout(
+                deadline,
+                self.process_claim(ctx, id.clone(), now, flow, &mut timings),
+            )
+            .await
             {
                 Ok(decided) => decided?,
                 Err(_) => Self::deadline_decision()?,
@@ -1555,8 +1697,44 @@ impl VpBackend {
         // Single bounded terminal write, outside the cancellable verification
         // phase: a cancelled verification can never replace or duplicate a
         // committed terminal outcome.
-        self.finish_response(&id, &claim_id, decision.outcome, decision.response)
-            .await
+        let decision_code = match &decision.outcome {
+            TerminalOutcome::Done(_) => "ok".to_owned(),
+            TerminalOutcome::Failed { code, .. } => code.clone(),
+        };
+        let finalize_started = std::time::Instant::now();
+        let finished = self
+            .finish_response(&id, &claim_id, decision.outcome, decision.response)
+            .await;
+        timings.finalize_ms = elapsed_ms(finalize_started);
+        // The logged result is what the WALLET actually received: the
+        // decision's own code when the outcome persisted, the finalization
+        // failure when the terminal write replaced it.
+        let result_code = match &finished {
+            Ok((_, FinalizeOutcome::Persisted)) => decision_code,
+            Ok((_, FinalizeOutcome::Conflict)) => "finalize_conflict".to_owned(),
+            Ok((_, FinalizeOutcome::StoreError)) => "finalize_store_error".to_owned(),
+            Err(_) => "finalize_error".to_owned(),
+        };
+        // One line per presentation, with the full step split: the drill
+        // logs answer "where did the time go" without any extra tooling.
+        // The total spans the whole POST, the store claim included — the
+        // wallet waits for that too. (`started`, the deadline clock, is
+        // unchanged: the budget governs verification, not the claim.)
+        tracing::info!(
+            flow = %id,
+            result = result_code,
+            total_ms = elapsed_ms(claim_started),
+            claim_ms = timings.claim_ms,
+            admission_ms = timings.admission_ms,
+            unseal_ms = timings.unseal_ms,
+            crypto_ms = timings.crypto_ms,
+            trust_ms = timings.trust_ms,
+            status_ms = timings.status_ms,
+            status_fetch_ms = timings.status_fetch_ms,
+            finalize_ms = timings.finalize_ms,
+            "wallet response processed"
+        );
+        finished.map(|(response, _)| response)
     }
 
     /// Decide the terminal outcome for one claimed wallet response without
@@ -1568,6 +1746,7 @@ impl VpBackend {
         id: String,
         now: i64,
         flow: Flow,
+        timings: &mut ResponseTimings,
     ) -> Result<Decision> {
         let Flow {
             sealed_session,
@@ -1583,12 +1762,15 @@ impl VpBackend {
         // so sustained overload cannot accumulate unbounded verification
         // work. The millisecond crypto job a dropped caller leaves on the
         // blocking pool is bounded by that pool.
+        let _admission_timer = StepTimer::start(&mut timings.admission_ms);
         let _admission = match self.verification_permits.clone().acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => {
                 return Decision::failed("verifier_error", Response::text(500, "verifier error"));
             }
         };
+        drop(_admission_timer);
+        let _unseal_timer = StepTimer::start(&mut timings.unseal_ms);
         let session = match self.sealer.unseal(&sealed_session, id.as_bytes()) {
             Ok(s) => s,
             Err(e) => {
@@ -1598,6 +1780,7 @@ impl VpBackend {
                 );
             }
         };
+        drop(_unseal_timer);
         // RFC 6749 section 3.1 prohibits repeated request/response parameters.
         // The HTTP adapter preserves form pairs so this boundary must not
         // silently accept a last-write-wins interpretation.
@@ -1621,8 +1804,12 @@ impl VpBackend {
             let Some(z) = &self.zkp else {
                 return Decision::failed("verifier_error", Response::text(500, "verifier error"));
             };
+            // The handler times its own phases: decrypt/parse and the
+            // native verification land in crypto_ms, the trust evaluations
+            // in trust_ms - a slow PDP must not read as slow proof
+            // verification.
             return self
-                .on_zkp_response(&id, z, &session, &jwe, requester, now)
+                .on_zkp_response(&id, z, &session, &jwe, requester, now, timings)
                 .await;
         }
         // Synchronous cryptographic verification runs on the blocking pool so
@@ -1630,6 +1817,11 @@ impl VpBackend {
         // permit moves into the job and is held until the job finishes —
         // even a caller-abandoned job keeps its slot, so neither the
         // running set nor the pool's queue can exceed the cap.
+        // The guard spans the blocking-pool acquire AND the verification
+        // job, and records through its DROP: an expensive verification that
+        // fails still shows its cost, and a cancellation still shows where
+        // the budget went.
+        let _crypto_timer = StepTimer::start(&mut timings.crypto_ms);
         let crypto_permit = match self.crypto_permits.clone().acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => {
@@ -1650,6 +1842,7 @@ impl VpBackend {
                 return Decision::failed("verifier_error", Response::text(500, "verifier error"));
             }
         };
+        drop(_crypto_timer);
         // Every presented credential's issuer must be trusted; a single denial fails the flow.
         if verified.is_empty() {
             return Decision::failed("no_presentation", Response::text(400, "no presentation"));
@@ -1670,7 +1863,10 @@ impl VpBackend {
                 .verified
                 .trust_query(&self.cfg.role, &self.cfg.mdoc_role)
                 .to_authzen();
-            match self.gate.permits(&q, now).await {
+            let _trust_timer = StepTimer::start(&mut timings.trust_ms);
+            let permitted = self.gate.permits(&q, now).await;
+            drop(_trust_timer);
+            match permitted {
                 Ok(true) => {}
                 Ok(false) => {
                     return Decision::failed(
@@ -1687,7 +1883,17 @@ impl VpBackend {
                 }
             }
             if let oid4vp::VerifiedCredential::SdJwt(credential) = &p.verified {
-                if let Err(refusal) = self.check_sd_jwt_status(credential, now).await {
+                let _status_timer = StepTimer::start(&mut timings.status_ms);
+                let status_result = self
+                    .check_sd_jwt_status(
+                        credential,
+                        now,
+                        &mut timings.status_fetch_ms,
+                        &mut timings.trust_ms,
+                    )
+                    .await;
+                drop(_status_timer);
+                if let Err(refusal) = status_result {
                     return Decision::failed(
                         refusal.code,
                         Response::text(refusal.status, &refusal.description),
@@ -1728,6 +1934,7 @@ impl VpBackend {
         Decision::done(sealed_result)
     }
 
+    #[allow(clippy::too_many_arguments)] // the signature mirrors the response's own shape
     async fn on_zkp_response(
         &self,
         id: &str,
@@ -1736,7 +1943,13 @@ impl VpBackend {
         jwe: &str,
         requester: Option<String>,
         now: i64,
+        timings: &mut ResponseTimings,
     ) -> Result<Decision> {
+        // Phase one - decrypt, parse, exchange setup - is crypto; the trust
+        // loop below is the PDP round-trip, and the native finish after it
+        // is crypto again. Timing them apart keeps a slow trust endpoint
+        // from reading as slow proof verification.
+        let _phase_one_timer = StepTimer::start(&mut timings.crypto_ms);
         let opened = match oid4vp::open_response(session, jwe, now) {
             Ok(o) => o,
             Err(e) => {
@@ -1787,13 +2000,21 @@ impl VpBackend {
             Ok(p) => p,
             Err(e) => return self.zkp_failure(&e),
         };
+        drop(_phase_one_timer);
         let mut verdicts = Vec::new();
         for queries in pending.trust_queries() {
             let mut per = Vec::with_capacity(queries.len());
             for q in queries {
+                let _now_timer = StepTimer::start(&mut timings.trust_ms);
                 let now_ok = self.gate.permits(&q.now.to_authzen(), now).await;
+                drop(_now_timer);
                 let at_expiry = match &q.at_expiry {
-                    Some(x) => Some(self.gate.permits(&x.to_authzen(), now).await),
+                    Some(x) => {
+                        let _expiry_timer = StepTimer::start(&mut timings.trust_ms);
+                        let permitted = self.gate.permits(&x.to_authzen(), now).await;
+                        drop(_expiry_timer);
+                        Some(permitted)
+                    }
                     None => None,
                 };
                 match (now_ok, at_expiry) {
@@ -1829,6 +2050,7 @@ impl VpBackend {
         // the cap. The bounded parse and decrypt of phase one stay inline:
         // they make no native calls and are already bounded by the body
         // limits.
+        let _native_timer = StepTimer::start(&mut timings.crypto_ms);
         let crypto_permit = match self.crypto_permits.clone().acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => {
@@ -1847,6 +2069,7 @@ impl VpBackend {
                 return Decision::failed("verifier_error", Response::text(500, "verifier error"));
             }
         };
+        drop(_native_timer);
         let Some(first) = verified.first() else {
             return Decision::failed("no_presentation", Response::text(400, "no presentation"));
         };
