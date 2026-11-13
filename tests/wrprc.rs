@@ -252,6 +252,37 @@ fn the_wrprc_payload_is_held_to_table_7() {
             .contains("wrprc_credentials_claim_path_missing"),
         "{error}"
     );
+    // The URI-valued members are RFC 3986 URIs, not just non-empty strings.
+    let mut claims = register_claims();
+    claims["registry_uri"] = json!("not a URI");
+    let error = parse_wrprc(&mint_wrprc(&claims), NOW).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("wrprc_registry_uri_not_valid_uri"),
+        "{error}"
+    );
+    let mut claims = register_claims();
+    claims["privacy_policy"] = json!("https://example.com/%zz");
+    let error = parse_wrprc(&mint_wrprc(&claims), NOW).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("wrprc_privacy_policy_not_valid_uri"),
+        "{error}"
+    );
+    let mut claims = register_claims();
+    claims["info_uri"] = json!("not a URI");
+    let error = parse_wrprc(&mint_wrprc(&claims), NOW).unwrap_err();
+    assert!(
+        error.to_string().contains("wrprc_info_uri_not_valid_uri"),
+        "{error}"
+    );
+    // The sub stays a plain string: it is the B.2.2 registered identifier
+    // (URN-shaped), not a URI-schemed reference.
+    let mut claims = register_claims();
+    claims["sub"] = json!("urn:glas:se:registrar:5561234567");
+    parse_wrprc(&mint_wrprc(&claims), NOW).expect("the URN-shaped sub parses");
     // The registrar's own shapes, held: the nested srv_description groups,
     // the string-array policy_id, the status object.
     let mut claims = register_claims();

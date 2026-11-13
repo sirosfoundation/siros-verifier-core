@@ -152,13 +152,28 @@ pub fn parse_wrprc(token: &str, now: i64) -> Result<Wrprc> {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| malformed(format!("wrprc_missing_{name}")))
     };
+    // The URI-valued members: the same RFC 3986 check the status
+    // reference applies. `sub` stays a non-empty string — it is the B.2.2
+    // registered identifier (URN-shaped in the registrar's output), not a
+    // URI-schemed reference.
+    let require_uri = |name: &str| -> Result<()> {
+        let uri = claims
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| malformed(format!("wrprc_missing_{name}")))?;
+        if !crate::sdjwt::status_uri_is_valid(uri) {
+            return Err(malformed(format!("wrprc_{name}_not_valid_uri")));
+        }
+        Ok(())
+    };
     // GEN-5.2.4-02 / Table 7 NOTE 2: the subject is the registered — and
     // always the FINAL — relying party, never the presenting intermediary.
     let _ = require_string("sub")?;
     // Table 7: `registry_uri` (the national registry API) and
     // `privacy_policy` (B.2.8) are the wallet's user-facing anchors.
-    let _ = require_string("registry_uri")?;
-    let _ = require_string("privacy_policy")?;
+    require_uri("registry_uri")?;
+    require_uri("privacy_policy")?;
     // GEN-5.2.4-01/-03: at least one entitlement, each a clause A.2
     // identifier string — and each NON-EMPTY: an empty identifier is not a
     // registered entitlement.
@@ -226,18 +241,21 @@ pub fn parse_wrprc(token: &str, now: i64) -> Result<Wrprc> {
     // the producer's (siros-wrpac-tool's claims.go, the pinned registrar):
     // `policy_id` an array of strings, `status` the TSL-pointing object
     // ({status_list: {idx, uri}}), the person names and URIs plain strings.
-    for name in [
-        "country",
-        "sub_ln",
-        "sub_gn",
-        "sub_fn",
-        "info_uri",
-        "support_uri",
-        "certificate_policy",
-    ] {
+    for name in ["country", "sub_ln", "sub_gn", "sub_fn"] {
         if let Some(value) = claims.get(name) {
             if !value.is_string() {
                 return Err(malformed(format!("wrprc_{name}_not_string")));
+            }
+        }
+    }
+    // The URI-valued optionals: the same RFC 3986 check.
+    for name in ["info_uri", "support_uri", "certificate_policy"] {
+        if let Some(value) = claims.get(name) {
+            let uri = value
+                .as_str()
+                .ok_or_else(|| malformed(format!("wrprc_{name}_not_string")))?;
+            if !crate::sdjwt::status_uri_is_valid(uri) {
+                return Err(malformed(format!("wrprc_{name}_not_valid_uri")));
             }
         }
     }
