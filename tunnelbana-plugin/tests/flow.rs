@@ -1,7 +1,7 @@
 //! End-to-end flows through the tunnelbana Backend interface: browser start, wallet fetches the request object,
 //! wallet posts the encrypted response, browser collects the result. The wallet is simulated; go-trust is mocked.
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 mod common;
@@ -41,6 +41,8 @@ struct MockPdp {
     /// Answer as go-trust's always-trusted registry does (captured
     /// REAL_ALWAYS_TRUSTED): id, reason, and timestamp-less trust_data.
     go_trust_always_trusted: AtomicBool,
+    /// The artificial answer delay, for the telemetry tests.
+    delay_ms: AtomicU64,
     /// Accept the request and never answer, like a stalled endpoint.
     stall: AtomicBool,
 }
@@ -48,6 +50,10 @@ struct MockPdp {
 impl PdpClient for MockPdp {
     async fn evaluate(&self, req: &Value) -> Result<Value, String> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        let delay_ms = self.delay_ms.load(Ordering::SeqCst);
+        if delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
         if self.stall.load(Ordering::SeqCst) {
             std::future::pending::<()>().await;
         }
@@ -248,6 +254,22 @@ fn mock_pdp(next_update_in: i64, stall: bool) -> Arc<MockPdp> {
         go_trust_today: AtomicBool::new(false),
         go_trust_always_trusted: AtomicBool::new(false),
         stall: AtomicBool::new(stall),
+        delay_ms: AtomicU64::new(0),
+    })
+}
+
+/// A mock go-trust that delays its answer by the given milliseconds: the
+/// telemetry tests assert the wait lands in the trust column.
+fn mock_pdp_delayed(delay_ms: u64, permit: bool) -> Arc<MockPdp> {
+    Arc::new(MockPdp {
+        permit: AtomicBool::new(permit),
+        down: AtomicBool::new(false),
+        calls: AtomicUsize::new(0),
+        next_update_in: 100_000,
+        go_trust_today: AtomicBool::new(false),
+        go_trust_always_trusted: AtomicBool::new(false),
+        stall: AtomicBool::new(false),
+        delay_ms: AtomicU64::new(delay_ms),
     })
 }
 
@@ -2556,4 +2578,133 @@ async fn local_conformance_client_dials_private_literal_addresses() {
     drop(socket);
     let error = request.await.unwrap().unwrap_err();
     assert_ne!(error, "status_list_no_public_address");
+}
+
+// ---- the response telemetry -------------------------------------------------
+//
+// The completion event's SCHEMA is asserted in the service's binary e2e; these
+// tests pin the RECORDING: a controlled wait must land in its column, on the
+// completion, failure, and deadline-cancellation paths — an always-zero
+// recorder would fail them.
+
+/// The global log capture: every test's completion events land here, and each
+/// test filters its own flow id out of the stream.
+static LOG: std::sync::OnceLock<std::sync::Mutex<Vec<u8>>> = std::sync::OnceLock::new();
+
+fn log_buffer() -> &'static std::sync::Mutex<Vec<u8>> {
+    let log = LOG.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INIT.get_or_init(|| {
+        struct SharedWriter(&'static std::sync::Mutex<Vec<u8>>);
+        impl std::io::Write for SharedWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        struct MakeShared;
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for MakeShared {
+            type Writer = SharedWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                SharedWriter(LOG.get_or_init(|| std::sync::Mutex::new(Vec::new())))
+            }
+        }
+        tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(MakeShared)
+            .init();
+    });
+    log
+}
+
+/// The completion event for one flow, parsed from the captured log.
+fn completion_event(flow_id: &str) -> serde_json::Value {
+    let log = log_buffer().lock().unwrap();
+    let text = String::from_utf8_lossy(&log).into_owned();
+    let events: Vec<serde_json::Value> = text
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .filter(|entry: &serde_json::Value| {
+            let fields = entry.get("fields").cloned().unwrap_or_default();
+            fields.get("message").and_then(|m| m.as_str()) == Some("wallet response processed")
+                && fields.get("flow").and_then(|f| f.as_str()) == Some(flow_id)
+        })
+        .collect();
+    assert_eq!(
+        events.len(),
+        1,
+        "exactly one completion event for {flow_id}"
+    );
+    events[0].get("fields").cloned().expect("the event fields")
+}
+
+#[tokio::test]
+async fn telemetry_records_the_trust_wait() {
+    log_buffer(); // the subscriber must exist before the flow emits
+                  // A go-trust that takes 80ms to answer: the wait must land in trust_ms on
+                  // the COMPLETION path, not as an always-zero field.
+    let cfg = pid_cfg("/family_name", "get", None, 16);
+    let f = assemble(cfg, mock_pdp_delayed(80, true), pid_parts());
+    let (state, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    let (st, body) = post(&f, &id, &wallet(&f, &jar)).await;
+    assert_eq!(st, 200, "{body}");
+    assert!(matches!(
+        complete(&f, &state).await.unwrap(),
+        BackendAction::AuthResponse(_)
+    ));
+    let event = completion_event(&id);
+    assert_eq!(event["result"], "ok");
+    let trust_ms = event["trust_ms"].as_u64().expect("numeric");
+    assert!(
+        trust_ms >= 30,
+        "the 80ms PDP wait must be recorded, got {trust_ms}"
+    );
+    let total_ms = event["total_ms"].as_u64().expect("numeric");
+    assert!(total_ms >= trust_ms, "the total spans the trust wait");
+}
+
+#[tokio::test]
+async fn telemetry_records_the_wait_behind_a_refusal() {
+    log_buffer(); // the subscriber must exist before the flow emits
+                  // The same 80ms PDP, but it DENIES: the flow fails with issuer_not_trusted
+                  // and the wait is still recorded — the refusal's latency story is exactly
+                  // the one an operator needs.
+    let cfg = pid_cfg("/family_name", "get", None, 16);
+    let f = assemble(cfg, mock_pdp_delayed(80, false), pid_parts());
+    let (_state, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    let (st, body) = post(&f, &id, &wallet(&f, &jar)).await;
+    assert_eq!(st, 403, "{body}");
+    let event = completion_event(&id);
+    assert_eq!(event["result"], "issuer_not_trusted");
+    let trust_ms = event["trust_ms"].as_u64().expect("numeric");
+    assert!(
+        trust_ms >= 30,
+        "the wait behind the refusal must be recorded, got {trust_ms}"
+    );
+}
+
+#[tokio::test]
+async fn telemetry_records_the_deadline_cancellation() {
+    log_buffer(); // the subscriber must exist before the flow emits
+                  // A PDP that never answers and a one-second budget: the deadline cancels
+                  // the verification mid-trust-evaluation, and the drop-based timer still
+                  // records the wait that held the budget.
+    let f = fx_stalled(1);
+    let (_state, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    let (st, body) = post(&f, &id, &wallet(&f, &jar)).await;
+    assert_eq!(st, 504, "{body}");
+    let event = completion_event(&id);
+    assert_eq!(event["result"], "processing_deadline");
+    let trust_ms = event["trust_ms"].as_u64().expect("numeric");
+    assert!(
+        trust_ms >= 500,
+        "the cancelled trust wait must be recorded, got {trust_ms}"
+    );
 }
