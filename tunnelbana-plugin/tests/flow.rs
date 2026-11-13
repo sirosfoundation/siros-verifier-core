@@ -769,8 +769,50 @@ async fn an_intermediary_configured_backend_arms_the_verifier_info_members() {
     cfg.wrprc = Some(wrprc.clone());
     cfg.verifier_info = Some(dataset);
     let f = assemble(cfg, mock_pdp(100_000, false), pid_parts());
+    // The armed request carries the verifier_info members — the wired data,
+    // not just a parseable request. Decoding the request object and
+    // asserting the registrar_dataset element's members and the byte-exact
+    // registration_cert catches a revert of the wiring to None.
     let (state, id) = start(&f).await;
     let jar = fetch_jar(&f, &id).await;
+    let request_payload: Value = {
+        use base64::Engine;
+        let segment = jar.split('.').nth(1).unwrap_or_default();
+        serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(segment)
+                .unwrap_or_default(),
+        )
+        .unwrap_or(Value::Null)
+    };
+    let verifier_info = request_payload["verifier_info"]
+        .as_array()
+        .expect("the armed request carries verifier_info");
+    let dataset_element = verifier_info
+        .iter()
+        .find(|e| e["format"] == "registrar_dataset")
+        .expect("the registrar_dataset element");
+    assert_eq!(
+        dataset_element["data"]["intendedUseIdentifier"],
+        "urn:registrar:use:1"
+    );
+    let registration_element = verifier_info
+        .iter()
+        .find(|e| e["format"] == "registration_cert")
+        .expect("the registration_cert element");
+    let registration_data = registration_element["data"].as_str().unwrap();
+    let decoded = {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(registration_data)
+            .expect("base64url")
+    };
+    assert_eq!(
+        String::from_utf8(decoded).unwrap(),
+        wrprc,
+        "the registration_cert data is the byte-exact WRPRC"
+    );
+
     let (st, body) = post(&f, &id, &wallet(&f, &jar)).await;
     assert_eq!(st, 200, "{body}");
     assert!(matches!(

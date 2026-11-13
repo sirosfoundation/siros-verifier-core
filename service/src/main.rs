@@ -368,6 +368,17 @@ async fn build_openid4vp_backend(
         }
         None => None,
     };
+    // The deployment surface is PATH-ONLY: the DeploymentConfig flattens
+    // VpBackendConfig, so an inline `wrprc` or `verifier_info` member in
+    // the config file would be accepted by the deserializer and then
+    // silently discarded here (both overwritten from the file paths). Fail
+    // loudly instead — the operator meant to configure the intermediary.
+    if deployment.vp.wrprc.is_some() {
+        bail!("inline `wrprc` is not supported on the deployment config; use `wrprc_path`");
+    }
+    if deployment.vp.verifier_info.is_some() {
+        bail!("inline `verifier_info` is not supported on the deployment config; use `verifier_info_path`");
+    }
     let mut vp_config = deployment.vp.clone();
     vp_config.wrprc = wrprc;
     vp_config.verifier_info = verifier_info;
