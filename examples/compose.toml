@@ -73,6 +73,15 @@ name = "vp"
   # Token Status List tokens among them) commonly embed the signer as a jwk
   # with no chain, which "x5c" refuses.
   status_list_key_source = "x5c-or-jwk"
+  # Increment 2 (#39) — the intermediary deployment shape. UNCOMMENT TO RUN
+  # AS AN INTERMEDIARY: point the request-signing paths above at the
+  # intermediary's own WRPAC key + chain (the X.509 access certificate per
+  # ETSI TS 119 411-8 — the request is signed by the INTERMEDIARY, while the
+  # members below speak for the FRONTED RP), and provide the fronted RP's
+  # registration certificate + the registrar's B.2 dataset. With both
+  # absent (the default here), the request is the pre-EAAP shape.
+  # wrprc_path = "/run/secrets/fronted_rp_wrprc.jwt"
+  # verifier_info_path = "/run/secrets/fronted_rp_registrar_dataset.json"
   request_ttl_secs = 300
   subject_pointer = "/personal_administrative_number"
   dcql = { credentials = [{

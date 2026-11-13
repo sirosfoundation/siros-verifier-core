@@ -72,6 +72,25 @@ SD-JWT `status.status_list` references are fetched over HTTPS with a 5-second ti
 
 The default is `request_uri_method = "get"`. Set `request_uri_method = "post"` for wallets that require POST retrieval. The wallet supplies `wallet_nonce` in its form POST; the service echoes it in a re-signed request object and requires exactly one valid field. Missing, duplicate, unknown, or malformed fields are refused. GET retrieval remains unchanged and is always available alongside POST retrieval.
 
+## The intermediary deployment (WRPRC + WRPAC)
+
+```toml
+[backend.config]
+# The request-signing paths point at the INTERMEDIARY's WRPAC — the X.509
+# access certificate per ETSI TS 119 411-8.
+request_signing_key_path = "/run/secrets/intermediary_wrpac_key.pem"
+request_certificate_chain_path = "/run/secrets/intermediary_wrpac_chain.pem"
+# The fronted relying party's registration certificate and the registrar's
+# dataset. Relative paths resolve against the config file's directory, like
+# every other file member.
+wrprc_path = "/run/secrets/fronted_rp_wrprc.jwt"
+verifier_info_path = "/run/secrets/fronted_rp_registrar_dataset.json"
+```
+
+A deployment that fronts a relying party — an intermediary in ETSI TS 119 475's model — arms every request with the ETSI TS 119 472-2 §6.3.2.2 `verifier_info` members: the `registration_cert` element (the serialized `rc-wrp+jwt` WRPRC of the FRONTED relying party, byte-exact from `wrprc_path`) and the `registrar_dataset` element (the B.2 members from `verifier_info_path`). The request object itself is still signed by the deployment's request-signing key, which for an intermediary is its own WRPAC per ETSI TS 119 411-8: the request speaks with the intermediary's certificate while the two members speak for the fronted relying party. With both members absent — the default — the request is the pre-EAAP shape the certified OIDF surface covers, byte-identical.
+
+Both files are loaded and validated once at startup, and a failure refuses the boot rather than the first request: the WRPRC must parse (the shape per TS 119 475 §5.2, signature consistency under the presented chain, and freshness at the boot's clock — a future-dated or already-expired file refuses), and the dataset must carry the B.2 members (the RO-01..16 requirements). An unreadable path, a malformed file, or an inline `wrprc`/`verifier_info` member — the deployment config is path-only, and inline members are rejected loudly instead of being silently discarded — each refuse the boot. The arm re-validates the WRPRC's freshness on every request, so a certificate that expires while the service runs fails new flows at initiation with the `wrprc_expired` refusal instead of degrading silently. Rotating the certificate therefore means replacing the file and restarting the service; a running service keeps serving the members it booted with.
+
 ## UI presets
 
 `frontend.config.presets` is an array of tables with `id`, `label`, and `dcql`. Registry-derived presets are merged by credential format and type; the registry's full claim list remains available for editing. Configure the requested claim subset for your deployment and include a subject claim—the first claim becomes the subject when no custom pointer is configured.
