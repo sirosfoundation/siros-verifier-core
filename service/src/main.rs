@@ -357,8 +357,12 @@ async fn build_openid4vp_backend(
                     .await
                     .with_context(|| "joining the verifier_info read task")?
                     .with_context(|| format!("reading registrar dataset {}", path.display()))?;
-            let dataset: serde_json::Value = serde_json::from_str(&dataset)
-                .with_context(|| format!("parsing registrar dataset {}", path.display()))?;
+            // The strict parse: duplicate members are ambiguous to
+            // different parsers — the same check every other attacker-
+            // controlled JSON input gets.
+            let dataset: serde_json::Value =
+                siros_verifier_core::json_strict::from_str(&dataset)
+                    .with_context(|| format!("parsing registrar dataset {}", path.display()))?;
             // Validate the B.2 members at startup — the same validation the
             // arm applies, caught before the boot completes.
             siros_verifier_core::wrprc::build_verifier_info(Some(&dataset), None)
