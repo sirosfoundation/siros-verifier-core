@@ -193,6 +193,16 @@ fn the_wrprc_payload_is_held_to_table_7() {
     claims["country"] = json!(42);
     let error = parse_wrprc(&mint_wrprc(&claims), NOW).unwrap_err();
     assert!(error.to_string().contains("wrprc_country_not_string"));
+    // Table 7: the supervisory authority's contact members are typed.
+    let mut claims = register_claims();
+    claims["supervisory_authority"] = json!({"email": 42});
+    let error = parse_wrprc(&mint_wrprc(&claims), NOW).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("wrprc_supervisory_authority_email_not_string"),
+        "{error}"
+    );
     // The registrar's own shapes, held: the nested srv_description groups,
     // the string-array policy_id, the status object.
     let mut claims = register_claims();
@@ -423,8 +433,20 @@ fn duplicate_header_members_and_malformed_dataset_entries_fail_the_arm() {
         let header_b64 = B64U.encode(header_json.as_bytes());
         format!("{header_b64}.{}.{}}}", parts[1], parts[2])
     };
+    // The SPECIFIC rejection: the strict parse's duplicate-member error,
+    // not any malformed reason — the json_strict kinds carry their own
+    // message shape, so the assertion pins the rejection to the duplicate.
     let error = parse_wrprc(&forged_header, NOW).unwrap_err();
     assert_eq!(error.code(), "malformed");
+    assert!(
+        !error.to_string().contains("wrprc_"),
+        "the rejection is the STRICT parse's, before any wrprc_* kind: {error}"
+    );
+    // The same bytes WITHOUT the duplicate member parse — proving the
+    // duplicate is what rejects, not the surrounding shape. The control
+    // is a token minted the same way as every other test token.
+    let clean = mint_wrprc(&register_claims());
+    parse_wrprc(&clean, NOW).expect("the clean token parses - only the duplicate rejects");
 
     // Copilot round 1: the B.2 arrays are validated per ENTRY, not just as
     // containers — [null] entries, missing identifier members, and

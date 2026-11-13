@@ -273,8 +273,19 @@ pub fn parse_wrprc(token: &str, now: i64) -> Result<Wrprc> {
         }
     }
     if let Some(authority) = claims.get("supervisory_authority") {
-        if !authority.is_object() {
-            return Err(malformed("wrprc_supervisory_authority_not_object"));
+        let object = authority
+            .as_object()
+            .ok_or_else(|| malformed("wrprc_supervisory_authority_not_object"))?;
+        // Table 7: the supervising Data Protection Authority — the contact
+        // members, each a string when present.
+        for name in ["email", "phone", "uri"] {
+            if let Some(value) = object.get(name) {
+                if !value.is_string() {
+                    return Err(malformed(format!(
+                        "wrprc_supervisory_authority_{name}_not_string"
+                    )));
+                }
+            }
         }
     }
     // Tables 8/9: the provider/service credential arrays — each entry a
