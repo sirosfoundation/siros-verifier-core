@@ -1422,6 +1422,33 @@ impl VpBackend {
         Ok(())
     }
 
+    /// The completion event for a response that never got past the store
+    /// claim: the claim's own cost is the whole story, later steps are zero,
+    /// and the flow is never finalized (the claim was not acquired).
+    fn claim_refusal(
+        id: &str,
+        code: &str,
+        started: std::time::Instant,
+        timings: &ResponseTimings,
+        response: Response,
+    ) -> Response {
+        tracing::info!(
+            flow = %id,
+            result = code,
+            total_ms = elapsed_ms(started),
+            claim_ms = timings.claim_ms,
+            admission_ms = timings.admission_ms,
+            unseal_ms = timings.unseal_ms,
+            crypto_ms = timings.crypto_ms,
+            trust_ms = timings.trust_ms,
+            status_ms = timings.status_ms,
+            status_fetch_ms = timings.status_fetch_ms,
+            finalize_ms = timings.finalize_ms,
+            "wallet response processed"
+        );
+        response
+    }
+
     async fn finish_response(
         &self,
         id: &str,
@@ -1477,6 +1504,7 @@ impl VpBackend {
         verified: &CryptoVerified,
         now: i64,
         status_fetch_ms: &mut u64,
+        trust_ms: &mut u64,
     ) -> std::result::Result<(), StatusListRefusal> {
         let Some(reference) = &verified.status else {
             return Ok(());
@@ -1523,7 +1551,13 @@ impl VpBackend {
                 }
             })?;
         let query = TrustQuery::for_issuer(&token.issuer, "status-list-signer", "status-list");
-        match self.gate.permits(&query.to_authzen(), now).await {
+        // The signer's trust evaluation is a PDP round-trip like every
+        // other: it accumulates into trust_ms as well, or a slow go-trust
+        // hides inside status_ms and the trust total understates it.
+        let _signer_trust_timer = StepTimer::start(trust_ms);
+        let permitted = self.gate.permits(&query.to_authzen(), now).await;
+        drop(_signer_trust_timer);
+        match permitted {
             Ok(true) => {}
             Ok(false) => {
                 return Err(StatusListRefusal {
@@ -1562,25 +1596,61 @@ impl VpBackend {
         let now = (self.clock)();
         let claim_id = new_flow_id();
         let claim_started = std::time::Instant::now();
+        // The timings exist BEFORE the claim: a slow claim that fails is a
+        // latency story too, and its refusal emits the same completion
+        // event with the claim's own cost and every later step at zero.
+        let mut timings = ResponseTimings::default();
+        let _claim_timer = StepTimer::start(&mut timings.claim_ms);
         let flow = match self
             .store
             .claim(&id, now, &claim_id, self.cfg.processing_lease_secs)
             .await
         {
-            Ok(ClaimResult::Claimed(flow)) => *flow,
-            Ok(ClaimResult::Unknown) => return Ok(Response::text(404, "unknown flow")),
-            Ok(ClaimResult::Expired) => return Ok(Response::text(400, "expired flow")),
+            Ok(ClaimResult::Claimed(flow)) => {
+                drop(_claim_timer);
+                *flow
+            }
+            Ok(ClaimResult::Unknown) => {
+                drop(_claim_timer);
+                return Ok(Self::claim_refusal(
+                    &id,
+                    "unknown_flow",
+                    claim_started,
+                    &timings,
+                    Response::text(404, "unknown flow"),
+                ));
+            }
+            Ok(ClaimResult::Expired) => {
+                drop(_claim_timer);
+                return Ok(Self::claim_refusal(
+                    &id,
+                    "expired_flow",
+                    claim_started,
+                    &timings,
+                    Response::text(400, "expired flow"),
+                ));
+            }
             Ok(ClaimResult::Replay) => {
-                return Ok(Response::text(409, "response already received"));
+                drop(_claim_timer);
+                return Ok(Self::claim_refusal(
+                    &id,
+                    "duplicate_response",
+                    claim_started,
+                    &timings,
+                    Response::text(409, "response already received"),
+                ));
             }
             Err(e) => {
+                drop(_claim_timer);
                 tracing::error!(error = %e, flow = %id, "flow store claim failed");
-                return Ok(Response::text(503, "flow store unavailable"));
+                return Ok(Self::claim_refusal(
+                    &id,
+                    "claim_store_error",
+                    claim_started,
+                    &timings,
+                    Response::text(503, "flow store unavailable"),
+                ));
             }
-        };
-        let mut timings = ResponseTimings {
-            claim_ms: elapsed_ms(claim_started),
-            ..Default::default()
         };
         // The budget never takes more of the lease than leaves room to
         // persist the terminal outcome while this claim is still held; a
@@ -1816,7 +1886,12 @@ impl VpBackend {
             if let oid4vp::VerifiedCredential::SdJwt(credential) = &p.verified {
                 let _status_timer = StepTimer::start(&mut timings.status_ms);
                 let status_result = self
-                    .check_sd_jwt_status(credential, now, &mut timings.status_fetch_ms)
+                    .check_sd_jwt_status(
+                        credential,
+                        now,
+                        &mut timings.status_fetch_ms,
+                        &mut timings.trust_ms,
+                    )
                     .await;
                 drop(_status_timer);
                 if let Err(refusal) = status_result {

@@ -30,6 +30,10 @@ fn write_config(dir: &std::path::Path, extra: &str) -> std::path::PathBuf {
         state_encryption_key = "a-32-byte-or-longer-test-secret!!"
         cookie_secure = false
 
+        [logging]
+        level = "info"
+        format = "json"
+
         [[frontend]]
         type = "ui"
         name = "ui"
@@ -432,13 +436,49 @@ async fn the_served_request_carries_the_configured_wrprc_and_dataset() {
         .expect("the response POST");
     assert_eq!(refused.status(), 400);
     let _ = child.kill().await;
-    // The per-presentation telemetry: one line with the full step split,
-    // so a deployment's logs answer "where did the time go" by themselves.
+    // The per-presentation telemetry: exactly ONE completion event for the
+    // flow, carrying the refusal the wallet actually received and every
+    // numeric timing field — parsed from the JSON log, so the assertions do
+    // not depend on display formatting.
     let stdout_bytes = stdout_task.await.unwrap_or_default();
-    let stderr = String::from_utf8_lossy(&stdout_bytes);
-    assert!(
-        stderr.contains("wallet response processed"),
-        "the response telemetry line must appear in the service log; stderr was:
-{stderr}"
+    let log = String::from_utf8_lossy(&stdout_bytes);
+    let events: Vec<serde_json::Value> = log
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|entry| {
+            entry
+                .get("fields")
+                .and_then(|f| f.get("message"))
+                .and_then(|m| m.as_str())
+                == Some("wallet response processed")
+        })
+        .collect();
+    assert_eq!(
+        events.len(),
+        1,
+        "exactly one completion event; the log was:\n{log}"
     );
+    let event = events[0].get("fields").cloned().expect("the event fields");
+    let result = event
+        .get("result")
+        .and_then(|r| r.as_str())
+        .expect("the result field");
+    assert_ne!(result, "ok", "the refusal must not be logged as a success");
+    assert!(!result.is_empty(), "the refusal result must be present");
+    for field in [
+        "total_ms",
+        "claim_ms",
+        "admission_ms",
+        "unseal_ms",
+        "crypto_ms",
+        "trust_ms",
+        "status_ms",
+        "status_fetch_ms",
+        "finalize_ms",
+    ] {
+        assert!(
+            event.get(field).is_some_and(|v| v.is_number()),
+            "the {field} timing field must be numeric; the event was {event}"
+        );
+    }
 }
