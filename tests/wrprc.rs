@@ -222,6 +222,36 @@ fn the_wrprc_payload_is_held_to_table_7() {
             .contains("wrprc_supervisory_authority_email_not_string"),
         "{error}"
     );
+    // exp must post-date iat: a registration expiring before issuance is
+    // malformed regardless of the clock. The fixture: exp still in the
+    // future (not expired) but BEFORE the iat — and the iat itself within
+    // the 60s future skew, so only the exp-before-iat rule rejects.
+    let mut claims = register_claims();
+    claims["iat"] = json!(NOW + 60);
+    claims["exp"] = json!(NOW + 30);
+    let error = parse_wrprc(&mint_wrprc(&claims), NOW).unwrap_err();
+    assert!(
+        error.to_string().contains("wrprc_exp_before_iat"),
+        "{error}"
+    );
+    // The registrar's public_body flag is a boolean.
+    let mut claims = register_claims();
+    claims["public_body"] = json!("yes");
+    let error = parse_wrprc(&mint_wrprc(&claims), NOW).unwrap_err();
+    assert!(
+        error.to_string().contains("wrprc_public_body_not_boolean"),
+        "{error}"
+    );
+    // The credential claim entries carry non-empty string paths.
+    let mut claims = register_claims();
+    claims["credentials"] = json!([{"format": "dc+sd-jwt", "claim": [{"path": []}]}]);
+    let error = parse_wrprc(&mint_wrprc(&claims), NOW).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("wrprc_credentials_claim_path_missing"),
+        "{error}"
+    );
     // The registrar's own shapes, held: the nested srv_description groups,
     // the string-array policy_id, the status object.
     let mut claims = register_claims();

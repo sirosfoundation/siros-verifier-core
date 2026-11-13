@@ -205,8 +205,20 @@ pub fn parse_wrprc(token: &str, now: i64) -> Result<Wrprc> {
         if !exp.is_i64() {
             return Err(malformed("wrprc_exp_not_integer"));
         }
-        if now >= exp.as_i64().expect("checked") {
+        let exp = exp.as_i64().expect("checked");
+        if now >= exp {
             return Err(policy("wrprc_expired"));
+        }
+        // A registration that expired before it was issued is malformed
+        // regardless of the clock.
+        if exp < iat {
+            return Err(malformed("wrprc_exp_before_iat"));
+        }
+    }
+    // The registrar's `public_body` flag: a boolean when present.
+    if let Some(public_body) = claims.get("public_body") {
+        if !public_body.is_boolean() {
+            return Err(malformed("wrprc_public_body_not_boolean"));
         }
     }
     // Table 7's optional members: type-checked when present, never required
@@ -316,8 +328,21 @@ pub fn parse_wrprc(token: &str, now: i64) -> Result<Wrprc> {
                     }
                 }
                 if let Some(claim) = object.get("claim") {
-                    if !claim.is_array() {
-                        return Err(malformed(format!("wrprc_{name}_claim_not_array")));
+                    let list = claim
+                        .as_array()
+                        .ok_or_else(|| malformed(format!("wrprc_{name}_claim_not_array")))?;
+                    for entry in list {
+                        let object = entry.as_object().ok_or_else(|| {
+                            malformed(format!("wrprc_{name}_claim_entry_not_object"))
+                        })?;
+                        let path = object
+                            .get("path")
+                            .and_then(Value::as_array)
+                            .filter(|path| !path.is_empty())
+                            .ok_or_else(|| malformed(format!("wrprc_{name}_claim_path_missing")))?;
+                        if path.iter().any(|seg| seg.as_str().is_none()) {
+                            return Err(malformed(format!("wrprc_{name}_claim_path_not_strings")));
+                        }
                     }
                 }
             }
