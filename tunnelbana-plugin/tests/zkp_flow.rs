@@ -288,6 +288,8 @@ fn build_full(
         processing_deadline_secs: limits.1,
         max_concurrent_verifications: limits.2,
         status_list_key_source: siros_verifier_core::status_list::StatusListKeySource::default(),
+        wrprc: None,
+        verifier_info: None,
     };
     let mut backend = VpBackend::new_with_zkp(
         "vp",

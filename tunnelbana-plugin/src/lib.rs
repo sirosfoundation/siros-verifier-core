@@ -266,6 +266,19 @@ pub struct VpBackendConfig {
     /// referenced URI, `iat`/`exp` — applies regardless of the carrier.
     #[serde(default)]
     pub status_list_key_source: StatusListKeySource,
+    /// The serialized WRPRC (`rc-wrp+jwt` per ETSI TS 119 475 §5.2) of the
+    /// FRONTED relying party — the deployment is an intermediary's (the
+    /// request-signing key is the intermediary's WRPAC per ETSI TS 119
+    /// 411-8). Loaded and validated at startup by the service, re-validated
+    /// (freshness) per-request at arm, and carried as the 472-2 §6.3.2.2
+    /// `registration_cert` element. Absent — the pre-EAAP request shape —
+    /// for a non-intermediary deployment.
+    #[serde(default)]
+    pub wrprc: Option<String>,
+    /// The 472-2 §6.3.2.2 registrar dataset (the B.2 members), the
+    /// `registrar_dataset` element. Absent for a non-intermediary deployment.
+    #[serde(default)]
+    pub verifier_info: Option<Value>,
 }
 
 fn default_mdoc_role() -> String {
@@ -1217,6 +1230,8 @@ impl VpBackend {
             processing_deadline_secs: default_processing_deadline(),
             max_concurrent_verifications: default_max_concurrent_verifications(),
             status_list_key_source: StatusListKeySource::default(),
+            wrprc: None,
+            verifier_info: None,
         };
         let mut backend =
             Self::new_inner(name, module_base, cfg, gate, signer, chain_der, clock, true)?;
@@ -2150,11 +2165,13 @@ impl Backend for VpBackend {
             ttl_secs: self.cfg.request_ttl_secs,
             vp_formats_supported: zkp.map(|z| z.vp_formats.clone()),
             client_id: zkp.map(|z| z.cfg.verifier_id.clone()),
-            // Increment 2 (#39) wires the EAAP members from the backend
-            // config; increment 1's carrier is the core's, unconfigured
-            // here — the pre-EAAP request shape is unchanged.
-            verifier_info: None,
-            wrprc: None,
+            // The EAAP members from the backend config — increment 2's
+            // wiring: the WRPRC (the fronted RP's registration certificate)
+            // and the registrar dataset ride the armed request when the
+            // deployment is an intermediary's; both absent otherwise (the
+            // pre-EAAP shape).
+            verifier_info: self.cfg.verifier_info.clone(),
+            wrprc: self.cfg.wrprc.clone(),
         };
         let dc_api = request.requester.as_deref() == Some(ui::DC_API_REQUESTER);
         let (jar, session) = if dc_api {
@@ -2166,7 +2183,7 @@ impl Backend for VpBackend {
         } else {
             oid4vp::create_request(&cfg, &self.signer, "ES256", &self.chain_der, now)
         }
-        .map_err(|e| Error::Internal(format!("request: {}", e.code())))?;
+        .map_err(|e| Error::Internal(format!("request: {}: {}", e.code(), e)))?;
         let client_id = session.client_id.clone();
         let expires_at = session.expires_at;
         let sealed_session = self

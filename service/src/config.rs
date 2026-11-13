@@ -62,6 +62,21 @@ pub struct DeploymentConfig {
     pub max_receipt_ttl_secs: Option<i64>,
     #[serde(default)]
     pub zkp: Option<ZkpDeploymentConfig>,
+    /// The serialized WRPRC (`rc-wrp+jwt` per ETSI TS 119 475 §5.2) of the
+    /// FRONTED relying party — the deployment is an intermediary's. Read at
+    /// startup, validated (shape + signature consistency), and carried on
+    /// every armed request per ETSI TS 119 472-2 §6.3.2.2's `registration_cert`
+    /// element. Absent for a non-intermediary deployment — the request stays
+    /// the pre-EAAP shape.
+    #[serde(default)]
+    pub wrprc_path: Option<String>,
+    /// The 472-2 §6.3.2.2 registrar dataset JSON (the B.2 members:
+    /// identifier/srvDescription/registryURI/intendedUseIdentifier/purpose/
+    /// policyURI, optional credential) — the RP Registrar-provided data the
+    /// wallet renders. Absent when the deployment runs without the EAAP
+    /// members.
+    #[serde(default)]
+    pub verifier_info_path: Option<String>,
     #[serde(flatten)]
     pub vp: VpBackendConfig,
 }

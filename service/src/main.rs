@@ -317,6 +317,61 @@ async fn build_openid4vp_backend(
         bail!("request certificate chain is empty");
     }
 
+    // Increment 2 (#39): the intermediary deployment's EAAP members. The
+    // WRPRC is the FRONTED relying party's registration certificate; the
+    // request-signing key + chain above are the INTERMEDIARY's WRPAC (the
+    // X.509 access certificate per ETSI TS 119 411-8) — the operator points
+    // those config paths at the intermediary's own credentials. The WRPRC
+    // is loaded once and validated at startup (fail-fast on a malformed
+    // file); the arm re-validates freshness per-request.
+    let wrprc = match &deployment.wrprc_path {
+        Some(path) => {
+            let path = resolve_sibling(config_path, path);
+            let read_path = path.clone();
+            let token =
+                actix_web::rt::task::spawn_blocking(move || std::fs::read_to_string(read_path))
+                    .await
+                    .with_context(|| "joining the WRPRC read task")?
+                    .with_context(|| format!("reading WRPRC {}", path.display()))?;
+            // Validate at startup: the shape, the signature consistency
+            // under the presented chain, and the freshness right now. A
+            // malformed or stale file fails the boot, not the first
+            // request.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            siros_verifier_core::wrprc::parse_wrprc(token.trim(), now)
+                .with_context(|| format!("validating WRPRC {}", path.display()))?;
+            tracing::info!(name = %plugin.name, "loaded WRPRC (the fronted RP's registration certificate)");
+            Some(token.trim().to_owned())
+        }
+        None => None,
+    };
+    let verifier_info = match &deployment.verifier_info_path {
+        Some(path) => {
+            let path = resolve_sibling(config_path, path);
+            let read_path = path.clone();
+            let dataset =
+                actix_web::rt::task::spawn_blocking(move || std::fs::read_to_string(read_path))
+                    .await
+                    .with_context(|| "joining the verifier_info read task")?
+                    .with_context(|| format!("reading registrar dataset {}", path.display()))?;
+            let dataset: serde_json::Value = serde_json::from_str(&dataset)
+                .with_context(|| format!("parsing registrar dataset {}", path.display()))?;
+            // Validate the B.2 members at startup — the same validation the
+            // arm applies, caught before the boot completes.
+            siros_verifier_core::wrprc::build_verifier_info(Some(&dataset), None)
+                .with_context(|| format!("validating registrar dataset {}", path.display()))?;
+            tracing::info!(name = %plugin.name, "loaded registrar dataset (the verifier_info element)");
+            Some(dataset)
+        }
+        None => None,
+    };
+    let mut vp_config = deployment.vp.clone();
+    vp_config.wrprc = wrprc;
+    vp_config.verifier_info = verifier_info;
+
     let pdp: Arc<dyn PdpClient> = if deployment.allow_insecure_http {
         Arc::new(
             HttpPdp::new_allow_http(
@@ -360,7 +415,7 @@ async fn build_openid4vp_backend(
         VpBackend::new_with_zkp(
             &plugin.name,
             &module_base,
-            deployment.vp,
+            vp_config,
             zkp.backend,
             gate,
             request_signer,
@@ -372,7 +427,7 @@ async fn build_openid4vp_backend(
         VpBackend::new(
             &plugin.name,
             &module_base,
-            deployment.vp,
+            vp_config,
             gate,
             request_signer,
             chain_der,

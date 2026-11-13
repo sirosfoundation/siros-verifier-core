@@ -733,6 +733,55 @@ async fn untrusted_issuer_fails_the_flow_and_no_attributes_leak() {
 }
 
 #[tokio::test]
+async fn an_intermediary_configured_backend_arms_the_verifier_info_members() {
+    // Increment 2 (#39): the backend configured with the fronted RP's WRPRC
+    // + the registrar dataset arms requests carrying the 472-2 §6.3.2.2
+    // `verifier_info` members. The request is signed by the DEPLOYMENT's
+    // key — the intermediary's WRPAC in the real deployment; the fixture's
+    // own key stands in. The flow completes exactly as the non-intermediary
+    // one: the wallet fixture's DCQL match and the presentation succeeding
+    // prove the armed request parsed and matched.
+    let wrprc = {
+        let (cert, key) = self_signed_ec("registrar.example", "ES256");
+        let claims = json!({
+            "sub": "urn:glas:se:registrar:5561234567",
+            "iat": T0 - 1_000,
+            "country": "SE",
+            "sub_ln": "Testfronted RP",
+            "registry_uri": "https://registrar.example/api/5561234567",
+            "srv_description": [[{"lang": "sv", "value": "Tjänst"}]],
+            "entitlements": ["pid_provision"],
+            "privacy_policy": "https://example.com/privacy",
+            "policy_id": ["https://registrar.example/policies/wrp"],
+            "status": {"status_list": {"idx": 9, "uri": "https://registrar.example/statuslists/9"}},
+        });
+        sign_raw(&key, "rc-wrp+jwt", &claims, std::slice::from_ref(&cert))
+    };
+    let dataset = json!({
+        "identifier": [{"type": "eori", "identifier": "SE556123456701"}],
+        "srvDescription": [{"lang": "sv", "content": "Tjänst"}],
+        "registryURI": "https://registrar.example/api/5561234567",
+        "intendedUseIdentifier": "urn:registrar:use:1",
+        "purpose": [{"lang": "sv", "content": "Verifiera"}],
+        "policyURI": "https://example.com/privacy",
+    });
+    let mut cfg = pid_cfg("/family_name", "get", None, 16);
+    cfg.wrprc = Some(wrprc.clone());
+    cfg.verifier_info = Some(dataset);
+    let f = assemble(cfg, mock_pdp(100_000, false), pid_parts());
+    let (state, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    let (st, body) = post(&f, &id, &wallet(&f, &jar)).await;
+    assert_eq!(st, 200, "{body}");
+    assert!(matches!(
+        complete(&f, &state).await.unwrap(),
+        BackendAction::AuthResponse(_)
+    ));
+    // The WRPRC the arm validated parses at the fixture clock.
+    siros_verifier_core::wrprc::parse_wrprc(&wrprc, T0).unwrap();
+}
+
+#[tokio::test]
 async fn an_untrusted_issuer_cannot_trigger_status_network_activity() {
     let mut f = fx();
     f.pdp.permit.store(false, Ordering::SeqCst);
