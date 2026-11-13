@@ -160,13 +160,17 @@ pub fn parse_wrprc(token: &str, now: i64) -> Result<Wrprc> {
     let _ = require_string("registry_uri")?;
     let _ = require_string("privacy_policy")?;
     // GEN-5.2.4-01/-03: at least one entitlement, each a clause A.2
-    // identifier string.
+    // identifier string — and each NON-EMPTY: an empty identifier is not a
+    // registered entitlement.
     let entitlements = claims
         .get("entitlements")
         .and_then(Value::as_array)
         .filter(|list| !list.is_empty())
         .ok_or_else(|| malformed("wrprc_missing_entitlements"))?;
-    if entitlements.iter().any(|e| e.as_str().is_none()) {
+    if entitlements
+        .iter()
+        .any(|e| e.as_str().filter(|s| !s.is_empty()).is_none())
+    {
         return Err(malformed("wrprc_entitlements_not_strings"));
     }
     // Table 7: `srv_description` — the registrar's per-registered-service

@@ -193,6 +193,25 @@ fn the_wrprc_payload_is_held_to_table_7() {
     claims["country"] = json!(42);
     let error = parse_wrprc(&mint_wrprc(&claims), NOW).unwrap_err();
     assert!(error.to_string().contains("wrprc_country_not_string"));
+    // An EMPTY entitlement identifier is not a registered entitlement.
+    let mut claims = register_claims();
+    claims["entitlements"] = json!(["pid_provision", ""]);
+    let error = parse_wrprc(&mint_wrprc(&claims), NOW).unwrap_err();
+    assert!(
+        error.to_string().contains("wrprc_entitlements_not_strings"),
+        "{error}"
+    );
+    // The optional members are TYPED, not just present: a number where the
+    // register carries a string rejects.
+    let mut claims = register_claims();
+    claims["certificate_policy"] = json!(42);
+    let error = parse_wrprc(&mint_wrprc(&claims), NOW).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("wrprc_certificate_policy_not_string"),
+        "{error}"
+    );
     // Table 7: the supervisory authority's contact members are typed.
     let mut claims = register_claims();
     claims["supervisory_authority"] = json!({"email": 42});
