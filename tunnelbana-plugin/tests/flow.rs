@@ -2694,11 +2694,20 @@ async fn telemetry_records_the_deadline_cancellation() {
     log_buffer(); // the subscriber must exist before the flow emits
                   // A PDP that never answers and a one-second budget: the deadline cancels
                   // the verification mid-trust-evaluation, and the drop-based timer still
-                  // records the wait that held the budget.
+                  // records the wait that held the budget. The outer 10-second cap is the
+                  // established pattern of the stalled-PDP test above: with the
+                  // processing-deadline mutant (a u64::MAX timeout) the inner deadline
+                  // never fires and the outer cap is what fails the test — without it,
+                  // that mutant would hang the mutation suite for the whole job timeout.
     let f = fx_stalled(1);
     let (_state, id) = start(&f).await;
     let jar = fetch_jar(&f, &id).await;
-    let (st, body) = post(&f, &id, &wallet(&f, &jar)).await;
+    let (st, body) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        post(&f, &id, &wallet(&f, &jar)),
+    )
+    .await
+    .expect("the processing deadline must bound a stalled PDP");
     assert_eq!(st, 504, "{body}");
     let event = completion_event(&id);
     assert_eq!(event["result"], "processing_deadline");
