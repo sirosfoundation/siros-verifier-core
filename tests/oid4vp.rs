@@ -1154,3 +1154,99 @@ fn encrypted_response_metadata_matches_openid4vp_1_0() {
         "the ephemeral key is an encryption key"
     );
 }
+
+// ─── The plain direct_post mode (the family's unencrypted arm) ────────────
+
+/// OID4VP's plain `direct_post` mode, ported onto the final-spec surface:
+/// the request carries `response_mode: direct_post` with NO
+/// `encrypted_response_enc_values_supported` (a wallet must not be invited
+/// to encrypt), the mdoc transcript handover is the same 4-item family
+/// shape, and the wallet's clear `vp_token` + state form processes with
+/// every check the encrypted modes make except the JWE layer. The modes
+/// never cross, either direction.
+#[test]
+fn plain_direct_post_round_trips_without_the_jwe_layer() {
+    let w = world();
+    let signer = software_signer(&w.verifier_key).unwrap();
+    let cfg = RequestConfig {
+        response_uri: "https://verify.example/resp".to_owned(),
+        dcql_query: dcql(&["given_name"]),
+        ttl_secs: 300,
+        vp_formats_supported: None,
+        client_id: None,
+        verifier_info: None,
+        wrprc: None,
+    };
+    let (jar, session) = create_plain_request(
+        &cfg,
+        &signer,
+        "ES256",
+        std::slice::from_ref(&w.verifier_cert),
+        NOW,
+    )
+    .expect("the plain request arms");
+
+    // The request: plain mode, no encryption invitation.
+    let header = jws::decode_header(&jar).unwrap();
+    let chain = sdjwt::x5c_chain(&header).unwrap();
+    let leaf = sdjwt::jwk_from_cert_der(&chain[0]).unwrap();
+    let payload: Value =
+        serde_json::from_slice(&jws::compact::verify_with_jwk(&leaf, &jar).unwrap()).unwrap();
+    assert_eq!(payload["response_mode"], "direct_post");
+    assert!(
+        payload["client_metadata"]
+            .get("encrypted_response_enc_values_supported")
+            .is_none(),
+        "a plain-mode request never invites encryption: {}",
+        payload["client_metadata"]
+    );
+    assert!(
+        payload["client_metadata"]["jwks"]["keys"][0].is_object(),
+        "the jwks stays (the mdoc transcript's thumbprint resolves from it)"
+    );
+
+    // The transcript: the direct_post family's shared 4-item handover.
+    assert!(
+        session.mdoc_session_transcript_bytes().is_ok(),
+        "the plain mode's transcript computes (the family handover)"
+    );
+
+    // The wallet's CLEAR response (no JWE): vp_token + state.
+    let presentation = real_presentation(&w, &session, &[0, 1]);
+    let body = json!({
+        "vp_token": { "pid": [presentation] },
+        "state": session.state,
+    });
+    let results =
+        process_response_plain(&session, &serde_json::to_vec(&body).unwrap(), NOW, &X5cLeaf)
+            .expect("the plain response processes");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].credential_id, "pid");
+
+    // The modes never cross, both directions: a plain body to an
+    // ENCRYPTED-mode session, and a JWE to a PLAIN-mode session.
+    let (_jwt_jar, jwt_session) = create_request(
+        &cfg,
+        &signer,
+        "ES256",
+        std::slice::from_ref(&w.verifier_cert),
+        NOW,
+    )
+    .expect("the .jwt request arms");
+    let error = process_response_plain(
+        &jwt_session,
+        &serde_json::to_vec(&body).unwrap(),
+        NOW,
+        &X5cLeaf,
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("plain direct_post mode"),
+        "a plain body answers only the plain mode: {error}"
+    );
+    let error = process_response(&session, "not-a-jwe", NOW, &X5cLeaf).unwrap_err();
+    assert!(
+        error.to_string().contains("encrypted modes"),
+        "a JWE answers only the encrypted modes: {error}"
+    );
+}

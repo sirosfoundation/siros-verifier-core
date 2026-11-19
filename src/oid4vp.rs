@@ -117,7 +117,10 @@ fn mdoc_transcript_parts(
 ) -> Result<Vec<u8>> {
     use ciborium::Value as Cbor;
     let (handover, info) = match mode {
-        "direct_post.jwt" => (
+        // The direct_post family shares ONE handover (client_id, nonce,
+        // thumbprint, response_uri): the `.jwt` suffix governs only the
+        // response's encryption, not the transcript.
+        "direct_post" | "direct_post.jwt" => (
             "OpenID4VPHandover",
             vec![
                 Cbor::Text(client_id.to_owned()),
@@ -366,6 +369,25 @@ pub fn create_dc_api_request(
     create_request_with_response_mode(cfg, signer, alg, chain_der, now, "dc_api.jwt", Some(origin))
 }
 
+/// Create a request for OID4VP's plain `direct_post` response mode: the
+/// wallet returns the `vp_token` + `state` form in the clear (over TLS to
+/// the `response_uri`) — no JWE layer. The tradeoff is the verifier's to
+/// state: the presentation rides TLS without the response-encryption
+/// layer. The mdoc session transcript is the SAME `OpenID4VPHandover` as
+/// `direct_post.jwt` (client_id, nonce, thumbprint, response_uri) — the
+/// `.jwt` suffix governs only the response's encryption, not the
+/// transcript. The drill-proven plain arm (siros-flow-core's wallet drill
+/// + the realeyes plain twin).
+pub fn create_plain_request(
+    cfg: &RequestConfig,
+    signer: &dyn kryptering::Signer,
+    alg: &str,
+    chain_der: &[Vec<u8>],
+    now: i64,
+) -> Result<(String, Session)> {
+    create_request_with_response_mode(cfg, signer, alg, chain_der, now, "direct_post", None)
+}
+
 fn create_request_with_response_mode(
     cfg: &RequestConfig,
     signer: &dyn kryptering::Signer,
@@ -474,10 +496,23 @@ fn create_request_with_response_mode(
         // gating on the legacy names and otherwise answering with a
         // plain vp_token — is refused until it reads the key's
         // `alg` and the advertised enc values instead.
-        "client_metadata": {
-            "jwks": { "keys": [enc_pub] },
-            "encrypted_response_enc_values_supported": ["A128GCM", "A256GCM"],
-            "vp_formats_supported": vp_formats_supported,
+        // The enc-values invitation rides ONLY the encrypted modes: a
+        // plain `direct_post` request must NOT advertise
+        // `encrypted_response_enc_values_supported` (a wallet would
+        // encrypt against the mode's instruction). The `jwks` stays in
+        // every mode — the mdoc session transcript's thumbprint resolves
+        // from it.
+        "client_metadata": if response_mode.ends_with(".jwt") {
+            json!({
+                "jwks": { "keys": [enc_pub] },
+                "encrypted_response_enc_values_supported": ["A128GCM", "A256GCM"],
+                "vp_formats_supported": vp_formats_supported,
+            })
+        } else {
+            json!({
+                "jwks": { "keys": [enc_pub] },
+                "vp_formats_supported": vp_formats_supported,
+            })
         },
     });
     if let Some(origin) = dc_api_origin {
@@ -951,8 +986,53 @@ pub fn process_response(
     now: i64,
     resolver: &dyn IssuerKeyResolver,
 ) -> Result<Vec<PresentationResult>> {
+    if session.response_mode != "direct_post.jwt" && session.response_mode != "dc_api.jwt" {
+        return Err(policy(format!(
+            "a `response` JWE answers only the encrypted modes; this request is {}",
+            session.response_mode
+        )));
+    }
     let opened = open_response(session, jwe, now)?;
     process_opened_response(session, opened, now, resolver)
+}
+
+/// Process the wallet's PLAIN `direct_post` response (OID4VP's
+/// unencrypted mode): the wallet returned the `vp_token` + `state` form
+/// in the clear. The checks — the mode guard (a plain body answers only
+/// the plain mode), expiry, the wallet-error short-circuit, the state
+/// match, the credential walk, the key-binding window — are every check
+/// the encrypted modes make, with only the JWE layer absent. The modes
+/// never cross: a plain body to an encrypted session refuses here, and a
+/// JWE to a plain session refuses in [`process_response`].
+pub fn process_response_plain(
+    session: &Session,
+    body: &[u8],
+    now: i64,
+    resolver: &dyn IssuerKeyResolver,
+) -> Result<Vec<PresentationResult>> {
+    if session.response_mode != "direct_post" {
+        return Err(policy(format!(
+            "a plain `vp_token` answers only the plain direct_post mode; this request is {}",
+            session.response_mode
+        )));
+    }
+    if now >= session.expires_at {
+        return Err(policy("request has expired"));
+    }
+    let value: Value = crate::json_strict::from_slice(body)
+        .map_err(|e| malformed(format!("response is not JSON: {e}")))?;
+    if let Some(err) = value.get("error") {
+        return Err(policy(format!("wallet returned an error: {err}")));
+    }
+    if value.get("state").and_then(Value::as_str) != Some(session.state.as_str()) {
+        return Err(integrity("state mismatch"));
+    }
+    let vp_token = value
+        .get("vp_token")
+        .and_then(Value::as_object)
+        .cloned()
+        .ok_or_else(|| malformed("missing vp_token object"))?;
+    process_opened_response(session, OpenedResponse { vp_token }, now, resolver)
 }
 
 /// Process an already-opened response: the same checks [`process_response`]
