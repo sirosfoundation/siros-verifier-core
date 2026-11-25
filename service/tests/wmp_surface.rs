@@ -2,7 +2,7 @@
 //! provider, the config-declared invites parse fail-fast, and the
 //! non-join purposes refuse.
 
-use siros_verifier_service::wmp::{ParsedInvite, WmpConfig, WmpSurface};
+use siros_verifier_service::wmp::{WmpConfig, WmpSurface};
 use std::path::Path;
 
 fn fixture_dir() -> std::path::PathBuf {
@@ -28,7 +28,7 @@ fn write_identity(dir: &Path) -> String {
 
 fn config_with(invites: Vec<serde_json::Value>) -> WmpConfig {
     serde_json::from_value(serde_json::json!({
-        "join_pdp_url": "http://sirosid-gdc-spocp.internal:8000/access/v1/evaluation",
+        "join_pdp_url": "https://sirosid-gdc-spocp.internal:8000/access/v1/evaluation",
         "identity": "x509:san:dns:verifier.example",
         "identity_chain_path": write_identity(&fixture_dir()),
         "invites": invites,
@@ -93,5 +93,102 @@ fn a_malformed_invite_uri_refuses_the_parse() {
     assert!(
         err.to_string().contains("invite"),
         "the refusal names the invite: {err:#}"
+    );
+}
+
+use siros_verifier_service::wmp::{
+    parse_authzen_decision, AuthZenEntity, AuthZenRequest, Decision, ParsedInvite,
+};
+
+fn invite() -> ParsedInvite {
+    ParsedInvite::parse(
+        "wmp://invite?data=eyJwcm92aWRlciI6InBhcnRuZXIuZXhhbXBsZSIsInNlbmRlciI6InNlbmRlci5leGFtcGxlIiwibm9uY2UiOiJuLWEiLCJwdXJwb3NlIjoiam9pbiIsInJlbGF5IjoicmVsYXkuZXhhbXBsZSJ9",
+    )
+    .expect("the join-purpose invite parses")
+}
+
+#[test]
+fn the_join_request_follows_the_go_spocp_wire_shape() {
+    // The subject is the resource owner (the verifier); the group is
+    // the resource; the counterpart rides the context — and the wire
+    // JSON is exactly go-spocp's EvaluationRequest shape.
+    let invite = invite();
+    let request = AuthZenRequest::join("x509:san:dns:verifier.example", &invite);
+    let json = request.to_json();
+    assert_eq!(json["subject"]["type"], "verifier");
+    assert_eq!(json["subject"]["id"], "x509:san:dns:verifier.example");
+    assert_eq!(json["resource"]["type"], "wmp_group");
+    assert_eq!(json["resource"]["id"], "partner.example");
+    assert_eq!(json["action"]["name"], "join");
+    assert_eq!(json["context"]["sender"], "sender.example");
+    assert_eq!(json["context"]["relay"], "relay.example");
+    assert_eq!(json["context"]["purpose"], "join");
+}
+
+#[test]
+fn the_entity_properties_ride_the_wire_when_present() {
+    let entity = AuthZenEntity {
+        kind: "verifier",
+        id: "v".into(),
+        properties: Some(serde_json::json!({"x": 1})),
+    };
+    let json = entity.to_json();
+    assert_eq!(json["properties"]["x"], 1);
+    let bare = AuthZenEntity {
+        kind: "verifier",
+        id: "v".into(),
+        properties: None,
+    };
+    assert!(bare.to_json().get("properties").is_none());
+}
+
+#[test]
+fn the_decision_parser_takes_booleans_and_refuses_everything_else() {
+    assert_eq!(
+        parse_authzen_decision(&serde_json::json!({"decision": true})).unwrap(),
+        Decision::Allow
+    );
+    assert_eq!(
+        parse_authzen_decision(&serde_json::json!({"decision": false})).unwrap(),
+        Decision::Deny
+    );
+    // A present-but-non-boolean decision is malformed, never guessed:
+    for malformed in [
+        serde_json::json!({"decision": "Allow"}),
+        serde_json::json!({"decision": 1}),
+        serde_json::json!({"decision": null}),
+        serde_json::json!({}),
+        serde_json::json!({"context": {}}),
+    ] {
+        assert!(
+            parse_authzen_decision(&malformed).is_err(),
+            "the malformed answer {malformed} must refuse"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_pdp_denies_fail_closed_when_unreachable() {
+    // An unreachable PDP (nothing listens here) denies — the
+    // fail-closed contract the gate's decisions ride on.
+    let pdp =
+        siros_verifier_service::wmp::SpocpPdp::new("http://127.0.0.1:1/access/v1/evaluation", true)
+            .expect("the client builds (loopback http)");
+    let request = AuthZenRequest::join("x509:san:dns:verifier.example", &invite());
+    assert_eq!(pdp.evaluate(&request).await, Decision::Deny);
+}
+
+#[test]
+fn the_pdp_url_scheme_refuses_plain_http_without_the_opt_in() {
+    let err = match siros_verifier_service::wmp::SpocpPdp::new(
+        "http://sirosid-gdc-spocp.internal:8000/access/v1/evaluation",
+        false,
+    ) {
+        Ok(_) => panic!("a plain-HTTP non-loopback PDP must refuse without the opt-in"),
+        Err(e) => e,
+    };
+    assert!(
+        format!("{err:#}").contains("https"),
+        "the refusal names the scheme: {err:#}"
     );
 }

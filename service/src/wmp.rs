@@ -39,6 +39,11 @@ pub struct WmpConfig {
     /// the config-declared invites alone are a valid surface.
     #[serde(default)]
     pub invite_endpoint: bool,
+    /// Permit a plain-HTTP PDP on a non-loopback address (the fly 6PN
+    /// posture). Off by default: the URL refuses and names this switch,
+    /// the same explicit policy edge the deployment's own PDP has.
+    #[serde(default)]
+    pub allow_insecure_pdp: bool,
     /// The verifier's WMP identifier (its `x509:san:dns:<host>` leaf
     /// identity; the MLS credential carries the certificate chain).
     pub identity: String,
@@ -151,6 +156,8 @@ pub struct WmpSurface {
     config: WmpConfig,
     #[allow(dead_code)]
     provider: OpenMlsProvider,
+    /// The go-spocp PDP: every join decision evaluates here.
+    pdp: SpocpPdp,
     /// The config-declared invites, parsed at construction (fail-fast
     /// at boot on any malformed URI or non-join purpose).
     config_invites: Vec<ParsedInvite>,
@@ -195,9 +202,12 @@ impl WmpSurface {
             .map(|invite| ParsedInvite::parse(&invite.uri))
             .collect::<Result<Vec<_>>>()
             .with_context(|| "the [wmp] invites: a config-declared invite refused the parse")?;
+        let pdp = SpocpPdp::new(&config.join_pdp_url, config.allow_insecure_pdp)
+            .with_context(|| "the [wmp] join_pdp_url")?;
         Ok(Self {
             config,
             provider,
+            pdp,
             config_invites,
         })
     }
@@ -210,5 +220,195 @@ impl WmpSurface {
     /// The verifier's WMP identity.
     pub fn identity(&self) -> &str {
         self.provider.identity()
+    }
+
+    /// The invite gate: the join decision for one parsed invite. The
+    /// go-spocp PDP evaluates — the subject the resource owner (this
+    /// verifier), the group the resource, the sender/relay/purpose the
+    /// context — fail-closed.
+    ///
+    /// The signature verification (`wmp-core`'s `InvitationVerifier`,
+    /// the sender's key resolved via `wmp.resolve`) and the MLS join
+    /// exchange are the next increment's work; until they land, an
+    /// Allow is recorded as authorized-not-yet-joined and nothing is
+    /// joined — the surface never pretends a join it did not perform.
+    pub async fn join_decision(&self, invite: &ParsedInvite) -> Decision {
+        let request = AuthZenRequest::join(self.identity(), invite);
+        let decision = self.pdp.evaluate(&request).await;
+        match decision {
+            Decision::Allow => tracing::info!(
+                group = %invite.provider,
+                sender = %invite.sender,
+                "the join decision allows — the MLS join exchange is the next increment (not yet joined)"
+            ),
+            Decision::Deny => tracing::info!(
+                group = %invite.provider,
+                sender = %invite.sender,
+                "the join decision denies"
+            ),
+        }
+        decision
+    }
+
+    /// The config-declared invites' decisions, evaluated at boot.
+    pub async fn evaluate_config_invites(&self) -> Vec<(&ParsedInvite, Decision)> {
+        let mut decisions = Vec::with_capacity(self.config_invites.len());
+        for invite in &self.config_invites {
+            let decision = self.join_decision(invite).await;
+            decisions.push((invite, decision));
+        }
+        decisions
+    }
+}
+
+// ---- the go-spocp AuthZEN client ------------------------------------------------
+
+/// One AuthZEN entity: the go-spocp `EvaluationRequest`'s subject or
+/// resource shape (`{type, id, properties?}`).
+#[derive(Debug, Clone)]
+pub struct AuthZenEntity {
+    pub kind: &'static str,
+    pub id: String,
+    pub properties: Option<serde_json::Value>,
+}
+
+impl AuthZenEntity {
+    /// The entity as the go-spocp wire JSON.
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut value = serde_json::json!({
+            "type": self.kind,
+            "id": self.id,
+        });
+        if let Some(properties) = &self.properties {
+            value["properties"] = properties.clone();
+        }
+        value
+    }
+}
+
+/// One AuthZEN evaluation request: the go-spocp PDP's exact wire shape
+/// (`POST /access/v1/evaluation`, the `EvaluationRequest` of its
+/// pkg/authzen). The subject is the resource owner — the verifier —
+/// for every decision this surface makes; the counterpart rides the
+/// context.
+#[derive(Debug, Clone)]
+pub struct AuthZenRequest {
+    pub subject: AuthZenEntity,
+    pub resource: AuthZenEntity,
+    pub action: &'static str,
+    pub context: serde_json::Value,
+}
+
+impl AuthZenRequest {
+    /// The request as the go-spocp wire JSON.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "subject": self.subject.to_json(),
+            "resource": self.resource.to_json(),
+            "action": {"name": self.action},
+            "context": self.context,
+        })
+    }
+
+    /// The join decision's request: may **the verifier** join this
+    /// group, given the invite's attributes in context.
+    pub fn join(verifier_id: &str, invite: &ParsedInvite) -> Self {
+        Self {
+            subject: AuthZenEntity {
+                kind: "verifier",
+                id: verifier_id.to_string(),
+                properties: None,
+            },
+            resource: AuthZenEntity {
+                kind: "wmp_group",
+                id: invite.provider.clone(),
+                properties: None,
+            },
+            action: "join",
+            context: serde_json::json!({
+                "sender": invite.sender,
+                "relay": invite.relay,
+                "purpose": invite.purpose,
+            }),
+        }
+    }
+}
+
+/// The evaluation's outcome. Fail-closed: every failure mode — the
+/// PDP unreachable, the response malformed, the decision not a
+/// boolean — denies, with the reason named for the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    Allow,
+    Deny,
+}
+
+/// Parse a go-spocp `EvaluationResponse`: `{"decision": <bool>,
+/// "context"?: ...}`. A present-but-non-boolean decision is malformed
+/// (refused), never guessed.
+pub fn parse_authzen_decision(response: &serde_json::Value) -> Result<Decision> {
+    match response.get("decision") {
+        Some(serde_json::Value::Bool(true)) => Ok(Decision::Allow),
+        Some(serde_json::Value::Bool(false)) => Ok(Decision::Deny),
+        Some(other) => Err(anyhow!(
+            "the go-spocp PDP answered a non-boolean decision ({other}) — refusing rather than guessing"
+        )),
+        None => Err(anyhow!(
+            "the go-spocp PDP answered no decision — refusing rather than guessing"
+        )),
+    }
+}
+
+/// The go-spocp PDP client: the deployment's external rules engine.
+/// The transport is the service's existing hardened AuthZEN client
+/// (bounded, no redirects, no ambient proxies); the policy URL scheme
+/// discipline is the same as the deployment's own PDP — HTTPS or
+/// loopback, plain HTTP on a private network only behind the explicit
+/// config switch.
+pub struct SpocpPdp {
+    pdp: siros_verifier_core_tunnelbana::HttpPdp,
+}
+
+// evaluate rides the PdpClient trait.
+use siros_verifier_core_tunnelbana::PdpClient as _;
+
+impl SpocpPdp {
+    /// Build the client from the config: the URL's scheme is enforced
+    /// here (HTTPS or loopback; plain HTTP only when the explicit
+    /// `allow_insecure_pdp` is set).
+    pub fn new(url: &str, allow_insecure: bool) -> Result<Self> {
+        let pdp = if allow_insecure {
+            siros_verifier_core_tunnelbana::HttpPdp::new_allow_http(
+                url,
+                None,
+                std::time::Duration::from_secs(10),
+            )
+        } else {
+            siros_verifier_core_tunnelbana::HttpPdp::new(
+                url,
+                None,
+                std::time::Duration::from_secs(10),
+            )
+        }
+        .map_err(|e| anyhow!("the go-spocp PDP URL: {e}"))?;
+        Ok(Self { pdp })
+    }
+
+    /// Evaluate one request, fail-closed: any transport or parse
+    /// failure denies.
+    pub async fn evaluate(&self, request: &AuthZenRequest) -> Decision {
+        match self.pdp.evaluate(&request.to_json()).await {
+            Ok(response) => match parse_authzen_decision(&response) {
+                Ok(decision) => decision,
+                Err(e) => {
+                    tracing::warn!("the go-spocp PDP answered malformed: {e:#} — denying");
+                    Decision::Deny
+                }
+            },
+            Err(e) => {
+                tracing::warn!("the go-spocp PDP unreachable: {e} — denying");
+                Decision::Deny
+            }
+        }
     }
 }

@@ -155,8 +155,19 @@ async fn build_proxy(cfg: ProxyConfig, config_path: &str) -> anyhow::Result<Prox
             tracing::info!(
                 identity = surface.identity(),
                 invites = surface.config_invites().len(),
-                "the WMP surface is configured (the skeleton: parsed, the join machinery to come)"
+                "the WMP surface is configured"
             );
+            // The config invites' join decisions, evaluated now
+            // (fail-closed at the PDP); the MLS join exchange is the
+            // next increment — an Allow is recorded, never acted on.
+            for (invite, decision) in surface.evaluate_config_invites().await {
+                tracing::info!(
+                    group = %invite.provider,
+                    sender = %invite.sender,
+                    allowed = decision == siros_verifier_service::wmp::Decision::Allow,
+                    "the config invite's join decision"
+                );
+            }
             Some(surface)
         }
         None => None,
