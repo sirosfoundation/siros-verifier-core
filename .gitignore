@@ -35,3 +35,4 @@ scripts/__pycache__/
 
 # Coverage
 lcov.info
+service/testdata/wmp/identity-*.pem
