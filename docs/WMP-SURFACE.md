@@ -39,11 +39,18 @@ an external rules engine that speaks AuthZEN (`POST
 The verifier reuses its AuthZEN client shape (`HttpPdp`): a second
 endpoint instance, fail-closed on any evaluation failure.
 
+**The subject is the resource owner — the verifier.** The verifier owns
+the resources every decision acts on (its membership, its credentials,
+its consignments); the counterpart (the invite sender, the flow
+initiator, the requester) rides the context. One uniform rule-writing
+surface: every decision is "may **the verifier** do X, given context
+C".
+
 | Decision | Engine | Shape |
 |---|---|---|
-| Join this group? | go-spocp PDP | subject: the invite sender; resource: the group/relay; action: `join` |
-| Answer this request? | go-spocp PDP | resource: the verifier's credential; action: `request_vp_token` |
-| Relay this presentation? | go-spocp PDP | resource: the candidate group; context: the presentation's process context; action: `relay_presentation` |
+| Join this group? | go-spocp PDP | subject: the verifier; resource: the group; context: sender, provider, relay, purpose; action: `join` |
+| Complete this flow? | go-spocp PDP | subject: the verifier; resource: the held credential; context: the initiator, the query; action: `present_credential` |
+| Relay this presentation? | go-spocp PDP | subject: the verifier; resource: the candidate group; context: the presentation's process context; action: `relay_presentation` |
 
 ## The components
 
@@ -66,15 +73,56 @@ per-group in the flow store keyed by group id. The boot rehydrates
 every group; membership survives restarts. The provider's one-identity
 keystore holds the verifier's WMP key material.
 
-### 3. The responder API (inbound requests)
+### 3. The responder — a presentation flow, spec-native
 
-The verifier only acts on WMP messages **directed to it**. A group
-message carrying a request (name the claims, carry a challenge) is
-authorized at the PDP (`action: request_vp_token`) and answered with a
-§5.6 `verifiable_presentation` — the verifier's **configured credential**
-(the `[wmp.credential]` block, the same style as every other credential
-surface: key paths + metadata), `audience` = the session, `nonce` =
-the request's challenge. This is the QERDS identity_assertion exactly.
+The verifier's API is not an ad-hoc message body: it is an **OpenID4VP
+flow for WMP**, following the wmp specification as the model —
+`wmp-core` §6's structured flows, `wmp-openid4x` §3.2 (`oid4vp`) as the
+reference shape, §6.5's extension requirements for a profile-defined
+flow type. The verifier implements the **responder** role (the holder
+producing presentations); any group member (a QERDS application,
+another tool) initiates.
+
+The flow (the verifier profile defines it per §6.5 — identifier,
+capability, start params, steps, actions, completion result):
+
+```
+initiator (group member)              responder (the verifier)
+    │                                     │
+    │── wmp.flow.start ──────────────────>│   flow_type: the verifier profile's
+    │        params: dcql_query (which     │   presentation flow type; the DCQL query
+    │        credentials/claims wanted),   │   names what the initiator needs
+    │        nonce, audience               │
+    │                                     │── policy evaluation (go-spocp PDP):
+    │<── wmp.flow.progress ───────────────│   `evaluating_policy` → `policy_evaluated`
+    │                                     │   (the machine holder's analogue of
+    │                                     │    awaiting_consent — §3.2's consent UX
+    │                                     │    steps become the policy decision)
+    │<── wmp.flow.progress ───────────────│   `generating_presentation`
+    │<── wmp.flow.complete ───────────────│   the result (below) — or wmp.flow.error
+    │                                     │   with the refusal reason
+```
+
+**The completion result follows the spec's own multi-token shape**
+(`wmp-openid4x` §3.2.4): `vp_token` is a non-empty string, a non-empty
+array of strings, or — for a DCQL request — **the object form
+`{"<credential query id>": ["<presentation>", ...]}`**. A presentation
+may result in multiple tokens; the held credentials are an array
+(`[[wmp.credential]]`), and the query ids key the responses.
+
+**The raw vp_token.** The QERDS application needs the raw token — the
+result carries it verbatim, per the spec (the `vp_token` IS the raw
+presentation; there is no processed form on this wire). Where the
+relay leg consigns verified presentations onward, the same rule holds:
+the raw token rides the consignment, per the QERDS evidence model.
+
+**Two distinct mechanisms, both spec-native, both carrying raw
+vp_tokens:**
+
+| Mechanism | Spec | Who initiates | Use |
+|---|---|---|---|
+| The presentation flow | `wmp-openid4x` §3.2 (the model) | the group member | a QERDS application *requests* a presentation from the verifier |
+| The identity_assertion | `wmp-core` §5.6 | the verifier (sender-initiated) | the verifier *attaches* its own vp_token to messages it sends — session binding, consignments |
 
 ### 4. The relay leg (inbound presentations → outbound WMP messages)
 
@@ -137,9 +185,9 @@ invite_endpoint = true                          # POST /wmp/invites (optional)
 private_key_path = "..."
 public_key_path = "..."
 
-[wmp.credential]                                # the held credential for vp_tokens
-key_path = "..."
-chain_path = "..."
+[[wmp.credential]]                              # the held credentials (an array:
+key_path = "..."                               # a presentation may result in
+chain_path = "..."                             # multiple tokens, per the spec)
 
 [[wmp.invites]]                                 # config-declared (optional)
 uri = "wmp://invite?data=..."
