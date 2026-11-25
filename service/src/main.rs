@@ -144,6 +144,23 @@ async fn build_proxy(cfg: ProxyConfig, config_path: &str) -> anyhow::Result<Prox
     }
     let mut deployment: DeploymentConfig = serde_json::from_value(cfg.backends[0].config_json())?;
     resolve_deployment_secrets(&mut deployment, secrets.as_ref())?;
+    // The WMP surface (the [wmp] block): built fail-fast — a malformed
+    // identity chain or a refused config invite aborts the boot. The
+    // skeleton parses and validates; the join machinery is the next
+    // increment.
+    let _wmp = match deployment.wmp.take() {
+        Some(config) => {
+            let surface =
+                siros_verifier_service::wmp::WmpSurface::new(config, &config_dir(config_path))?;
+            tracing::info!(
+                identity = surface.identity(),
+                invites = surface.config_invites().len(),
+                "the WMP surface is configured (the skeleton: parsed, the join machinery to come)"
+            );
+            Some(surface)
+        }
+        None => None,
+    };
     let token_use_store = build_token_use_store(&deployment.storage).await?;
     let mut frontends = Vec::new();
     for p in &cfg.frontends {
