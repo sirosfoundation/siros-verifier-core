@@ -214,13 +214,18 @@ impl WmpSurface {
                 chain_path.display()
             ));
         }
-        // The leaf's DNS name must match the configured identity (the
-        // x509:san:dns form): a chain for another host is not this
-        // member's identity, and the failure refuses the boot.
-        let dns_name = config
-            .identity
-            .strip_prefix("x509:san:dns:")
-            .unwrap_or(&config.identity);
+        // The configured identity is the x509:san:dns form — the
+        // prefix is REQUIRED (a bare hostname is not a WMP identifier
+        // scheme, and the AuthZEN subject must be the documented form).
+        // The leaf's DNS name must then match: a chain for another host
+        // is not this member's identity, and the failure refuses the
+        // boot.
+        let Some(dns_name) = config.identity.strip_prefix("x509:san:dns:") else {
+            return Err(anyhow!(
+                "the [wmp] identity must be the x509:san:dns:<host> form (got {:?}) — a bare name is not a WMP identifier scheme",
+                config.identity
+            ));
+        };
         if !leaf_dns_names(&chain_der[0])?.contains(&dns_name.to_string()) {
             return Err(anyhow!(
                 "the WMP identity chain's leaf carries no SAN DNS {dns_name:?} — it is not this member's identity"
@@ -370,6 +375,11 @@ impl AuthZenRequest {
             },
             action: "join",
             context: serde_json::json!({
+                // The documented contract: the group's provider rides
+                // the context alongside the sender/relay/purpose (the
+                // resource names it too — the SPOCP rules may match on
+                // either).
+                "provider": invite.provider,
                 "sender": invite.sender,
                 "relay": invite.relay,
                 "purpose": invite.purpose,

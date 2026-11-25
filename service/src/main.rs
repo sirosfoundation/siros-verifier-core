@@ -148,7 +148,7 @@ async fn build_proxy(cfg: ProxyConfig, config_path: &str) -> anyhow::Result<Prox
     // identity chain or a refused config invite aborts the boot. The
     // skeleton parses and validates; the join machinery is the next
     // increment.
-    let _wmp = match deployment.wmp.take() {
+    let _wmp: Option<()> = match deployment.wmp.take() {
         Some(config) => {
             let surface =
                 siros_verifier_service::wmp::WmpSurface::new(config, &config_dir(config_path))?;
@@ -157,18 +157,24 @@ async fn build_proxy(cfg: ProxyConfig, config_path: &str) -> anyhow::Result<Prox
                 invites = surface.config_invites().len(),
                 "the WMP surface is configured"
             );
-            // The config invites' join decisions, evaluated now
-            // (fail-closed at the PDP); the MLS join exchange is the
-            // next increment — an Allow is recorded, never acted on.
-            for (invite, decision) in surface.evaluate_config_invites().await {
-                tracing::info!(
-                    group = %invite.provider,
-                    sender = %invite.sender,
-                    allowed = decision == siros_verifier_service::wmp::Decision::Allow,
-                    "the config invite's join decision"
-                );
-            }
-            Some(surface)
+            // The config invites' join decisions evaluate OUTSIDE the
+            // pre-bind path: a stalled PDP must never delay the
+            // verifier's own endpoints (the 10s client timeout × N
+            // invites). The lifecycle task runs them in the background
+            // — local validation stays fail-fast (the chain, the invite
+            // parses already happened); the REMOTE policy calls move
+            // here, the MLS join exchange still to come.
+            actix_web::rt::spawn(async move {
+                for (invite, decision) in surface.evaluate_config_invites().await {
+                    tracing::info!(
+                        group = %invite.provider,
+                        sender = %invite.sender,
+                        allowed = decision == siros_verifier_service::wmp::Decision::Allow,
+                        "the config invite's join decision"
+                    );
+                }
+            });
+            None
         }
         None => None,
     };

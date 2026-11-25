@@ -138,6 +138,7 @@ fn the_join_request_follows_the_go_spocp_wire_shape() {
     assert_eq!(json["resource"]["type"], "wmp_group");
     assert_eq!(json["resource"]["id"], "partner.example");
     assert_eq!(json["action"]["name"], "join");
+    assert_eq!(json["context"]["provider"], "partner.example");
     assert_eq!(json["context"]["sender"], "sender.example");
     assert_eq!(json["context"]["relay"], "relay.example");
     assert_eq!(json["context"]["purpose"], "join");
@@ -225,5 +226,23 @@ fn an_identity_chain_for_another_host_refuses_the_build() {
     assert!(
         chained.contains("no SAN DNS"),
         "the refusal names the identity mismatch: {chained}"
+    );
+}
+
+#[test]
+fn a_bare_identity_refuses_the_build() {
+    // The identity must be the x509:san:dns:<host> form — a bare
+    // hostname is not a WMP identifier scheme, and the AuthZEN subject
+    // must be the documented form.
+    let (mut config, dir) = config_with(vec![]);
+    config.identity = "verifier.example".to_string();
+    let err = match WmpSurface::new(config, &dir) {
+        Ok(_) => panic!("a bare identity must refuse the build"),
+        Err(e) => e,
+    };
+    let chained = format!("{err:#}");
+    assert!(
+        chained.contains("x509:san:dns:"),
+        "the refusal names the required form: {chained}"
     );
 }
