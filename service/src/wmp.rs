@@ -103,6 +103,30 @@ pub struct WmpRelayTarget {
     pub content: String,
 }
 
+/// One DER certificate's SAN DNS names (the same x509-cert parse the
+/// core crate's trust evaluation uses). A leaf that does not parse
+/// refuses the boot — a malformed identity is worse than none.
+fn leaf_dns_names(der: &[u8]) -> Result<Vec<String>> {
+    use x509_cert::der::Decode;
+    use x509_cert::ext::pkix::SubjectAltName;
+    let cert = x509_cert::Certificate::from_der(der)
+        .map_err(|e| anyhow!("the leaf does not parse as a certificate: {e}"))?;
+    let san_oid = x509_cert::der::oid::ObjectIdentifier::new_unwrap("2.5.29.17");
+    let mut dns_names = Vec::new();
+    for extension in cert.tbs_certificate.extensions.iter().flatten() {
+        if extension.extn_id == san_oid {
+            let san = SubjectAltName::from_der(extension.extn_value.as_bytes())
+                .map_err(|e| anyhow!("the leaf's SAN does not parse: {e}"))?;
+            for name in san.0.iter() {
+                if let x509_cert::ext::pkix::name::GeneralName::DnsName(host) = name {
+                    dns_names.push(host.to_string());
+                }
+            }
+        }
+    }
+    Ok(dns_names)
+}
+
 /// A parsed, validated invite: the join decision's input.
 ///
 /// The signature verification (`wmp-core`'s `InvitationVerifier`) and
@@ -190,11 +214,31 @@ impl WmpSurface {
                 chain_path.display()
             ));
         }
-        // One provider = one WMP member: the identity string with the
-        // X.509 chain as the MLS credential (the mtls/x5c schemes' shape).
-        let provider =
-            OpenMlsProvider::for_identity_with_certificate(&config.identity, Some(chain_der))
-                .map_err(|e| anyhow!("the WMP member provider: {}", e.to_rpc()))?;
+        // The leaf's DNS name must match the configured identity (the
+        // x509:san:dns form): a chain for another host is not this
+        // member's identity, and the failure refuses the boot.
+        let dns_name = config
+            .identity
+            .strip_prefix("x509:san:dns:")
+            .unwrap_or(&config.identity);
+        if !leaf_dns_names(&chain_der[0])?.contains(&dns_name.to_string()) {
+            return Err(anyhow!(
+                "the WMP identity chain's leaf carries no SAN DNS {dns_name:?} — it is not this member's identity"
+            ));
+        }
+        // One provider = one WMP member. At wallet-core 0.4.4 the basic
+        // credential is the only HONEST construction:
+        // for_identity_with_certificate mints a fresh Ed25519 signer
+        // regardless of the chain's key, so an X.509 MLS credential
+        // built from a P-256 leaf violates RFC 9420 §5.3.1's key
+        // binding (this PR's review found it). The basic credential is
+        // authenticated outside MLS — the session's own channel — and
+        // the validated chain still feeds the §5.6 x509_chain
+        // assertions. The X.509 MLS credential lands when wmp-mls
+        // gains the signer-accepting constructor; the switch is this
+        // one call.
+        let provider = OpenMlsProvider::for_identity(&config.identity)
+            .map_err(|e| anyhow!("the WMP member provider: {}", e.to_rpc()))?;
         // The config invites: parsed now, fail-fast.
         let config_invites = config
             .invites

@@ -5,41 +5,59 @@
 use siros_verifier_service::wmp::{WmpConfig, WmpSurface};
 use std::path::Path;
 
+/// One owned temp dir per test: parallel tests share a pid (one test
+/// binary), so a shared name would race — each test's chain lives and
+/// dies with the test.
 fn fixture_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/wmp"))
+    let dir = std::env::temp_dir().join(format!(
+        "wmp-surface-test-{}-{}",
+        std::process::id(),
+        std::thread::current()
+            .name()
+            .unwrap_or("test")
+            .replace("::", "-")
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
 }
 
-/// A real key pair + self-signed chain: the member provider's
-/// construction needs a real chain (leaf first), same as every other
-/// certificate surface in this service.
-fn write_identity(dir: &Path) -> String {
-    // Unique per test: tests run in parallel, the chain writes are not
-    // coordinated.
-    let name = format!("identity-{}.pem", std::process::id());
+/// A real key pair + self-signed chain (the identity's DNS name is
+/// `verifier.example`): the boot's leaf validation needs a real,
+/// matching chain.
+fn write_identity(dir: &Path, dns: &str) -> String {
     let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-    let cert = rcgen::CertificateParams::new(vec!["verifier.example".to_string()])
+    let cert = rcgen::CertificateParams::new(vec![dns.to_string()])
         .unwrap()
         .self_signed(&kp)
         .unwrap();
-    let chain = dir.join(name);
+    let chain = dir.join("identity_chain.pem");
     std::fs::write(&chain, cert.pem()).unwrap();
     chain.display().to_string()
 }
 
-fn config_with(invites: Vec<serde_json::Value>) -> WmpConfig {
+fn config_in(dir: &Path, invites: Vec<serde_json::Value>) -> WmpConfig {
     serde_json::from_value(serde_json::json!({
         "join_pdp_url": "https://sirosid-gdc-spocp.internal:8000/access/v1/evaluation",
         "identity": "x509:san:dns:verifier.example",
-        "identity_chain_path": write_identity(&fixture_dir()),
+        "identity_chain_path": write_identity(dir, "verifier.example"),
         "invites": invites,
     }))
     .unwrap()
 }
 
+/// The test's owned dir + the config built in it: ONE dir, held for the
+/// test's lifetime (the second fixture_dir() call would wipe the first
+/// — the config's chain lives in it).
+fn config_with(invites: Vec<serde_json::Value>) -> (WmpConfig, std::path::PathBuf) {
+    let dir = fixture_dir();
+    (config_in(&dir, invites), dir)
+}
+
 #[test]
 fn the_surface_builds_with_a_valid_identity_chain() {
-    let config = config_with(vec![]);
-    let surface = WmpSurface::new(config, &fixture_dir()).expect("the surface builds");
+    let (config, dir) = config_with(vec![]);
+    let surface = WmpSurface::new(config, &dir).expect("the surface builds");
     assert_eq!(
         surface.identity(),
         "x509:san:dns:verifier.example",
@@ -57,8 +75,8 @@ fn a_config_invite_without_the_join_purpose_refuses_the_build() {
     // GROUPS, it does not bootstrap sessions — the gate refuses the
     // purpose at construction, fail-fast at boot.
     let uri = "wmp://invite?data=eyJwcm92aWRlciI6InBhcnRuZXIuZXhhbXBsZSIsInNlbmRlciI6InNlbmRlci5leGFtcGxlIiwibm9uY2UiOiJuLWEiLCJwdXJwb3NlIjoic2Vzc2lvbiJ9";
-    let config = config_with(vec![serde_json::json!({ "uri": uri })]);
-    let err = match WmpSurface::new(config, &fixture_dir()) {
+    let (config, dir) = config_with(vec![serde_json::json!({ "uri": uri })]);
+    let err = match WmpSurface::new(config, &dir) {
         Ok(_) => panic!("a session-purpose invite must refuse the build"),
         Err(e) => e,
     };
@@ -71,9 +89,9 @@ fn a_config_invite_without_the_join_purpose_refuses_the_build() {
 
 #[test]
 fn an_empty_identity_chain_refuses_the_build() {
-    let mut config = config_with(vec![]);
-    config.identity_chain_path = fixture_dir().join("no-such.pem").display().to_string();
-    let err = match WmpSurface::new(config, &fixture_dir()) {
+    let (mut config, dir) = config_with(vec![]);
+    config.identity_chain_path = dir.join("no-such.pem").display().to_string();
+    let err = match WmpSurface::new(config, &dir) {
         Ok(_) => panic!("a missing identity chain must refuse the build"),
         Err(e) => e,
     };
@@ -190,5 +208,22 @@ fn the_pdp_url_scheme_refuses_plain_http_without_the_opt_in() {
     assert!(
         format!("{err:#}").contains("https"),
         "the refusal names the scheme: {err:#}"
+    );
+}
+
+#[test]
+fn an_identity_chain_for_another_host_refuses_the_build() {
+    // The leaf's SAN DNS must match the configured identity: a chain
+    // for another host is not this member's identity.
+    let (mut config, dir) = config_with(vec![]);
+    config.identity_chain_path = write_identity(&dir, "other.example");
+    let err = match WmpSurface::new(config, &dir) {
+        Ok(_) => panic!("a foreign leaf must refuse the build"),
+        Err(e) => e,
+    };
+    let chained = format!("{err:#}");
+    assert!(
+        chained.contains("no SAN DNS"),
+        "the refusal names the identity mismatch: {chained}"
     );
 }

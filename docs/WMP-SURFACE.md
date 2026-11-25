@@ -215,28 +215,40 @@ Both are policy-gated; neither is a default.
 
 ## The config surface
 
+The block rides the deployment config — `[backend.config.wmp]`, the
+same place the keys and the PDP endpoint live:
+
 ```toml
-[wmp]
+[backend.config.wmp]
 join_pdp_url = "http://sirosid-gdc-spocp.internal:8000/access/v1/evaluation"
 invite_endpoint = true                          # POST /wmp/invites (optional)
+allow_insecure_pdp = true                       # the private-network PDP posture (explicit)
+identity = "x509:san:dns:sirosid-gdc-siros-verifier.fly.dev"
+identity_chain_path = "/pki/verifier_ec_chain.pem"   # leaf first; its SAN DNS must match the identity
 
-[wmp.member_key]                                # the verifier's WMP key material
-private_key_path = "..."
-public_key_path = "..."
+[[backend.config.wmp.credentials]]              # the held credentials (an array:
+format = "vc+sd-jwt"                            # a presentation may result in
+type_id = "urn:example:verifier:1"              # multiple tokens, per the spec)
+key_path = "..."
+credential_path = "..."
 
-[[wmp.credential]]                              # the held credentials (an array:
-key_path = "..."                               # a presentation may result in
-chain_path = "..."                             # multiple tokens, per the spec)
-
-[[wmp.invites]]                                 # config-declared (optional)
+[[backend.config.wmp.invites]]                  # config-declared (optional)
 uri = "wmp://invite?data=..."
 
-[[wmp.relay]]                                   # candidate targets; the PDP
+[[backend.config.wmp.relay]]                    # candidate targets; the PDP
 group = "wmp:group:..."                        # decides per presentation
 content = "verified_claims"                    # or vp_token | digest
 ```
 
-No `[wmp]` block → no WMP surface at all.
+No `wmp` block → no WMP surface at all. **The identity chain's leaf
+must carry the identity's SAN DNS** — a chain for another host refuses
+the boot. The MLS credential is the basic one at wallet-core 0.4.4
+(honest: the identity is authenticated outside MLS — the session's own
+channel); the X.509 MLS credential lands when wmp-mls gains the
+signer-accepting constructor (0.4.4's `for_identity_with_certificate`
+mints a fresh Ed25519 signer regardless of the chain's key — an RFC
+9420 §5.3.1 violation found in review), and the validated chain feeds
+the §5.6 `x509_chain` assertions either way.
 
 ## The increments
 
