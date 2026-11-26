@@ -315,7 +315,7 @@ key_path = "..."
 credential_path = "..."
 
 [[backend.config.wmp.groups]]                   # config-identified groups the
-id = "wmp:group:evidence-qerds"                # verifier JOINS (the orchestrator
+id = "<the MLS GroupId, base64url>"            # verifier JOINS (the orchestrator
 via = "x509:san:dns:sirosid-gdc-wmp-mcp.fly.dev"  # creates; the gate decides)
 
 [[backend.config.wmp.invites]]                  # config-declared (optional)
@@ -343,14 +343,18 @@ fresh-key signer never minted), and the validated chain feeds the §5.6
    client; both channels; the fail-closed refusals. *(The client and
    the join decision landed in #78; the signature verification and the
    MLS join exchange land with the wallet-core 0.5.0 re-pin.)*
-3. **PDP-delegated persistent groups** — the verifier joins the
-   groups it is allowed to join (§2.1): the `[[wmp.groups]]` config
-   names the candidates, the go-spocp PDP decides each ("may this
-   entity join the group named X?"), and the MLS join exchange
-   completes the membership. **The join machinery — the invite channel
-   and the persistent-group channel — is the next implementation
-   increment.** The orchestration side (how the orchestrator creates
-   and assembles) is out of scope here.
+3. **PDP-delegated persistent groups — the join machinery**
+   *(partially landed)*: the `[[wmp.groups]]` candidates evaluate at
+   boot ("may this entity join the group named X?"); the join fires
+   when the orchestrator delivers the Welcome — `join_by_welcome`
+   gates, verifies the declared id against the Welcome's own MLS
+   GroupId, and processes it into the registry; the fresh-KeyPackage
+   surface (`fresh_key_package`) is the orchestrator's add-flow input
+   (the restart reconciliation). The invite-channel signature
+   verification (wmp-core's `InvitationVerifier`, the sender's key
+   via `wmp.resolve`) remains; the delivery endpoint
+   (POST /wmp/joins) is the orchestrator's channel, landing with the
+   actix wiring.
 4. **The responder** — the request shape, the PDP evaluation, the §5.6
    assertion generation.
 5. **The relay leg** — the verified-outcome hook, the per-target PDP

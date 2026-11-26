@@ -173,6 +173,17 @@ async fn build_proxy(cfg: ProxyConfig, config_path: &str) -> anyhow::Result<Prox
                         "the config invite's join decision"
                     );
                 }
+                // The config-identified groups — the candidate
+                // enumeration: the PDP decides each, the join fires
+                // when the orchestrator delivers the Welcome.
+                for (group, decision) in surface.evaluate_config_groups().await {
+                    tracing::info!(
+                        group = %group.id,
+                        via = %group.via,
+                        allowed = decision == siros_verifier_service::wmp::Decision::Allow,
+                        "the config group's join decision"
+                    );
+                }
             });
             None
         }

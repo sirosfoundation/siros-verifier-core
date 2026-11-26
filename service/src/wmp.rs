@@ -63,6 +63,14 @@ pub struct WmpConfig {
     /// channel alone is a valid surface).
     #[serde(default)]
     pub invites: Vec<WmpInvite>,
+    /// The config-identified groups (the candidate enumeration —
+    /// permanent groups are delegated to the authz infrastructure):
+    /// each is evaluated at boot ("may this entity join the group
+    /// named X?"), the intent recorded; the join itself fires when
+    /// the orchestrator delivers the Welcome (the restart
+    /// reconciliation model — the member state is process-lifetime).
+    #[serde(default)]
+    pub groups: Vec<WmpGroupDeclaration>,
     /// The relay targets: candidate groups a verified presentation may
     /// consign to. The PDP decides per presentation — the config names
     /// the candidates, never the conditions.
@@ -93,6 +101,19 @@ pub struct WmpCredential {
 pub struct WmpInvite {
     /// The `wmp://invite?data=...` URI.
     pub uri: String,
+}
+
+/// One config-identified group: a candidate the PDP decides on. The
+/// `via` names the orchestrating counterpart the membership is
+/// established through (the gate's context).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WmpGroupDeclaration {
+    /// The group's identifier (the MLS GroupId the Welcome will carry).
+    pub id: String,
+    /// The orchestrating counterpart (the gate's context; the Welcome
+    /// arrives from it).
+    pub via: String,
 }
 
 /// One candidate relay target.
@@ -222,22 +243,38 @@ impl ParsedInvite {
     }
 }
 
+/// The membership record: one joined group (the in-memory registry;
+/// the MLS state itself is process-lifetime — the persistence model
+/// in the design doc).
+#[derive(Debug, Clone)]
+pub struct JoinedGroup {
+    /// The group's identifier (the MLS GroupId, base64url).
+    pub id: String,
+    /// The epoch at join time.
+    pub epoch: i64,
+}
+
 /// The WMP surface: the member identity, the held credentials, the
-/// parsed invites. The group state (the MLS membership) arrives with
-/// the join machinery's increment.
+/// parsed invites, the joined groups.
 pub struct WmpSurface {
     /// Held for the following increments (the relay targets, the
     /// credentials the responder draws from); the skeleton reads the
     /// invites at construction.
     #[allow(dead_code)]
     config: WmpConfig,
-    #[allow(dead_code)]
     provider: OpenMlsProvider,
     /// The go-spocp PDP: every join decision evaluates here.
     pdp: SpocpPdp,
     /// The config-declared invites, parsed at construction (fail-fast
     /// at boot on any malformed URI or non-join purpose).
     config_invites: Vec<ParsedInvite>,
+    /// The config-identified groups (the candidates the PDP decides
+    /// on; the intent evaluated at boot).
+    config_groups: Vec<WmpGroupDeclaration>,
+    /// The joined groups: the in-memory registry. The MLS state is
+    /// process-lifetime (the persistence model); the orchestrator
+    /// reconciles membership across restarts.
+    joined: tokio::sync::Mutex<Vec<JoinedGroup>>,
 }
 
 impl WmpSurface {
@@ -344,11 +381,14 @@ impl WmpSurface {
             .with_context(|| "the [wmp] invites: a config-declared invite refused the parse")?;
         let pdp = SpocpPdp::new(&config.join_pdp_url, config.allow_insecure_pdp)
             .with_context(|| "the [wmp] join_pdp_url")?;
+        let config_groups = config.groups.clone();
         Ok(Self {
             config,
             provider,
             pdp,
             config_invites,
+            config_groups,
+            joined: tokio::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -399,6 +439,101 @@ impl WmpSurface {
         }
         decisions
     }
+
+    /// The config-identified groups' join decisions, evaluated at
+    /// boot — the candidate enumeration: permanent groups are
+    /// delegated to the authz infrastructure, so the config names the
+    /// candidates and the PDP decides each ("may this entity join the
+    /// group named X?"). An Allow is recorded as authorized; the join
+    /// itself fires when the orchestrator delivers the Welcome (the
+    /// restart reconciliation model).
+    pub async fn evaluate_config_groups(&self) -> Vec<(&WmpGroupDeclaration, Decision)> {
+        let mut decisions = Vec::with_capacity(self.config_groups.len());
+        for group in &self.config_groups {
+            let request = AuthZenRequest::join_group(self.identity(), group);
+            let decision = self.pdp.evaluate(&request).await;
+            match decision {
+                Decision::Allow => tracing::info!(
+                    group = %group.id,
+                    via = %group.via,
+                    "the group join is authorized — awaiting the orchestrator's Welcome"
+                ),
+                Decision::Deny => tracing::info!(
+                    group = %group.id,
+                    via = %group.via,
+                    "the group join is denied"
+                ),
+            }
+            decisions.push((group, decision));
+        }
+        decisions
+    }
+
+    /// The join: process a Welcome the orchestrator delivered, through
+    /// the policy gate. The declared group id must match the Welcome's
+    /// own MLS GroupId — a mismatch is a misdelivery, refused loudly.
+    /// The joined group enters the registry (the epoch at join time).
+    pub async fn join_by_welcome(
+        &self,
+        declaration: &WmpGroupDeclaration,
+        welcome: &str,
+    ) -> Result<JoinedGroup> {
+        // The gate first: may this verifier join the group named X?
+        // (Fail-closed — the PDP's denial refuses before any MLS
+        // state touches the provider.)
+        let request = AuthZenRequest::join_group(self.identity(), declaration);
+        match self.pdp.evaluate(&request).await {
+            Decision::Allow => {}
+            Decision::Deny => {
+                return Err(anyhow!(
+                    "the group join for {:?} is denied by policy",
+                    declaration.id
+                ))
+            }
+        }
+        // The Welcome processes: the provider's own key store holds the
+        // KeyPackage's private key (the orchestrator added the member
+        // by this surface's KeyPackage).
+        use wmp_core::mls::MlsProvider as _;
+        let (group_id, epoch) = self
+            .provider
+            .process_welcome(welcome)
+            .map_err(|e| anyhow!("processing the Welcome: {}", e.to_rpc()))?;
+        if group_id != declaration.id {
+            return Err(anyhow!(
+                "the Welcome is for group {group_id:?} but the join was declared for {:?} — a misdelivery",
+                declaration.id
+            ));
+        }
+        let joined = JoinedGroup {
+            id: group_id,
+            epoch,
+        };
+        tracing::info!(
+            group = %joined.id,
+            epoch = joined.epoch,
+            "joined the group (the orchestrator's Welcome processed)"
+        );
+        self.joined.lock().await.push(joined.clone());
+        Ok(joined)
+    }
+
+    /// The joined groups (the registry snapshot).
+    pub async fn joined_groups(&self) -> Vec<JoinedGroup> {
+        self.joined.lock().await.clone()
+    }
+
+    /// A fresh KeyPackage for this member — the orchestrator's add
+    /// flow consumes it (the restart reconciliation: a restarted
+    /// verifier presents a fresh package; the orchestrator re-adds).
+    pub fn fresh_key_package(&self, cipher_suite: i64) -> Result<String> {
+        use wmp_core::mls::MlsProvider as _;
+        let package = self
+            .provider
+            .generate_key_package(cipher_suite)
+            .map_err(|e| anyhow!("the key package: {}", e.to_rpc()))?;
+        Ok(package.key_package)
+    }
 }
 
 // ---- the go-spocp AuthZEN client ------------------------------------------------
@@ -448,6 +583,30 @@ impl AuthZenRequest {
             "action": {"name": self.action},
             "context": self.context,
         })
+    }
+
+    /// The persistent-group join's request: may **the verifier** join
+    /// the group named X, established through the orchestrator `via`?
+    /// The subject the resource owner, the group the resource — the
+    /// same primitive as the invite's, the declaration's context.
+    pub fn join_group(verifier_id: &str, group: &WmpGroupDeclaration) -> Self {
+        Self {
+            subject: AuthZenEntity {
+                kind: "verifier",
+                id: verifier_id.to_string(),
+                properties: None,
+            },
+            resource: AuthZenEntity {
+                kind: "wmp_group",
+                id: group.id.clone(),
+                properties: None,
+            },
+            action: "join",
+            context: serde_json::json!({
+                "via": group.via,
+                "source": "config",
+            }),
+        }
     }
 
     /// The join decision's request: may **the verifier** join this

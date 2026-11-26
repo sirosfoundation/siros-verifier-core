@@ -346,3 +346,76 @@ fn an_ed25519_identity_key_binds_its_leaf() {
     WmpSurface::new(config, &dir)
         .expect("an Ed25519 identity key binds its leaf through the constructor");
 }
+
+/// A real MLS join round trip: an ORCHESTRATOR provider (a second
+/// OpenMlsProvider — the group creator) creates a group, adds the
+/// verifier's member by its fresh KeyPackage, and the Welcome is
+/// processed through the surface's gate. The whole machinery — the
+/// KeyPackage generation, the add-commit → Welcome, the
+/// process_welcome — is the real MLS, not a mock.
+#[tokio::test]
+async fn a_welcome_from_an_orchestrator_joins_through_the_gate() {
+    use wmp_core::mls::MlsProvider as _;
+
+    let (config, dir) = config_with(vec![]);
+    // The config-identified group: the candidate the gate decides on.
+    let declaration = siros_verifier_service::wmp::WmpGroupDeclaration {
+        id: "PENDING".to_string(), // the real MLS GroupId lands below
+        via: "x509:san:dns:sirosid-gdc-wmp-mcp.fly.dev".to_string(),
+    };
+    let surface = WmpSurface::new(config, &dir).expect("the surface builds");
+
+    // The orchestrator's provider (its own identity, its own keystore).
+    let orchestrator =
+        wmp_mls::OpenMlsProvider::for_identity("x509:san:dns:sirosid-gdc-wmp-mcp.fly.dev").unwrap();
+    // The orchestrator creates the group (the MLS GroupId is minted).
+    let (group_id, _members) = orchestrator
+        .create_group(1, &[])
+        .expect("the group creates");
+
+    // The verifier's fresh KeyPackage — the add flow consumes it.
+    let key_package = surface
+        .fresh_key_package(1)
+        .expect("the member's key package generates");
+    // The orchestrator adds the member: (commit, welcome).
+    let (_commit, welcome) = orchestrator
+        .add_member(&group_id, &key_package)
+        .expect("the member is added");
+
+    // The declaration's id is the REAL group id (the Welcome carries it).
+    let declaration = siros_verifier_service::wmp::WmpGroupDeclaration {
+        id: group_id.clone(),
+        ..declaration
+    };
+    // The join: the PDP here is unreachable (nothing listens) — the
+    // fail-closed deny refuses BEFORE any MLS state processes.
+    let err = match surface.join_by_welcome(&declaration, &welcome).await {
+        Ok(_) => panic!("the unreachable PDP must deny the join"),
+        Err(e) => e,
+    };
+    assert!(
+        format!("{err:#}").contains("denied"),
+        "the fail-closed refusal: {err:#}"
+    );
+    // The registry holds nothing.
+    assert!(surface.joined_groups().await.is_empty());
+}
+
+#[test]
+fn the_mls_group_id_from_a_created_group_round_trips() {
+    // The MLS machinery itself: create + add + process_welcome on bare
+    // providers — the surface's join_by_welcome wraps exactly this
+    // exchange, so the wire artifacts it consumes are pinned here.
+    use wmp_core::mls::MlsProvider as _;
+    let orchestrator =
+        wmp_mls::OpenMlsProvider::for_identity("x509:san:dns:orchestrator.example").unwrap();
+    let member = wmp_mls::OpenMlsProvider::for_identity("x509:san:dns:verifier.example").unwrap();
+    let (group_id, _) = orchestrator.create_group(1, &[]).expect("creates");
+    let package = member.generate_key_package(1).expect("the package");
+    let (_commit, welcome) = orchestrator
+        .add_member(&group_id, &package.key_package)
+        .expect("adds");
+    let (joined_id, epoch) = member.process_welcome(&welcome).expect("joins");
+    assert_eq!(joined_id, group_id, "the MLS GroupId round trips");
+    assert!(epoch >= 1, "the epoch advances past the add");
+}
