@@ -273,37 +273,53 @@ fn a_key_that_is_not_the_leafs_refuses_the_build() {
 
 #[test]
 fn a_compressed_leaf_point_binds_the_matching_key() {
-    // RFC 5480 §2.2: a certificate's SPKI may carry a compressed SEC1
-    // point while the key's own SPKI emits the uncompressed form — the
-    // same key, two encodings. The binding compares DECODED keys, so
-    // this pair must be accepted (the byte comparison rejected it).
-    let (_config, dir) = config_with(vec![]);
-    // Rewrite the chain's leaf with a compressed point: re-encode the
-    // generated certificate's SPKI subjectPublicKey. rcgen emits
-    // uncompressed P-256 points, so this test builds a second self-
-    // signed pair and checks the decoder's own round trip: the leaf's
-    // SPKI (however the encoder wrote the point) decodes to the same
-    // p256::PublicKey as the key's.
+    // RFC 5480 §2.2: a certificate's SPKI may carry a COMPRESSED SEC1
+    // point (0x02/0x03 prefix) while the key's own SPKI emits the
+    // uncompressed form — the same key, two encodings. The regression
+    // protection goes THROUGH WmpSurface::new: the leaf re-encoded
+    // with the compressed point must still build (a byte comparison
+    // would reject it).
+    let dir = fixture_dir();
     let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
     let cert = rcgen::CertificateParams::new(vec!["verifier.example".to_string()])
         .unwrap()
         .self_signed(&kp)
         .unwrap();
-    let leaf_der = cert.der().to_vec();
-    // The decoded comparison itself: the leaf's SPKI decodes to the
-    // key's public half regardless of the point's compressed form.
-    let surface_key =
-        siros_verifier_service::wmp::leaf_public_key(&leaf_der).expect("the leaf decodes");
-    let key_der = pem::parse_many(kp.serialize_pem())
-        .unwrap()
-        .into_iter()
-        .find(|b| b.tag() == "PRIVATE KEY")
-        .map(pem::Pem::into_contents)
-        .unwrap();
-    let surface_leaf = siros_verifier_service::wmp::key_public(&key_der).expect("the key decodes");
-    assert_eq!(
-        surface_key, surface_leaf,
-        "the same key pair decodes equal regardless of the point encoding"
-    );
-    let _ = dir;
+    // The leaf's DER with the SPKI's point replaced by the compressed
+    // form. The signature no longer covers the modified TBS — the
+    // surface does not verify the identity file's self-signature (the
+    // deployment's own file), only the parse, the SAN and the key
+    // binding, so the re-encode is faithful to what the constructor
+    // reads.
+    let compressed = {
+        let key_der = pem::parse_many(kp.serialize_pem())
+            .unwrap()
+            .into_iter()
+            .find(|b| b.tag() == "PRIVATE KEY")
+            .map(pem::Pem::into_contents)
+            .unwrap();
+        let secret =
+            <p256::SecretKey as p256::pkcs8::DecodePrivateKey>::from_pkcs8_der(&key_der).unwrap();
+        use p256::elliptic_curve::sec1::ToSec1Point;
+        secret.public_key().to_sec1_point(true).as_bytes().to_vec()
+    };
+    let modified = {
+        use x509_cert::der::{asn1::BitString, Decode, Encode};
+        let parsed = x509_cert::Certificate::from_der(cert.der()).unwrap();
+        let mut spki = parsed.tbs_certificate.subject_public_key_info.clone();
+        spki.subject_public_key = BitString::from_bytes(&compressed).unwrap();
+        let mut tbs = parsed.tbs_certificate.clone();
+        tbs.subject_public_key_info = spki;
+        let rebuilt = x509_cert::Certificate {
+            tbs_certificate: tbs,
+            ..parsed.clone()
+        };
+        rebuilt.to_der().unwrap()
+    };
+    let block = pem::Pem::new("CERTIFICATE", modified);
+    std::fs::write(dir.join("identity_chain.pem"), pem::encode(&block)).unwrap();
+    std::fs::write(dir.join("identity_key.pem"), kp.serialize_pem()).unwrap();
+    let config = config_in(&dir, vec![]);
+    WmpSurface::new(config, &dir)
+        .expect("a compressed leaf point binds the matching key through the constructor");
 }
