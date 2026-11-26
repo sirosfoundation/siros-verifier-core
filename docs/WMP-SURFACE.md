@@ -98,18 +98,23 @@ received invite as two entrances to the same MLS exchange; the gate
 evaluates both (the declaration's context names the configured group,
 an invite's context names the signed invitation).
 
-**Persistent group membership may itself be represented as AuthZEN PDP
-queries**: "is this entity (its client_id) allowed to join the group
-named X?" — subject: the entity's identifier; resource: the group
-name; action: `join`. This is the SAME query shape the invite gate
-already uses (the group name as the resource instead of the invite's
-provider), so the PDP's rules can carry the membership policy for
-persistent groups — the rules engine as the authority for who belongs
-where — and the two bootstrap channels (an invite, a config
-declaration) become two entrances to one policy primitive. A
-deployment may then need no group roster in its config at all: the
-verifier asks the PDP which groups it may join (or is told, per
-query, for a named group).
+**Permanent groups are delegated to the authz infrastructure**: the
+membership policy lives in the PDP's rules, not in config rosters. The
+representation is the AuthZEN query "is this entity (its client_id)
+allowed to join the group named X?" — subject: the entity's
+identifier; resource: the group name; action: `join` — the SAME query
+shape the invite gate already uses (the group name as the resource
+instead of the invite's provider). The two bootstrap channels (an
+invite, a config-declared group) become two entrances to one policy
+primitive, and the rules engine is the single authority for who
+belongs where.
+
+The config's remaining role is the CANDIDATE enumeration: AuthZEN is a
+question-answer protocol, so the verifier asks about named groups —
+`[[wmp.groups]]` names the candidates the deployment knows about, and
+the PDP decides each. (A discovery mechanism that enumerates the groups
+without config naming them is an open item for the later discussion;
+AuthZEN's boolean answer does not carry a list by itself.)
 
 The concrete mechanisms — how the group definition is expressed in
 configuration, how the orchestrator discovers the participants and
@@ -308,13 +313,14 @@ fresh-key signer never minted), and the validated chain feeds the §5.6
    client; both channels; the fail-closed refusals. *(The client and
    the join decision landed in #78; the signature verification and the
    MLS join exchange land with the wallet-core 0.5.0 re-pin.)*
-3. **Config-defined group membership** — the verifier joins the
-   config-identified groups (§2.1): the `[[wmp.groups]]` declarations,
-   the same MLS join exchange as the invites, the same go-spocp gate
-   evaluating each. **The join machinery — both channels — is the next
-   implementation increment (on the wallet-core 0.5.0 re-pin); the
-   config surface lands with it.** The orchestration side (how the
-   orchestrator creates and assembles) is out of scope here.
+3. **PDP-delegated persistent groups** — the verifier joins the
+   groups it is allowed to join (§2.1): the `[[wmp.groups]]` config
+   names the candidates, the go-spocp PDP decides each ("may this
+   entity join the group named X?"), and the MLS join exchange
+   completes the membership. **The join machinery — the invite channel
+   and the persistent-group channel — is the next implementation
+   increment.** The orchestration side (how the orchestrator creates
+   and assembles) is out of scope here.
 4. **The responder** — the request shape, the PDP evaluation, the §5.6
    assertion generation.
 5. **The relay leg** — the verified-outcome hook, the per-target PDP
