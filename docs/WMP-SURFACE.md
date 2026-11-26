@@ -73,6 +73,38 @@ per-group in the flow store keyed by group id. The boot rehydrates
 every group; membership survives restarts. The provider's one-identity
 keystore holds the verifier's WMP key material.
 
+### 2.1 Config-defined group creation — headless compositions
+
+The verifier must also be able to **create** groups, not only join
+them: static combinations of headless participants — verifiers,
+issuers, headless wallets, other tools — assembled from configuration
+with **no user interaction**. A declared group's members are known
+parties (each a configured WMP identity); the assembly is the MLS
+create → KeyPackage resolution → add-commit → Welcome flow, driven at
+boot or on demand.
+
+This is the orchestration substrate the purpose statement names: a
+verifier, an issuer and a headless wallet in one MLS group, the QERDS
+consignment and presentation flows riding it, all declared rather than
+invited.
+
+**The design space** (the concrete mechanism is an open discussion —
+deliberately not yet chosen):
+
+| Option | The group definition lives in | Assembly |
+|---|---|---|
+| **A. Named roster in the config** | `[[wmp.groups]]`: the group's name + the members' WMP identifiers; the members' KeyPackages resolved via `wmp.resolve` / the well-known at create time | The verifier (as the creator named by the config, or the first-listed member) drives the MLS create and adds each roster member |
+| **B. Policy-defined composition** | The go-spocp PDP (or a group registry): the rules return the member set for a named group | The verifier asks the policy layer for the composition, then assembles; the roster stays a rules artifact, not config |
+| **C. Environment-level declaration** | The deployment tooling renders each participant's config with the same group definition (like the environment's other rendered fixtures); every participant learns its memberships | A designated creator assembles; the others accept the Welcome — same trust chain as the invite gate, minus the invitation UX |
+| **D. Self-assembling** | Every participant declares the group identically; a deterministic role assignment (config-declared creator) | The creator assembles; identity/consent is the mutual config declaration |
+
+The open questions to settle: who holds the creator role (and whether
+it can rotate), how members' KeyPackages are discovered (the well-known
+publication vs. direct resolution), whether creation itself is a policy
+decision at the PDP (it plausibly is — the same fail-closed posture as
+the join), and how a config change to the roster reconciles with a live
+group (add/remove commits vs. re-create).
+
 ### 3. The responder — a presentation flow, spec-native
 
 The verifier's API is not an ad-hoc message body: it is an **OpenID4VP
@@ -254,14 +286,20 @@ the §5.6 `x509_chain` assertions either way.
 
 1. **The WMP embedding skeleton** — `wmp-core` + `wmp-mls` as service
    dependencies; the config block; the multi-group session state in the
-   flow store; the boot/rehydration.
+   flow store; the boot/rehydration. *(Landed — #78.)*
 2. **The invite gate** — parse/verify; the go-spocp AuthZEN join
-   client; both channels; the fail-closed refusals.
-3. **The responder** — the request shape, the PDP evaluation, the §5.6
+   client; both channels; the fail-closed refusals. *(The client and
+   the join decision landed in #78; the signature verification and the
+   MLS join exchange land with the wallet-core 0.5.0 re-pin.)*
+3. **Config-defined group creation** — the headless compositions of
+   §2.1: the concrete mechanism chosen from the design space (the open
+   discussion), the assembly flow, the creator role, the roster
+   reconciliation. **Blocked on that discussion.**
+4. **The responder** — the request shape, the PDP evaluation, the §5.6
    assertion generation.
-4. **The relay leg** — the verified-outcome hook, the per-target PDP
+5. **The relay leg** — the verified-outcome hook, the per-target PDP
    evaluation with the process context, the consignment.
-5. **Tests + drills** — the invite refusal path, the multi-group
+6. **Tests + drills** — the invite refusal path, the multi-group
    persistence-across-restart, the request/response round trip, the
    relay policy branches.
 
