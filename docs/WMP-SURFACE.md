@@ -116,6 +116,45 @@ presentation; there is no processed form on this wire). Where the
 relay leg consigns verified presentations onward, the same rule holds:
 the raw token rides the consignment, per the QERDS evidence model.
 
+### 3.1 The `verifier.present` flow type — the profile definition
+
+Following wmp-core §6.5's extension requirements (the six things a
+profile MUST define), the verifier profile:
+
+**1. Flow type identifier:** `verifier.present`
+
+**2. Capability:** `verifier` — negotiated at session create; a
+`wmp.flow.start` of type `verifier.present` without the negotiated
+capability answers `-31005` (Section 3.8.1's rule).
+
+**3. `wmp.flow.start` params:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `dcql_query` | object | REQUIRED | The DCQL query naming the credentials/claims the initiator wants from the verifier (the §3.2.1 model; `request_uri`/`presentation_definition` are not used — the verifier's credential catalogue is addressed directly) |
+| `nonce` | string | REQUIRED | The initiator's challenge — binds the presentation (the §3.2.5 sign sub-flow's `nonce`) |
+| `audience` | string | REQUIRED | The initiator's WMP identifier — the presentation's audience |
+| `client_metadata` | object | OPTIONAL | The initiator's metadata, verbatim when its acceptance policy wants more |
+
+**4. Progress steps:** `evaluating_policy` (the go-spocp evaluation
+underway), `policy_evaluated` (payload: the decision's public shape —
+allowed/denied, never the rule text), `generating_presentation`.
+
+**5. Actions:** `cancel` (reason OPTIONAL) — the initiator may cancel;
+the responder has no user-facing actions (the policy decision IS the
+selection — no `select_credentials` equivalent, the machine holder
+selects from its catalogue per the query).
+
+**6. `wmp.flow.complete` result:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `vp_token` | string / string[] / object | REQUIRED | The §3.2.4 shape: a non-empty string, a non-empty array of strings, or — for a DCQL request — **the object form `{"<credential query id>": ["<presentation>", ...]}`**. Multiple tokens per presentation; the raw presentation verbatim |
+
+A policy denial completes as `wmp.flow.error` (code `-32603`-class,
+`data.cause: policy_denied` — the reason is public, the rule text
+never is).
+
 **Two distinct mechanisms, both spec-native, both carrying raw
 vp_tokens:**
 
@@ -176,28 +215,40 @@ Both are policy-gated; neither is a default.
 
 ## The config surface
 
+The block rides the deployment config — `[backend.config.wmp]`, the
+same place the keys and the PDP endpoint live:
+
 ```toml
-[wmp]
+[backend.config.wmp]
 join_pdp_url = "http://sirosid-gdc-spocp.internal:8000/access/v1/evaluation"
 invite_endpoint = true                          # POST /wmp/invites (optional)
+allow_insecure_pdp = true                       # the private-network PDP posture (explicit)
+identity = "x509:san:dns:sirosid-gdc-siros-verifier.fly.dev"
+identity_chain_path = "/pki/verifier_ec_chain.pem"   # leaf first; its SAN DNS must match the identity
 
-[wmp.member_key]                                # the verifier's WMP key material
-private_key_path = "..."
-public_key_path = "..."
+[[backend.config.wmp.credentials]]              # the held credentials (an array:
+format = "vc+sd-jwt"                            # a presentation may result in
+type_id = "urn:example:verifier:1"              # multiple tokens, per the spec)
+key_path = "..."
+credential_path = "..."
 
-[[wmp.credential]]                              # the held credentials (an array:
-key_path = "..."                               # a presentation may result in
-chain_path = "..."                             # multiple tokens, per the spec)
-
-[[wmp.invites]]                                 # config-declared (optional)
+[[backend.config.wmp.invites]]                  # config-declared (optional)
 uri = "wmp://invite?data=..."
 
-[[wmp.relay]]                                   # candidate targets; the PDP
+[[backend.config.wmp.relay]]                    # candidate targets; the PDP
 group = "wmp:group:..."                        # decides per presentation
 content = "verified_claims"                    # or vp_token | digest
 ```
 
-No `[wmp]` block → no WMP surface at all.
+No `wmp` block → no WMP surface at all. **The identity chain's leaf
+must carry the identity's SAN DNS** — a chain for another host refuses
+the boot. The MLS credential is the basic one at wallet-core 0.4.4
+(honest: the identity is authenticated outside MLS — the session's own
+channel); the X.509 MLS credential lands when wmp-mls gains the
+signer-accepting constructor (0.4.4's `for_identity_with_certificate`
+mints a fresh Ed25519 signer regardless of the chain's key — an RFC
+9420 §5.3.1 violation found in review), and the validated chain feeds
+the §5.6 `x509_chain` assertions either way.
 
 ## The increments
 

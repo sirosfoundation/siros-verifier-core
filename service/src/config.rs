@@ -334,6 +334,10 @@ pub struct DeploymentConfig {
     /// members.
     #[serde(default)]
     pub verifier_info_path: Option<String>,
+    /// The WMP surface: absent — the whole [wmp] block — the service
+    /// has no WMP surface at all.
+    #[serde(default)]
+    pub wmp: Option<crate::wmp::WmpConfig>,
     #[serde(flatten)]
     pub vp: VpBackendConfig,
 }
