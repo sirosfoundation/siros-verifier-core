@@ -98,12 +98,26 @@ received invite as two entrances to the same MLS exchange; the gate
 evaluates both (the declaration's context names the configured group,
 an invite's context names the signed invitation).
 
+**Persistent group membership may itself be represented as AuthZEN PDP
+queries**: "is this entity (its client_id) allowed to join the group
+named X?" — subject: the entity's identifier; resource: the group
+name; action: `join`. This is the SAME query shape the invite gate
+already uses (the group name as the resource instead of the invite's
+provider), so the PDP's rules can carry the membership policy for
+persistent groups — the rules engine as the authority for who belongs
+where — and the two bootstrap channels (an invite, a config
+declaration) become two entrances to one policy primitive. A
+deployment may then need no group roster in its config at all: the
+verifier asks the PDP which groups it may join (or is told, per
+query, for a named group).
+
 The concrete mechanisms — how the group definition is expressed in
 configuration, how the orchestrator discovers the participants and
 drives the assembly, and how the declaration reconciles with the live
 group across redeploys — are deliberately not chosen here: there are
 many ways to define such constructions, and the options are discussed
-later. The design records the requirement and the actor split.
+later. The design records the requirement, the actor split, and the
+PDP-query representation above as an input to that discussion.
 
 ### 3. The responder — a presentation flow, spec-native
 
