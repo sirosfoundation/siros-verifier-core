@@ -326,3 +326,20 @@ fn a_compressed_leaf_point_binds_the_matching_key() {
     WmpSurface::new(config, &dir)
         .expect("a compressed leaf point binds the matching key through the constructor");
 }
+
+#[test]
+fn an_ed25519_identity_key_binds_its_leaf() {
+    // The other MLS suite algorithm (Ed25519, RFC 8410): the binding
+    // check must decode it as happily as the P-256 half.
+    let dir = fixture_dir();
+    let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+    let cert = rcgen::CertificateParams::new(vec!["verifier.example".to_string()])
+        .unwrap()
+        .self_signed(&kp)
+        .unwrap();
+    std::fs::write(dir.join("identity_chain.pem"), cert.pem()).unwrap();
+    std::fs::write(dir.join("identity_key.pem"), kp.serialize_pem()).unwrap();
+    let config = config_in(&dir, vec![]);
+    WmpSurface::new(config, &dir)
+        .expect("an Ed25519 identity key binds its leaf through the constructor");
+}
