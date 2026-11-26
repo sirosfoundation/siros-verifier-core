@@ -15,7 +15,8 @@ fn session() -> siros_verifier_core::oid4vp::Session {
         ttl_secs: 300,
         vp_formats_supported: None,
         client_id: None,
-
+        caller_nonce: None,
+        caller_client_id: None,
         verifier_info: None,
         wrprc: None,
     };

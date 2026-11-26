@@ -41,6 +41,29 @@ pub struct RequestConfig {
     /// Explicit client ID for formats that require a different scheme from the
     /// default x509_hash. `zkp_req` uses x509_san_dns or semantic_id.
     pub client_id: Option<String>,
+    /// The caller-supplied nonce (the CS-15 §5.6 assertion model: the
+    /// consignment session's challenge reaches the wallet's KB proof
+    /// through the request's nonce). `None` generates a fresh random
+    /// nonce — the historic behavior. Found driving the acceptance
+    /// round: the fresh mint bound the KB to a verifier-random value
+    /// and the recipient's gate could not relate the presentation to
+    /// the consignment session (delivery_failed RE04, 2026-11-25).
+    pub caller_nonce: Option<String>,
+    /// The caller-supplied client_id (the CS-15 §13 acceptance model's
+    /// aud binding): the consignment session's id becomes the
+    /// authorization request's client_id — the JAR's claim and the
+    /// outer parameter — so the wallet's key binding JWT carries
+    /// `aud` = the session id, the value the recipient's acceptance
+    /// gate reads. The request object stays signed by the verifier's
+    /// certificate (the x5c chain verifies unchanged); a bare client_id
+    /// carries no scheme binding and the wallet's trust evaluation
+    /// still runs on the verified chain. `None` keeps the
+    /// format-driven or certificate-derived client_id — the historic
+    /// behavior. Found driving the acceptance round: the KB's aud read
+    /// the verifier's x509_hash form and the recipient's gate refused
+    /// to relate the presentation to the consignment session (the
+    /// delivery gate, 2026-11-26).
+    pub caller_client_id: Option<String>,
     /// The ETSI TS 119 472-2 §6.3.2.2 EAAP profile's registrar dataset (the
     /// `verifier_info` registrar_dataset element, RO-02..12): the RP
     /// Registrar-provided data as the B.2 JSON members. `None` sends no
@@ -413,14 +436,18 @@ fn create_request_with_response_mode(
     let leaf = chain_der
         .first()
         .ok_or_else(|| malformed("certificate chain is empty"))?;
-    let client_id = match &cfg.client_id {
-        Some(id) => {
+    let client_id = match (&cfg.caller_client_id, &cfg.client_id) {
+        // The caller-supplied client_id wins (the aud binding): the
+        // acceptance gate reads the KB's aud as the consignment
+        // session's id — the exact analogue of the caller_nonce below.
+        (Some(caller), _) => caller.clone(),
+        (None, Some(id)) => {
             if !(id.starts_with("x509_san_dns:") || id.starts_with("semantic_id:")) {
                 return Err(malformed("unsupported explicit client_id scheme"));
             }
             id.clone()
         }
-        None => x509_hash_client_id(leaf),
+        (None, None) => x509_hash_client_id(leaf),
     };
 
     let mut enc_key = jose_rs::jwk::generate_ec("P-256")?;
@@ -432,7 +459,7 @@ fn create_request_with_response_mode(
 
     let session = Session {
         client_id: client_id.clone(),
-        nonce: random_token(),
+        nonce: cfg.caller_nonce.clone().unwrap_or_else(random_token),
         state: random_token(),
         response_uri: cfg.response_uri.clone(),
         dcql_query: cfg.dcql_query.clone(),

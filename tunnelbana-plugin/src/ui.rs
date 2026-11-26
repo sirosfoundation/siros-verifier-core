@@ -382,6 +382,21 @@ fn launch_request(ctx: &Context, requester: &str) -> InternalData {
     if let Some(scheme) = ctx.request.form.get("scheme") {
         request.set_attr(SCHEME_ATTRIBUTE, scheme);
     }
+    // The CS-15 §5.6 nonce pass-through: the consignment session's
+    // challenge rides the flow-start form and reaches the wallet's KB
+    // proof through the request object's nonce field.
+    if let Some(nonce) = ctx.request.form.get("nonce") {
+        request.set_attr("_siros_nonce", nonce);
+    }
+    // The client_id pass-through (the aud binding, CS-15 §13): the
+    // consignment session's id rides the flow-start form and becomes
+    // the authorization request's client_id — the wallet's KB binds
+    // its aud to the request's client_id, so the recipient's
+    // acceptance gate reads aud = the session id. The exact analogue
+    // of the nonce pass-through above.
+    if let Some(client_id) = ctx.request.form.get("client_id") {
+        request.set_attr("_siros_client_id", client_id);
+    }
     request
 }
 

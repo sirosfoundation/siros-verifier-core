@@ -383,6 +383,8 @@ fn the_request_carries_verifier_info_per_the_472_2_profile() {
         ttl_secs: 300,
         vp_formats_supported: None,
         client_id: None,
+        caller_nonce: None,
+        caller_client_id: None,
         verifier_info: Some(registrar_dataset()),
         wrprc: Some(wrprc.clone()),
     };
@@ -429,6 +431,8 @@ fn an_unconfigured_request_carries_no_verifier_info() {
         ttl_secs: 300,
         vp_formats_supported: None,
         client_id: None,
+        caller_nonce: None,
+        caller_client_id: None,
         verifier_info: None,
         wrprc: None,
     };
@@ -461,6 +465,8 @@ fn a_malformed_wrprc_fails_the_arm_and_a_forged_dataset_fails_the_build() {
         ttl_secs: 300,
         vp_formats_supported: None,
         client_id: None,
+        caller_nonce: None,
+        caller_client_id: None,
         verifier_info: None,
         wrprc: Some(bad),
     };

@@ -2070,6 +2070,11 @@ impl VpBackend {
             let jwe = jwe.clone();
             tokio::task::spawn_blocking(move || {
                 let opened = oid4vp::open_response(&session, &jwe, now)?;
+                // The raw vp_token (SD-JWT~KB), logged for the identity
+                // assertion handoff — the flow's outcome data is sealed,
+                // but the assertion needs the exact wire string.
+                tracing::info!(target: "vp_token", token_bytes = opened.vp_token_text().len(), "raw vp_token captured");
+                tracing::info!(target: "vp_token", "VP_TOKEN_BEGIN\n{}\nVP_TOKEN_END", opened.vp_token_text());
                 let hints = issuer_jwks_hints(&opened.vp_token_text());
                 Ok::<_, siros_verifier_core::Error>((opened, hints, crypto_permit))
             })
@@ -2651,12 +2656,22 @@ impl Backend for VpBackend {
             None
         };
         let request_uri_method = self.cfg.request_uri_method.clone();
+        let caller_nonce = request
+            .attr_first("_siros_nonce")
+            .filter(|n| !n.is_empty() && n.len() <= 256)
+            .map(str::to_owned);
+        let caller_client_id = request
+            .attr_first("_siros_client_id")
+            .filter(|c| !c.is_empty() && c.len() <= 256)
+            .map(str::to_owned);
         let cfg = RequestConfig {
             response_uri: format!("{}/response/{id}", self.module_base),
             dcql_query,
             ttl_secs: self.cfg.request_ttl_secs,
             vp_formats_supported: zkp.map(|z| z.vp_formats.clone()),
             client_id: zkp.map(|z| z.cfg.verifier_id.clone()),
+            caller_nonce,
+            caller_client_id,
             // The EAAP members from the backend config — increment 2's
             // wiring: the WRPRC (the fronted RP's registration certificate)
             // and the registrar dataset ride the armed request when the

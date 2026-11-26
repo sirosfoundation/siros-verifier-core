@@ -64,6 +64,8 @@ fn start(w: &World, q: Value) -> (String, Session) {
         ttl_secs: 300,
         vp_formats_supported: None,
         client_id: None,
+        caller_nonce: None,
+        caller_client_id: None,
 
         verifier_info: None,
         wrprc: None,
@@ -88,6 +90,48 @@ fn disclosure_idx(w: &World, name: &str) -> usize {
                 .contains(name)
         })
         .unwrap()
+}
+
+/// The client_id pass-through (the aud binding, CS-15 §13): a
+/// caller-supplied client_id becomes the JAR's `client_id` claim and the
+/// session's — so the wallet's KB binds its `aud` to it (the consignment
+/// session's id), and the recipient's acceptance gate reads the
+/// presentation back onto the session. The request stays signed by the
+/// verifier's certificate; only the claim moves.
+#[test]
+fn the_caller_client_id_becomes_the_jars_claim_and_the_sessions() {
+    let w = world();
+    let signer = software_signer(&w.verifier_key).unwrap();
+    let cfg = RequestConfig {
+        response_uri: "https://verify.example/resp".into(),
+        dcql_query: dcql(&["given_name"]),
+        ttl_secs: 300,
+        vp_formats_supported: None,
+        client_id: None,
+        caller_nonce: None,
+        caller_client_id: Some("ses-ccd9ce885bad99c2a91b42d0c748add2".to_owned()),
+        verifier_info: None,
+        wrprc: None,
+    };
+    let (jar, session) = create_request(
+        &cfg,
+        &signer,
+        "ES256",
+        std::slice::from_ref(&w.verifier_cert),
+        NOW,
+    )
+    .unwrap();
+
+    // The JAR's client_id claim: the caller's value, verbatim.
+    let header = jws::decode_header(&jar).unwrap();
+    let chain = sdjwt::x5c_chain(&header).unwrap();
+    let leaf = sdjwt::jwk_from_cert_der(&chain[0]).unwrap();
+    let payload: Value =
+        serde_json::from_slice(&jws::compact::verify_with_jwk(&leaf, &jar).unwrap()).unwrap();
+    assert_eq!(payload["client_id"], "ses-ccd9ce885bad99c2a91b42d0c748add2");
+    // The signature still verifies under the verifier's own leaf: the
+    // certificate authenticates the request; the claim carries the id.
+    assert_eq!(session.client_id, "ses-ccd9ce885bad99c2a91b42d0c748add2");
 }
 
 #[test]
@@ -212,6 +256,8 @@ fn dc_api_uses_the_browser_origin_for_holder_binding() {
         ttl_secs: 300,
         vp_formats_supported: None,
         client_id: None,
+        caller_nonce: None,
+        caller_client_id: None,
 
         verifier_info: None,
         wrprc: None,
@@ -266,6 +312,8 @@ fn dc_api_origin_must_be_a_bare_http_origin() {
         ttl_secs: 300,
         vp_formats_supported: None,
         client_id: None,
+        caller_nonce: None,
+        caller_client_id: None,
 
         verifier_info: None,
         wrprc: None,
@@ -843,6 +891,8 @@ fn start_mdoc(w: &World, dc_api: bool) -> (String, Session) {
         ttl_secs: 300,
         vp_formats_supported: None,
         client_id: None,
+        caller_nonce: None,
+        caller_client_id: None,
 
         verifier_info: None,
         wrprc: None,
@@ -935,6 +985,8 @@ fn mixed_sd_jwt_and_mdoc_presentations_stay_distinct() {
         ttl_secs: 300,
         vp_formats_supported: None,
         client_id: None,
+        caller_nonce: None,
+        caller_client_id: None,
 
         verifier_info: None,
         wrprc: None,
@@ -998,6 +1050,8 @@ fn mdoc_rejects_wrong_doctype_missing_claims_and_wrong_handover() {
         ttl_secs: 300,
         vp_formats_supported: None,
         client_id: None,
+        caller_nonce: None,
+        caller_client_id: None,
 
         verifier_info: None,
         wrprc: None,
@@ -1040,6 +1094,8 @@ fn mdoc_rejects_missing_claim_and_remote_device_mac() {
         ttl_secs: 300,
         vp_formats_supported: None,
         client_id: None,
+        caller_nonce: None,
+        caller_client_id: None,
 
         verifier_info: None,
         wrprc: None,
@@ -1100,6 +1156,8 @@ fn encrypted_response_metadata_matches_openid4vp_1_0() {
         ttl_secs: 300,
         vp_formats_supported: None,
         client_id: None,
+        caller_nonce: None,
+        caller_client_id: None,
 
         verifier_info: None,
         wrprc: None,
@@ -1174,6 +1232,8 @@ fn plain_direct_post_round_trips_without_the_jwe_layer() {
         ttl_secs: 300,
         vp_formats_supported: None,
         client_id: None,
+        caller_nonce: None,
+        caller_client_id: None,
         verifier_info: None,
         wrprc: None,
     };
