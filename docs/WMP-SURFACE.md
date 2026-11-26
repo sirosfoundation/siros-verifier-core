@@ -257,6 +257,7 @@ invite_endpoint = true                          # POST /wmp/invites (optional)
 allow_insecure_pdp = true                       # the private-network PDP posture (explicit)
 identity = "x509:san:dns:sirosid-gdc-siros-verifier.fly.dev"
 identity_chain_path = "/pki/verifier_ec_chain.pem"   # leaf first; its SAN DNS must match the identity
+identity_key_path = "/pki/verifier_ec_private.pem"    # the leaf's key — the MLS signer (required)
 
 [[backend.config.wmp.credentials]]              # the held credentials (an array:
 format = "vc+sd-jwt"                            # a presentation may result in
@@ -278,13 +279,11 @@ content = "verified_claims"                    # or vp_token | digest
 
 No `wmp` block → no WMP surface at all. **The identity chain's leaf
 must carry the identity's SAN DNS** — a chain for another host refuses
-the boot. The MLS credential is the basic one at wallet-core 0.4.4
-(honest: the identity is authenticated outside MLS — the session's own
-channel); the X.509 MLS credential lands when wmp-mls gains the
-signer-accepting constructor (0.4.4's `for_identity_with_certificate`
-mints a fresh Ed25519 signer regardless of the chain's key — an RFC
-9420 §5.3.1 violation found in review), and the validated chain feeds
-the §5.6 `x509_chain` assertions either way.
+the boot. **The identity key is required** — the MLS credential is the
+X.509 chain with the leaf's key as the signer (wallet-core 0.5.0's
+signer-accepting constructor; the RFC 9420 §5.3.1 binding live, a
+fresh-key signer never minted), and the validated chain feeds the §5.6
+`x509_chain` assertions.
 
 ## The increments
 

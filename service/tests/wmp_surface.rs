@@ -31,9 +31,11 @@ fn write_identity(dir: &Path, dns: &str) -> String {
         .unwrap()
         .self_signed(&kp)
         .unwrap();
-    let chain = dir.join("identity_chain.pem");
-    std::fs::write(&chain, cert.pem()).unwrap();
-    chain.display().to_string()
+    // The chain AND the leaf's PKCS#8 key: the surface's signer is the
+    // certificate's key (RFC 9420 §5.3.1's binding).
+    std::fs::write(dir.join("identity_chain.pem"), cert.pem()).unwrap();
+    std::fs::write(dir.join("identity_key.pem"), kp.serialize_pem()).unwrap();
+    dir.join("identity_chain.pem").display().to_string()
 }
 
 fn config_in(dir: &Path, invites: Vec<serde_json::Value>) -> WmpConfig {
@@ -41,6 +43,7 @@ fn config_in(dir: &Path, invites: Vec<serde_json::Value>) -> WmpConfig {
         "join_pdp_url": "https://sirosid-gdc-spocp.internal:8000/access/v1/evaluation",
         "identity": "x509:san:dns:verifier.example",
         "identity_chain_path": write_identity(dir, "verifier.example"),
+        "identity_key_path": dir.join("identity_key.pem").display().to_string(),
         "invites": invites,
     }))
     .unwrap()
@@ -244,5 +247,26 @@ fn a_bare_identity_refuses_the_build() {
     assert!(
         chained.contains("x509:san:dns:"),
         "the refusal names the required form: {chained}"
+    );
+}
+
+#[test]
+fn a_key_that_is_not_the_leafs_refuses_the_build() {
+    // RFC 9420 §5.3.1: the MLS credential's key must bind to the
+    // signer. A key from another leaf than the chain's is a misbinding
+    // — the constructor (or a peer) would catch it later; the boot
+    // catches it now.
+    let (config, dir) = config_with(vec![]);
+    // A DIFFERENT key pair's key, written over the fixture's.
+    let other = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    std::fs::write(dir.join("identity_key.pem"), other.serialize_pem()).unwrap();
+    let err = match WmpSurface::new(config, &dir) {
+        Ok(_) => panic!("a foreign key must refuse the build"),
+        Err(e) => e,
+    };
+    let chained = format!("{err:#}");
+    assert!(
+        chained.contains("signer") || chained.contains("key"),
+        "the refusal names the key binding: {chained}"
     );
 }
