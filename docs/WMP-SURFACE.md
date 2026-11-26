@@ -68,10 +68,21 @@ logged with the named reason; the group is never joined.
 
 ### 2. Multi-group membership
 
-`wmp-mls`'s provider holds every joined group's MLS state, persisted
-per-group in the flow store keyed by group id. The boot rehydrates
-every group; membership survives restarts. The provider's one-identity
-keystore holds the verifier's WMP key material.
+**The persistence model — corrected:** the MLS member state (the key
+store's private keys, the group epochs) is **process-lifetime** in
+wmp-mls — the OpenMLS key stores are in-memory, and the engine's own
+architecture does the same (sessions and invitations persist; key
+stores do not). Membership continuity across restarts is therefore the
+**orchestrator's reconciliation**, not state serialization: a restarted
+verifier presents a fresh KeyPackage, the orchestrator re-adds it (a
+fresh add-commit → Welcome cycle), and the join re-fires. The flow
+store persists the **membership record** — which groups the verifier is
+authorized for and joined, the epochs at join time — for audit and
+policy continuity, never the MLS state itself.
+
+The provider's one-identity keystore holds the verifier's WMP key
+material for the process lifetime; the surface tracks the joined
+groups (id → epoch) in memory, the record in the store.
 
 ### 2.1 Config-defined groups — the headless compositions
 
