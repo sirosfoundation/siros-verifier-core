@@ -36,8 +36,8 @@ siros-verifier-core = { path = ".." }
 # The WMP surface: the client-side library from siros-wallet-core
 # (the engine-adapter-server is NOT embedded). wmp-mls pulls openmls
 # 0.8 + its crypto crates.
-wmp-core = { git = "https://github.com/sirosfoundation/siros-wallet-core", rev = "b917057376bb24e1dfc2a03ca4764b7653ea2efb" }
-wmp-mls = { git = "https://github.com/sirosfoundation/siros-wallet-core", rev = "b917057376bb24e1dfc2a03ca4764b7653ea2efb" }
+wmp-core = { git = "https://github.com/sirosfoundation/siros-wallet-core", rev = "c533256224de5034990f9c590396ccc2f1f51cc6" }
+wmp-mls = { git = "https://github.com/sirosfoundation/siros-wallet-core", rev = "c533256224de5034990f9c590396ccc2f1f51cc6" }
 siros-verifier-core-tunnelbana = { path = "../tunnelbana-plugin" }
 siros-verifier-zkp = { path = "../zkp" }
 toml = "1.1.6"

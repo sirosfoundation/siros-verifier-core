@@ -7029,7 +7029,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 [[package]]
 name = "wmp-core"
 version = "0.1.0"
-source = "git+https://github.com/sirosfoundation/siros-wallet-core?rev=b917057376bb24e1dfc2a03ca4764b7653ea2efb#b917057376bb24e1dfc2a03ca4764b7653ea2efb"
+source = "git+https://github.com/sirosfoundation/siros-wallet-core?rev=c533256224de5034990f9c590396ccc2f1f51cc6#c533256224de5034990f9c590396ccc2f1f51cc6"
 dependencies = [
  "rustc-hash",
  "serde",
@@ -7041,7 +7041,7 @@ dependencies = [
 [[package]]
 name = "wmp-mls"
 version = "0.1.0"
-source = "git+https://github.com/sirosfoundation/siros-wallet-core?rev=b917057376bb24e1dfc2a03ca4764b7653ea2efb#b917057376bb24e1dfc2a03ca4764b7653ea2efb"
+source = "git+https://github.com/sirosfoundation/siros-wallet-core?rev=c533256224de5034990f9c590396ccc2f1f51cc6#c533256224de5034990f9c590396ccc2f1f51cc6"
 dependencies = [
  "ed25519-dalek 3.0.0",
  "openmls",
