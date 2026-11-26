@@ -419,3 +419,138 @@ fn the_mls_group_id_from_a_created_group_round_trips() {
     assert_eq!(joined_id, group_id, "the MLS GroupId round trips");
     assert!(epoch >= 1, "the epoch advances past the add");
 }
+
+/// The delivery endpoint end to end: the service boots with a [wmp]
+/// block, an orchestrator creates a group and adds the member, and the
+/// Welcome posts through the actix endpoint — the unreachable PDP's
+/// fail-closed denial answering 400 (the gate refuses before any MLS
+/// state), the whole path through the real HTTP surface.
+#[tokio::test]
+async fn the_delivery_endpoint_refuses_fail_closed_over_http() {
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    let dir = std::env::temp_dir().join(format!("wmp-endpoint-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // The verifier's member identity.
+    let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let cert = rcgen::CertificateParams::new(vec!["verifier.example".to_string()])
+        .unwrap()
+        .self_signed(&kp)
+        .unwrap();
+    std::fs::write(dir.join("identity_chain.pem"), cert.pem()).unwrap();
+    std::fs::write(dir.join("identity_key.pem"), kp.serialize_pem()).unwrap();
+
+    // The proxy.toml with the [wmp] block (a loopback PDP that nothing
+    // listens on — the fail-closed posture under test).
+    let config_path = dir.join("proxy.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+base_url = "https://verifier.example"
+state_encryption_key = "a-32-byte-or-longer-test-secret!!"
+
+[[frontend]]
+type = "ui"
+name = "ui"
+
+[[backend]]
+type = "openid4vp"
+name = "vp"
+  [backend.config]
+  request_signing_key_path = "{key}"
+  request_certificate_chain_path = "{chain}"
+  pdp_endpoint = "http://127.0.0.1:1/evaluation"
+  role = "pid-provider"
+  dcql = {{ credentials = [{{ id = "pid", format = "dc+sd-jwt",
+    claims = [{{ path = ["given_name"] }}] }}] }}
+  attribute_map = {{}}
+  subject_pointer = "/given_name"
+
+  [backend.config.storage]
+  backend = "memory"
+
+  [backend.config.wmp]
+  join_pdp_url = "http://127.0.0.1:1/access/v1/evaluation"
+  identity = "x509:san:dns:verifier.example"
+  identity_chain_path = "{chain}"
+  identity_key_path = "{key2}"
+"#,
+            key = dir.join("identity_key.pem").display(),
+            key2 = dir.join("identity_key.pem").display(),
+            chain = dir.join("identity_chain.pem").display(),
+        ),
+    )
+    .unwrap();
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_siros-verifier-service"))
+        .arg(&config_path)
+        .env("TUNNELBANA_BIND", address.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let healthy = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        loop {
+            if let Ok(Some(status)) = child.try_wait() {
+                panic!("the service exited before becoming healthy: {status}");
+            }
+            if let Ok(response) = client.get(format!("http://{address}/health")).send().await {
+                if response.status().is_success() {
+                    return;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+    })
+    .await;
+    assert!(
+        healthy.is_ok(),
+        "the service booted healthy with the [wmp] block"
+    );
+
+    // The orchestrator's group + the member's package + the Welcome.
+    use wmp_core::mls::MlsProvider as _;
+    let orchestrator =
+        wmp_mls::OpenMlsProvider::for_identity("x509:san:dns:orchestrator.example").unwrap();
+    let (group_id, _) = orchestrator.create_group(1, &[]).unwrap();
+    let member = wmp_mls::OpenMlsProvider::for_identity("x509:san:dns:verifier.example").unwrap();
+    let package = member.generate_key_package(1).unwrap();
+    let (_commit, welcome) = orchestrator
+        .add_member(&group_id, &package.key_package)
+        .unwrap();
+
+    // The delivery: POST /wmp/joins — the unreachable PDP denies; the
+    // endpoint answers 400 with the public reason.
+    let response = client
+        .post(format!("http://{address}/wmp/joins"))
+        .json(&serde_json::json!({
+            "group_id": group_id,
+            "via": "x509:san:dns:orchestrator.example",
+            "welcome": welcome,
+        }))
+        .send()
+        .await
+        .expect("the delivery posts");
+    assert_eq!(
+        response.status().as_u16(),
+        400,
+        "the fail-closed denial answers 400"
+    );
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"], "join_refused");
+    assert!(
+        body["reason"].as_str().unwrap_or("").contains("denied"),
+        "the refusal's reason is public: {body}"
+    );
+
+    let _ = child.kill().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
