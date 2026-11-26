@@ -131,39 +131,53 @@ fn leaf_dns_names(der: &[u8]) -> Result<Vec<String>> {
     Ok(dns_names)
 }
 
-/// The private key's SubjectPublicKeyInfo DER (the SPKI the leaf
-/// must carry), for either MLS suite algorithm: Ed25519 (RFC 8410)
-/// or P-256 (RFC 5915) PKCS#8.
-fn key_public_der(pkcs8_der: &[u8]) -> Result<Vec<u8>> {
-    use ed25519_dalek::pkcs8::{DecodePrivateKey, EncodePublicKey};
+/// A decoded public key, either MLS suite algorithm (Ed25519 RFC
+/// 8410, P-256 RFC 5915). Decoded, not SPKI bytes: RFC 5480 §2.2
+/// permits a compressed SEC1 point in a certificate's SPKI while the
+/// key's own SPKI emits the uncompressed form — the same key, two
+/// encodings. Comparison is on the key.
+#[derive(Debug, PartialEq)]
+pub enum PublicKey {
+    Ed25519(ed25519_dalek::VerifyingKey),
+    P256(p256::PublicKey),
+}
+
+/// The private key's public half, decoded.
+pub fn key_public(pkcs8_der: &[u8]) -> Result<PublicKey> {
+    use ed25519_dalek::pkcs8::DecodePrivateKey;
     if let Ok(ed) = ed25519_dalek::SigningKey::from_pkcs8_der(pkcs8_der) {
-        // The SPKI DER (the pkcs8 crate's VerifyingKey::encode_to_vec is
-        // the trait method).
-        return Ok(ed.verifying_key().to_public_key_der()?.as_bytes().to_vec());
+        return Ok(PublicKey::Ed25519(ed.verifying_key()));
     }
     if let Ok(ec) = <p256::SecretKey as p256::pkcs8::DecodePrivateKey>::from_pkcs8_der(pkcs8_der) {
-        let spki = ec
-            .public_key()
-            .to_public_key_der()
-            .map_err(|e| anyhow!("the P-256 public key does not encode: {e}"))?
-            .as_bytes()
-            .to_vec();
-        return Ok(spki);
+        return Ok(PublicKey::P256(ec.public_key()));
     }
     Err(anyhow!(
         "the private key is neither Ed25519 (RFC 8410) nor P-256 (RFC 5915) PKCS#8"
     ))
 }
 
-/// The leaf certificate's SubjectPublicKeyInfo DER.
-fn leaf_spki_der(der: &[u8]) -> Result<Vec<u8>> {
+/// The leaf certificate's public key, decoded from its SPKI.
+pub fn leaf_public_key(der: &[u8]) -> Result<PublicKey> {
+    use ed25519_dalek::pkcs8::DecodePublicKey;
     use x509_cert::der::{Decode, Encode};
     let cert = x509_cert::Certificate::from_der(der)
         .map_err(|e| anyhow!("the leaf does not parse as a certificate: {e}"))?;
-    cert.tbs_certificate
+    // The full SPKI structure, DER-encoded — the pkcs8 decoders
+    // accept the structure (RFC 5280 §4.1: the SubjectPublicKeyInfo).
+    let spki = cert
+        .tbs_certificate
         .subject_public_key_info
         .to_der()
-        .map_err(|e| anyhow!("the leaf's SPKI does not encode: {e}"))
+        .map_err(|e| anyhow!("the leaf's SPKI does not encode: {e}"))?;
+    if let Ok(ed) = ed25519_dalek::VerifyingKey::from_public_key_der(&spki) {
+        return Ok(PublicKey::Ed25519(ed));
+    }
+    if let Ok(p) = <p256::PublicKey as p256::pkcs8::DecodePublicKey>::from_public_key_der(&spki) {
+        return Ok(PublicKey::P256(p));
+    }
+    Err(anyhow!(
+        "the leaf's public key is neither Ed25519 (RFC 8410) nor P-256 (RFC 5915)"
+    ))
 }
 
 /// A parsed, validated invite: the join decision's input.
@@ -293,16 +307,20 @@ impl WmpSurface {
                     key_path.display()
                 )
             })?;
-        // RFC 9420 §5.3.1's binding, checked HERE: the leaf's
-        // SubjectPublicKeyInfo must be the private key's public half.
+        // RFC 9420 §5.3.1's binding, checked HERE: the leaf's public
+        // key must be the private key's public half, compared DECODED
+        // not as SPKI bytes (RFC 5480 §2.2 permits a compressed SEC1
+        // point in the certificate while the key's SPKI emits the
+        // uncompressed form — the encodings differ for the SAME key).
         // (wmp-mls's signer-accepting constructor imports the key but
         // does not check the match — a peer's "leaf node signature is
         // not valid" would be the late, far side, failure. Both MLS
         // suite algorithms: Ed25519 RFC 8410 and P-256 RFC 5915.)
-        let key_public = key_public_der(&key_der)
+        let key_public = key_public(&key_der)
             .with_context(|| format!("the WMP identity key {}", key_path.display()))?;
-        let leaf_spki = leaf_spki_der(&chain_der[0])?;
-        if leaf_spki != key_public {
+        let leaf_public =
+            leaf_public_key(&chain_der[0]).with_context(|| "the chain leaf's public key")?;
+        if key_public != leaf_public {
             return Err(anyhow!(
                 "the WMP identity key {} is not the chain leaf's key — the MLS credential's key must bind (RFC 9420 §5.3.1)",
                 key_path.display()

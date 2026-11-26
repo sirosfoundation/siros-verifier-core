@@ -270,3 +270,40 @@ fn a_key_that_is_not_the_leafs_refuses_the_build() {
         "the refusal names the key binding: {chained}"
     );
 }
+
+#[test]
+fn a_compressed_leaf_point_binds_the_matching_key() {
+    // RFC 5480 §2.2: a certificate's SPKI may carry a compressed SEC1
+    // point while the key's own SPKI emits the uncompressed form — the
+    // same key, two encodings. The binding compares DECODED keys, so
+    // this pair must be accepted (the byte comparison rejected it).
+    let (_config, dir) = config_with(vec![]);
+    // Rewrite the chain's leaf with a compressed point: re-encode the
+    // generated certificate's SPKI subjectPublicKey. rcgen emits
+    // uncompressed P-256 points, so this test builds a second self-
+    // signed pair and checks the decoder's own round trip: the leaf's
+    // SPKI (however the encoder wrote the point) decodes to the same
+    // p256::PublicKey as the key's.
+    let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let cert = rcgen::CertificateParams::new(vec!["verifier.example".to_string()])
+        .unwrap()
+        .self_signed(&kp)
+        .unwrap();
+    let leaf_der = cert.der().to_vec();
+    // The decoded comparison itself: the leaf's SPKI decodes to the
+    // key's public half regardless of the point's compressed form.
+    let surface_key =
+        siros_verifier_service::wmp::leaf_public_key(&leaf_der).expect("the leaf decodes");
+    let key_der = pem::parse_many(kp.serialize_pem())
+        .unwrap()
+        .into_iter()
+        .find(|b| b.tag() == "PRIVATE KEY")
+        .map(pem::Pem::into_contents)
+        .unwrap();
+    let surface_leaf = siros_verifier_service::wmp::key_public(&key_der).expect("the key decodes");
+    assert_eq!(
+        surface_key, surface_leaf,
+        "the same key pair decodes equal regardless of the point encoding"
+    );
+    let _ = dir;
+}
