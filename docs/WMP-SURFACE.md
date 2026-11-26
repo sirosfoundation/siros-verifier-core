@@ -85,13 +85,18 @@ add-commit → Welcome flow driven by the orchestrator). The verifier's
 role is the member's: it accepts the assembly the orchestrator
 performs.
 
-For this surface that means the config-declared group is a first-class
-bootstrap path alongside the invite: the `[wmp]` config names the
-groups the verifier belongs to; the orchestrating component assembles
-them headlessly; the same policy gate decides the membership (the
-orchestrator is just another counterpart whose request the go-spocp
-PDP evaluates — the fail-closed posture unchanged, only the invitation
-UX replaced by the declaration).
+For this surface that means **joining config-identified groups is a
+first-class requirement** — a bootstrap path alongside the invite: the
+`[[wmp.groups]]` config names the groups the verifier belongs to (and
+the counterpart/relay the membership is established through); the
+orchestrating component assembles them headlessly; the same policy
+gate decides each membership (the orchestrator is just another
+counterpart whose request the go-spocp PDP evaluates — the
+fail-closed posture unchanged, only the invitation UX replaced by the
+declaration). The join machinery treats a config-declared group and a
+received invite as two entrances to the same MLS exchange; the gate
+evaluates both (the declaration's context names the configured group,
+an invite's context names the signed invitation).
 
 The concrete mechanisms — how the group definition is expressed in
 configuration, how the orchestrator discovers the participants and
@@ -259,6 +264,10 @@ type_id = "urn:example:verifier:1"              # multiple tokens, per the spec)
 key_path = "..."
 credential_path = "..."
 
+[[backend.config.wmp.groups]]                   # config-identified groups the
+id = "wmp:group:evidence-qerds"                # verifier JOINS (the orchestrator
+via = "x509:san:dns:sirosid-gdc-wmp-mcp.fly.dev"  # creates; the gate decides)
+
 [[backend.config.wmp.invites]]                  # config-declared (optional)
 uri = "wmp://invite?data=..."
 
@@ -286,11 +295,13 @@ the §5.6 `x509_chain` assertions either way.
    client; both channels; the fail-closed refusals. *(The client and
    the join decision landed in #78; the signature verification and the
    MLS join exchange land with the wallet-core 0.5.0 re-pin.)*
-3. **Config-defined group membership** — the headless compositions of
-   §2.1: the config-declared groups the verifier belongs to, assembled
-   by an orchestrating component, the same policy gate deciding the
-   membership. The concrete definition mechanisms are an open
-   discussion (deliberately deferred).
+3. **Config-defined group membership** — the verifier joins the
+   config-identified groups (§2.1): the `[[wmp.groups]]` declarations,
+   the same MLS join exchange as the invites, the same go-spocp gate
+   evaluating each. **The join machinery — both channels — is the next
+   implementation increment (on the wallet-core 0.5.0 re-pin); the
+   config surface lands with it.** The orchestration side (how the
+   orchestrator creates and assembles) is out of scope here.
 4. **The responder** — the request shape, the PDP evaluation, the §5.6
    assertion generation.
 5. **The relay leg** — the verified-outcome hook, the per-target PDP
