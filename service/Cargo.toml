@@ -21,6 +21,7 @@ async-trait = "0.1"
 form_urlencoded = "1"
 url = "2"
 x509-cert = "0.2"
+ed25519-dalek = { version = "3", features = ["pkcs8"] }
 grindvakt = "0.8.2"
 jose-rs = { version = "0.10", default-features = false }
 kryptering = { version = "0.7", default-features = false, features = ["rustcrypto"] }
@@ -35,8 +36,8 @@ siros-verifier-core = { path = ".." }
 # The WMP surface: the client-side library from siros-wallet-core
 # (the engine-adapter-server is NOT embedded). wmp-mls pulls openmls
 # 0.8 + its crypto crates.
-wmp-core = { git = "https://github.com/sirosfoundation/siros-wallet-core", rev = "95a4bd644884f4791806f4e5eb7b5dba6512fcdb" }
-wmp-mls = { git = "https://github.com/sirosfoundation/siros-wallet-core", rev = "95a4bd644884f4791806f4e5eb7b5dba6512fcdb" }
+wmp-core = { git = "https://github.com/sirosfoundation/siros-wallet-core", rev = "c533256224de5034990f9c590396ccc2f1f51cc6" }
+wmp-mls = { git = "https://github.com/sirosfoundation/siros-wallet-core", rev = "c533256224de5034990f9c590396ccc2f1f51cc6" }
 siros-verifier-core-tunnelbana = { path = "../tunnelbana-plugin" }
 siros-verifier-zkp = { path = "../zkp" }
 toml = "1.1.6"

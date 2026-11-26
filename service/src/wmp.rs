@@ -50,6 +50,10 @@ pub struct WmpConfig {
     /// The member's X.509 chain (PEM file, leaf first): the MLS
     /// credential and the §5.6 `x509_chain` assertions derive from it.
     pub identity_chain_path: String,
+    /// The member's private key (PKCS#8 PEM): the leaf's key, the MLS
+    /// signer. Required — the credential's key must bind (RFC 9420
+    /// §5.3.1); a fresh-key signer is never minted.
+    pub identity_key_path: String,
     /// The held credentials — an array: a presentation may result in
     /// multiple tokens (the spec's §3.2.4 object form). The
     /// `verifier.present` responder draws from these.
@@ -125,6 +129,55 @@ fn leaf_dns_names(der: &[u8]) -> Result<Vec<String>> {
         }
     }
     Ok(dns_names)
+}
+
+/// A decoded public key, either MLS suite algorithm (Ed25519 RFC
+/// 8410, P-256 RFC 5915). Decoded, not SPKI bytes: RFC 5480 §2.2
+/// permits a compressed SEC1 point in a certificate's SPKI while the
+/// key's own SPKI emits the uncompressed form — the same key, two
+/// encodings. Comparison is on the key.
+#[derive(Debug, PartialEq)]
+pub enum PublicKey {
+    Ed25519(ed25519_dalek::VerifyingKey),
+    P256(p256::PublicKey),
+}
+
+/// The private key's public half, decoded.
+pub fn key_public(pkcs8_der: &[u8]) -> Result<PublicKey> {
+    use ed25519_dalek::pkcs8::DecodePrivateKey;
+    if let Ok(ed) = ed25519_dalek::SigningKey::from_pkcs8_der(pkcs8_der) {
+        return Ok(PublicKey::Ed25519(ed.verifying_key()));
+    }
+    if let Ok(ec) = <p256::SecretKey as p256::pkcs8::DecodePrivateKey>::from_pkcs8_der(pkcs8_der) {
+        return Ok(PublicKey::P256(ec.public_key()));
+    }
+    Err(anyhow!(
+        "the private key is neither Ed25519 (RFC 8410) nor P-256 (RFC 5915) PKCS#8"
+    ))
+}
+
+/// The leaf certificate's public key, decoded from its SPKI.
+pub fn leaf_public_key(der: &[u8]) -> Result<PublicKey> {
+    use ed25519_dalek::pkcs8::DecodePublicKey;
+    use x509_cert::der::{Decode, Encode};
+    let cert = x509_cert::Certificate::from_der(der)
+        .map_err(|e| anyhow!("the leaf does not parse as a certificate: {e}"))?;
+    // The full SPKI structure, DER-encoded — the pkcs8 decoders
+    // accept the structure (RFC 5280 §4.1: the SubjectPublicKeyInfo).
+    let spki = cert
+        .tbs_certificate
+        .subject_public_key_info
+        .to_der()
+        .map_err(|e| anyhow!("the leaf's SPKI does not encode: {e}"))?;
+    if let Ok(ed) = ed25519_dalek::VerifyingKey::from_public_key_der(&spki) {
+        return Ok(PublicKey::Ed25519(ed));
+    }
+    if let Ok(p) = <p256::PublicKey as p256::pkcs8::DecodePublicKey>::from_public_key_der(&spki) {
+        return Ok(PublicKey::P256(p));
+    }
+    Err(anyhow!(
+        "the leaf's public key is neither Ed25519 (RFC 8410) nor P-256 (RFC 5915)"
+    ))
 }
 
 /// A parsed, validated invite: the join decision's input.
@@ -231,19 +284,57 @@ impl WmpSurface {
                 "the WMP identity chain's leaf carries no SAN DNS {dns_name:?} — it is not this member's identity"
             ));
         }
-        // One provider = one WMP member. At wallet-core 0.4.4 the basic
-        // credential is the only HONEST construction:
-        // for_identity_with_certificate mints a fresh Ed25519 signer
-        // regardless of the chain's key, so an X.509 MLS credential
-        // built from a P-256 leaf violates RFC 9420 §5.3.1's key
-        // binding (this PR's review found it). The basic credential is
-        // authenticated outside MLS — the session's own channel — and
-        // the validated chain still feeds the §5.6 x509_chain
-        // assertions. The X.509 MLS credential lands when wmp-mls
-        // gains the signer-accepting constructor; the switch is this
-        // one call.
-        let provider = OpenMlsProvider::for_identity(&config.identity)
-            .map_err(|e| anyhow!("the WMP member provider: {}", e.to_rpc()))?;
+        // The member's private key (PKCS#8 PEM): the leaf's key, the
+        // MLS signer. Required — the credential's key must bind (RFC
+        // 9420 §5.3.1); wallet-core 0.5.0's signer-accepting
+        // constructor makes the X.509 MLS credential honest, and this
+        // surface requires the key (it never mints a fresh signer).
+        let key_path = std::path::Path::new(&config.identity_key_path);
+        let key_path = if key_path.is_absolute() {
+            key_path.to_path_buf()
+        } else {
+            config_dir.join(key_path)
+        };
+        let key_pem = std::fs::read_to_string(&key_path)
+            .with_context(|| format!("reading the WMP identity key {}", key_path.display()))?;
+        let key_der = pem::parse_many(key_pem)?
+            .into_iter()
+            .find(|block| block.tag() == "PRIVATE KEY")
+            .map(pem::Pem::into_contents)
+            .ok_or_else(|| {
+                anyhow!(
+                    "the WMP identity key {} carries no PRIVATE KEY block",
+                    key_path.display()
+                )
+            })?;
+        // RFC 9420 §5.3.1's binding, checked HERE: the leaf's public
+        // key must be the private key's public half, compared DECODED
+        // not as SPKI bytes (RFC 5480 §2.2 permits a compressed SEC1
+        // point in the certificate while the key's SPKI emits the
+        // uncompressed form — the encodings differ for the SAME key).
+        // (wmp-mls's signer-accepting constructor imports the key but
+        // does not check the match — a peer's "leaf node signature is
+        // not valid" would be the late, far side, failure. Both MLS
+        // suite algorithms: Ed25519 RFC 8410 and P-256 RFC 5915.)
+        let key_public = key_public(&key_der)
+            .with_context(|| format!("the WMP identity key {}", key_path.display()))?;
+        let leaf_public =
+            leaf_public_key(&chain_der[0]).with_context(|| "the chain leaf's public key")?;
+        if key_public != leaf_public {
+            return Err(anyhow!(
+                "the WMP identity key {} is not the chain leaf's key — the MLS credential's key must bind (RFC 9420 §5.3.1)",
+                key_path.display()
+            ));
+        }
+        // One provider = one WMP member: the identity string with the
+        // X.509 chain as the MLS credential AND the leaf's key as the
+        // signer — the key binding RFC 9420 §5.3.1 requires.
+        let provider = OpenMlsProvider::for_identity_with_certificate_and_key(
+            &config.identity,
+            Some(chain_der),
+            Some(key_der),
+        )
+        .map_err(|e| anyhow!("the WMP member provider: {}", e.to_rpc()))?;
         // The config invites: parsed now, fail-fast.
         let config_invites = config
             .invites

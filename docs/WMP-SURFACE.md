@@ -98,12 +98,50 @@ received invite as two entrances to the same MLS exchange; the gate
 evaluates both (the declaration's context names the configured group,
 an invite's context names the signed invitation).
 
+**Permanent groups are delegated to the authz infrastructure**: the
+membership policy lives in the PDP's rules, not in config rosters. The
+representation is the AuthZEN query "is this entity (its client_id)
+allowed to join the group named X?" — subject: the entity's
+identifier; resource: the group name; action: `join` — the SAME query
+shape the invite gate already uses (the group name as the resource
+instead of the invite's provider). The two bootstrap channels (an
+invite, a config-declared group) become two entrances to one policy
+primitive, and the rules engine is the single authority for who
+belongs where.
+
+The config's remaining role is the CANDIDATE enumeration: AuthZEN is a
+question-answer protocol, so the verifier asks about named groups —
+`[[wmp.groups]]` names the candidates the deployment knows about, and
+the PDP decides each.
+
+**Watch for the need to ENUMERATE.** The candidate-list shape carries
+a drift risk that becomes a real need the moment the rules and the
+config disagree: the rules may say member-of-Y while the config never
+names Y — the verifier never asks, never joins, and the divergence is
+silent. The scenarios that force enumeration:
+- **redeployment reconciliation** — the live group set (the flow
+  store's joined groups) must reconcile against the *intended* set,
+  which lives in the rules, not the config;
+- **roster changes** — a group added to the rules should be picked up
+  without a config edit;
+- **the store's own truth** — the joined set the service rehydrates
+  needs a source of intent to diff against.
+
+The candidate mechanisms, when the need lands: a PDP-side enumeration
+(a list-bearing answer — an AuthZEN extension or a sideband query), the
+orchestrator's group list (the engine knows what it assembled — an
+orchestrator-side API), or the intended set declared once per
+environment and shared by every participant. Deliberately not chosen —
+but the flag stands: if implementation or operations hits the drift,
+enumeration stops being an open item and becomes a requirement.
+
 The concrete mechanisms — how the group definition is expressed in
 configuration, how the orchestrator discovers the participants and
 drives the assembly, and how the declaration reconciles with the live
 group across redeploys — are deliberately not chosen here: there are
 many ways to define such constructions, and the options are discussed
-later. The design records the requirement and the actor split.
+later. The design records the requirement, the actor split, and the
+PDP-query representation above as an input to that discussion.
 
 ### 3. The responder — a presentation flow, spec-native
 
@@ -257,6 +295,7 @@ invite_endpoint = true                          # POST /wmp/invites (optional)
 allow_insecure_pdp = true                       # the private-network PDP posture (explicit)
 identity = "x509:san:dns:sirosid-gdc-siros-verifier.fly.dev"
 identity_chain_path = "/pki/verifier_ec_chain.pem"   # leaf first; its SAN DNS must match the identity
+identity_key_path = "/pki/verifier_ec_private.pem"    # the leaf's key — the MLS signer (required)
 
 [[backend.config.wmp.credentials]]              # the held credentials (an array:
 format = "vc+sd-jwt"                            # a presentation may result in
@@ -278,13 +317,11 @@ content = "verified_claims"                    # or vp_token | digest
 
 No `wmp` block → no WMP surface at all. **The identity chain's leaf
 must carry the identity's SAN DNS** — a chain for another host refuses
-the boot. The MLS credential is the basic one at wallet-core 0.4.4
-(honest: the identity is authenticated outside MLS — the session's own
-channel); the X.509 MLS credential lands when wmp-mls gains the
-signer-accepting constructor (0.4.4's `for_identity_with_certificate`
-mints a fresh Ed25519 signer regardless of the chain's key — an RFC
-9420 §5.3.1 violation found in review), and the validated chain feeds
-the §5.6 `x509_chain` assertions either way.
+the boot. **The identity key is required** — the MLS credential is the
+X.509 chain with the leaf's key as the signer (wallet-core 0.5.0's
+signer-accepting constructor; the RFC 9420 §5.3.1 binding live, a
+fresh-key signer never minted), and the validated chain feeds the §5.6
+`x509_chain` assertions.
 
 ## The increments
 
@@ -295,13 +332,14 @@ the §5.6 `x509_chain` assertions either way.
    client; both channels; the fail-closed refusals. *(The client and
    the join decision landed in #78; the signature verification and the
    MLS join exchange land with the wallet-core 0.5.0 re-pin.)*
-3. **Config-defined group membership** — the verifier joins the
-   config-identified groups (§2.1): the `[[wmp.groups]]` declarations,
-   the same MLS join exchange as the invites, the same go-spocp gate
-   evaluating each. **The join machinery — both channels — is the next
-   implementation increment (on the wallet-core 0.5.0 re-pin); the
-   config surface lands with it.** The orchestration side (how the
-   orchestrator creates and assembles) is out of scope here.
+3. **PDP-delegated persistent groups** — the verifier joins the
+   groups it is allowed to join (§2.1): the `[[wmp.groups]]` config
+   names the candidates, the go-spocp PDP decides each ("may this
+   entity join the group named X?"), and the MLS join exchange
+   completes the membership. **The join machinery — the invite channel
+   and the persistent-group channel — is the next implementation
+   increment.** The orchestration side (how the orchestrator creates
+   and assembles) is out of scope here.
 4. **The responder** — the request shape, the PDP evaluation, the §5.6
    assertion generation.
 5. **The relay leg** — the verified-outcome hook, the per-target PDP

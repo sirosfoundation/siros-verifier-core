@@ -31,9 +31,11 @@ fn write_identity(dir: &Path, dns: &str) -> String {
         .unwrap()
         .self_signed(&kp)
         .unwrap();
-    let chain = dir.join("identity_chain.pem");
-    std::fs::write(&chain, cert.pem()).unwrap();
-    chain.display().to_string()
+    // The chain AND the leaf's PKCS#8 key: the surface's signer is the
+    // certificate's key (RFC 9420 §5.3.1's binding).
+    std::fs::write(dir.join("identity_chain.pem"), cert.pem()).unwrap();
+    std::fs::write(dir.join("identity_key.pem"), kp.serialize_pem()).unwrap();
+    dir.join("identity_chain.pem").display().to_string()
 }
 
 fn config_in(dir: &Path, invites: Vec<serde_json::Value>) -> WmpConfig {
@@ -41,6 +43,7 @@ fn config_in(dir: &Path, invites: Vec<serde_json::Value>) -> WmpConfig {
         "join_pdp_url": "https://sirosid-gdc-spocp.internal:8000/access/v1/evaluation",
         "identity": "x509:san:dns:verifier.example",
         "identity_chain_path": write_identity(dir, "verifier.example"),
+        "identity_key_path": dir.join("identity_key.pem").display().to_string(),
         "invites": invites,
     }))
     .unwrap()
@@ -245,4 +248,101 @@ fn a_bare_identity_refuses_the_build() {
         chained.contains("x509:san:dns:"),
         "the refusal names the required form: {chained}"
     );
+}
+
+#[test]
+fn a_key_that_is_not_the_leafs_refuses_the_build() {
+    // RFC 9420 §5.3.1: the MLS credential's key must bind to the
+    // signer. A key from another leaf than the chain's is a misbinding
+    // — the constructor (or a peer) would catch it later; the boot
+    // catches it now.
+    let (config, dir) = config_with(vec![]);
+    // A DIFFERENT key pair's key, written over the fixture's.
+    let other = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    std::fs::write(dir.join("identity_key.pem"), other.serialize_pem()).unwrap();
+    let err = match WmpSurface::new(config, &dir) {
+        Ok(_) => panic!("a foreign key must refuse the build"),
+        Err(e) => e,
+    };
+    let chained = format!("{err:#}");
+    assert!(
+        chained.contains("signer") || chained.contains("key"),
+        "the refusal names the key binding: {chained}"
+    );
+}
+
+#[test]
+fn a_compressed_leaf_point_binds_the_matching_key() {
+    // RFC 5480 §2.2: a certificate's SPKI may carry a COMPRESSED SEC1
+    // point (0x02/0x03 prefix) while the key's own SPKI emits the
+    // uncompressed form — the same key, two encodings. The regression
+    // protection goes THROUGH WmpSurface::new: the leaf re-encoded
+    // with the compressed point must still build (a byte comparison
+    // would reject it).
+    let dir = fixture_dir();
+    let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let cert = rcgen::CertificateParams::new(vec!["verifier.example".to_string()])
+        .unwrap()
+        .self_signed(&kp)
+        .unwrap();
+    // The leaf's DER with the SPKI's point replaced by the compressed
+    // form. The signature no longer covers the modified TBS — the
+    // surface does not verify the identity file's self-signature (the
+    // deployment's own file), only the parse, the SAN and the key
+    // binding, so the re-encode is faithful to what the constructor
+    // reads.
+    let compressed = {
+        let key_der = pem::parse_many(kp.serialize_pem())
+            .unwrap()
+            .into_iter()
+            .find(|b| b.tag() == "PRIVATE KEY")
+            .map(pem::Pem::into_contents)
+            .unwrap();
+        let secret =
+            <p256::SecretKey as p256::pkcs8::DecodePrivateKey>::from_pkcs8_der(&key_der).unwrap();
+        use p256::elliptic_curve::sec1::ToSec1Point;
+        secret.public_key().to_sec1_point(true).as_bytes().to_vec()
+    };
+    let modified = {
+        use x509_cert::der::{asn1::BitString, Decode, Encode};
+        let parsed = x509_cert::Certificate::from_der(cert.der()).unwrap();
+        let mut spki = parsed.tbs_certificate.subject_public_key_info.clone();
+        spki.subject_public_key = BitString::from_bytes(&compressed).unwrap();
+        let mut tbs = parsed.tbs_certificate.clone();
+        tbs.subject_public_key_info = spki;
+        let rebuilt = x509_cert::Certificate {
+            tbs_certificate: tbs,
+            ..parsed.clone()
+        };
+        rebuilt.to_der().unwrap()
+    };
+    // The config BEFORE the fixture overwrite: config_in would generate
+    // a fresh uncompressed identity over both files — the constructor
+    // must consume THIS compressed leaf and ITS matching key.
+    let config = config_in(&dir, vec![]);
+    let block = pem::Pem::new("CERTIFICATE", modified);
+    std::fs::write(dir.join("identity_chain.pem"), pem::encode(&block)).unwrap();
+    std::fs::write(dir.join("identity_key.pem"), kp.serialize_pem()).unwrap();
+    WmpSurface::new(config, &dir)
+        .expect("a compressed leaf point binds the matching key through the constructor");
+}
+
+#[test]
+fn an_ed25519_identity_key_binds_its_leaf() {
+    // The other MLS suite algorithm (Ed25519, RFC 8410): the binding
+    // check must decode it as happily as the P-256 half.
+    let dir = fixture_dir();
+    let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+    let cert = rcgen::CertificateParams::new(vec!["verifier.example".to_string()])
+        .unwrap()
+        .self_signed(&kp)
+        .unwrap();
+    // The config BEFORE the fixture overwrite: config_in would generate
+    // a P-256 pair over both files — the constructor must consume THIS
+    // Ed25519 leaf and ITS matching key.
+    let config = config_in(&dir, vec![]);
+    std::fs::write(dir.join("identity_chain.pem"), cert.pem()).unwrap();
+    std::fs::write(dir.join("identity_key.pem"), kp.serialize_pem()).unwrap();
+    WmpSurface::new(config, &dir)
+        .expect("an Ed25519 identity key binds its leaf through the constructor");
 }
