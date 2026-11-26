@@ -121,10 +121,16 @@ async fn main() -> std::io::Result<()> {
         if let Some(state) = &wmp_state {
             // The orchestrator's delivery channel — served only when
             // the [wmp] block is present.
-            app = app.app_data(state.clone()).route(
-                "/wmp/joins",
-                web::post().to(siros_verifier_service::wmp_http::post_join),
-            );
+            app = app
+                .app_data(state.clone())
+                .route(
+                    "/wmp/joins",
+                    web::post().to(siros_verifier_service::wmp_http::post_join),
+                )
+                .route(
+                    "/wmp/key-package",
+                    web::get().to(siros_verifier_service::wmp_http::get_key_package),
+                );
         }
         app.default_service(web::to(http::handle))
     })

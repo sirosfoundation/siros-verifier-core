@@ -40,7 +40,7 @@ fn write_identity(dir: &Path, dns: &str) -> String {
 
 fn config_in(dir: &Path, invites: Vec<serde_json::Value>) -> WmpConfig {
     serde_json::from_value(serde_json::json!({
-        "join_pdp_url": "https://sirosid-gdc-spocp.internal:8000/access/v1/evaluation",
+        "join_pdp_url": "http://127.0.0.1:1/access/v1/evaluation",
         "identity": "x509:san:dns:verifier.example",
         "identity_chain_path": write_identity(dir, "verifier.example"),
         "identity_key_path": dir.join("identity_key.pem").display().to_string(),
@@ -347,48 +347,46 @@ fn an_ed25519_identity_key_binds_its_leaf() {
         .expect("an Ed25519 identity key binds its leaf through the constructor");
 }
 
-/// A real MLS join round trip: an ORCHESTRATOR provider (a second
-/// OpenMlsProvider — the group creator) creates a group, adds the
-/// verifier's member by its fresh KeyPackage, and the Welcome is
-/// processed through the surface's gate. The whole machinery — the
-/// KeyPackage generation, the add-commit → Welcome, the
-/// process_welcome — is the real MLS, not a mock.
+/// A real MLS join round trip through the gate: the orchestrator
+/// mints the group FIRST (the stable id the config declares), the
+/// candidate is configured, the member's package is fetched, the add
+/// produces the Welcome — and the unreachable PDP's denial refuses
+/// BEFORE any MLS state (the fail-closed contract).
 #[tokio::test]
 async fn a_welcome_from_an_orchestrator_joins_through_the_gate() {
     use wmp_core::mls::MlsProvider as _;
 
-    let (config, dir) = config_with(vec![]);
-    // The config-identified group: the candidate the gate decides on.
-    let declaration = siros_verifier_service::wmp::WmpGroupDeclaration {
-        id: "PENDING".to_string(), // the real MLS GroupId lands below
-        via: "x509:san:dns:sirosid-gdc-wmp-mcp.fly.dev".to_string(),
-    };
-    let surface = WmpSurface::new(config, &dir).expect("the surface builds");
-
-    // The orchestrator's provider (its own identity, its own keystore).
+    // The orchestrator mints the group id (the stable identifier the
+    // config declares).
     let orchestrator =
         wmp_mls::OpenMlsProvider::for_identity("x509:san:dns:sirosid-gdc-wmp-mcp.fly.dev").unwrap();
-    // The orchestrator creates the group (the MLS GroupId is minted).
-    let (group_id, _members) = orchestrator
+    let (group_id, _) = orchestrator
         .create_group(1, &[])
         .expect("the group creates");
 
-    // The verifier's fresh KeyPackage — the add flow consumes it.
+    let dir = fixture_dir();
+    let (config, dir2) = config_with(vec![]);
+    let mut config = config;
+    let _ = dir2;
+    config.groups = vec![siros_verifier_service::wmp::WmpGroupDeclaration {
+        id: group_id.clone(),
+        via: "x509:san:dns:sirosid-gdc-wmp-mcp.fly.dev".to_string(),
+    }];
+    let surface = WmpSurface::new(config, &dir).expect("the surface builds");
+
+    // The member's fresh KeyPackage — the add flow consumes it.
     let key_package = surface
         .fresh_key_package(1)
         .expect("the member's key package generates");
-    // The orchestrator adds the member: (commit, welcome).
     let (_commit, welcome) = orchestrator
         .add_member(&group_id, &key_package)
         .expect("the member is added");
 
-    // The declaration's id is the REAL group id (the Welcome carries it).
-    let declaration = siros_verifier_service::wmp::WmpGroupDeclaration {
-        id: group_id.clone(),
-        ..declaration
-    };
-    // The join: the PDP here is unreachable (nothing listens) — the
-    // fail-closed deny refuses BEFORE any MLS state processes.
+    // The join: the PDP is unreachable (nothing listens on loopback:1)
+    // — the fail-closed deny refuses BEFORE any MLS state processes.
+    let declaration = surface
+        .resolve_candidate(&group_id)
+        .expect("the candidate is configured");
     let err = match surface.join_by_welcome(&declaration, &welcome).await {
         Ok(_) => panic!("the unreachable PDP must deny the join"),
         Err(e) => e,
@@ -397,7 +395,6 @@ async fn a_welcome_from_an_orchestrator_joins_through_the_gate() {
         format!("{err:#}").contains("denied"),
         "the fail-closed refusal: {err:#}"
     );
-    // The registry holds nothing.
     assert!(surface.joined_groups().await.is_empty());
 }
 
@@ -420,20 +417,27 @@ fn the_mls_group_id_from_a_created_group_round_trips() {
     assert!(epoch >= 1, "the epoch advances past the add");
 }
 
-/// The delivery endpoint end to end: the service boots with a [wmp]
-/// block, an orchestrator creates a group and adds the member, and the
-/// Welcome posts through the actix endpoint — the unreachable PDP's
-/// fail-closed denial answering 400 (the gate refuses before any MLS
-/// state), the whole path through the real HTTP surface.
+/// The delivery endpoint end to end, the real deployment's order:
+/// the orchestrator mints the group, the config declares the
+/// candidate, the service boots, the orchestrator fetches the
+/// member's KeyPackage over HTTP, adds the member, and the Welcome
+/// posts through the endpoint — the unreachable PDP's fail-closed
+/// denial answering 400, the whole path over the real HTTP surface.
 #[tokio::test]
 async fn the_delivery_endpoint_refuses_fail_closed_over_http() {
     use std::process::Stdio;
     use tokio::process::Command;
+    use wmp_core::mls::MlsProvider as _;
 
+    // 1. The orchestrator mints the group (the stable id).
+    let orchestrator =
+        wmp_mls::OpenMlsProvider::for_identity("x509:san:dns:orchestrator.example").unwrap();
+    let (group_id, _) = orchestrator.create_group(1, &[]).unwrap();
+
+    // 2. The verifier's member identity + the config with the candidate.
     let dir = std::env::temp_dir().join(format!("wmp-endpoint-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    // The verifier's member identity.
     let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
     let cert = rcgen::CertificateParams::new(vec!["verifier.example".to_string()])
         .unwrap()
@@ -442,8 +446,6 @@ async fn the_delivery_endpoint_refuses_fail_closed_over_http() {
     std::fs::write(dir.join("identity_chain.pem"), cert.pem()).unwrap();
     std::fs::write(dir.join("identity_key.pem"), kp.serialize_pem()).unwrap();
 
-    // The proxy.toml with the [wmp] block (a loopback PDP that nothing
-    // listens on — the fail-closed posture under test).
     let config_path = dir.join("proxy.toml");
     std::fs::write(
         &config_path,
@@ -477,10 +479,15 @@ name = "vp"
   identity = "x509:san:dns:verifier.example"
   identity_chain_path = "{chain}"
   identity_key_path = "{key2}"
+
+  [[backend.config.wmp.groups]]
+  id = "{group}"
+  via = "x509:san:dns:orchestrator.example"
 "#,
             key = dir.join("identity_key.pem").display(),
             key2 = dir.join("identity_key.pem").display(),
             chain = dir.join("identity_chain.pem").display(),
+            group = group_id,
         ),
     )
     .unwrap();
@@ -516,24 +523,26 @@ name = "vp"
         "the service booted healthy with the [wmp] block"
     );
 
-    // The orchestrator's group + the member's package + the Welcome.
-    use wmp_core::mls::MlsProvider as _;
-    let orchestrator =
-        wmp_mls::OpenMlsProvider::for_identity("x509:san:dns:orchestrator.example").unwrap();
-    let (group_id, _) = orchestrator.create_group(1, &[]).unwrap();
-    let member = wmp_mls::OpenMlsProvider::for_identity("x509:san:dns:verifier.example").unwrap();
-    let package = member.generate_key_package(1).unwrap();
-    let (_commit, welcome) = orchestrator
-        .add_member(&group_id, &package.key_package)
-        .unwrap();
+    // 3. The orchestrator fetches the member's KeyPackage over HTTP
+    //    (the private key stays in the service's keystore).
+    let package_response = client
+        .get(format!("http://{address}/wmp/key-package"))
+        .send()
+        .await
+        .expect("the package endpoint answers");
+    assert!(package_response.status().is_success());
+    let package_body: serde_json::Value = package_response.json().await.unwrap();
+    let key_package = package_body["key_package"].as_str().unwrap().to_string();
 
-    // The delivery: POST /wmp/joins — the unreachable PDP denies; the
-    // endpoint answers 400 with the public reason.
+    // 4. The add produces the Welcome.
+    let (_commit, welcome) = orchestrator.add_member(&group_id, &key_package).unwrap();
+
+    // 5. The delivery: the unreachable PDP denies — 400, the public
+    //    reason, never the rule text.
     let response = client
         .post(format!("http://{address}/wmp/joins"))
         .json(&serde_json::json!({
             "group_id": group_id,
-            "via": "x509:san:dns:orchestrator.example",
             "welcome": welcome,
         }))
         .send()
@@ -553,4 +562,110 @@ name = "vp"
 
     let _ = child.kill().await;
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A tiny controllable AuthZEN PDP: a hand-rolled HTTP responder over
+/// a listener, flipping its decision per test demand. The full local
+/// loop the fail-closed tests can't prove: the ALLOW side.
+/// The fields are moved into the spawned thread's closure — the struct
+/// itself is only a scope for the two.
+struct ControllablePdp {
+    #[allow(dead_code)]
+    listener: std::net::TcpListener,
+    #[allow(dead_code)]
+    allow: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ControllablePdp {
+    fn spawn() -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let allow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = allow.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                let allow = flag.load(std::sync::atomic::Ordering::SeqCst);
+                let Ok(_) = stream.set_read_timeout(Some(std::time::Duration::from_secs(2))) else {
+                    continue;
+                };
+                // Drain the request (headers + body — small, one read is
+                // enough for the tests' payloads).
+                let mut buf = [0u8; 16384];
+                use std::io::Read;
+                let _ = (&stream).read(&mut buf);
+                let body = if allow {
+                    r#"{"decision": true}"#
+                } else {
+                    r#"{"decision": false}"#
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                use std::io::Write;
+                let _ = (&stream).write_all(response.as_bytes());
+            }
+        });
+        (addr, allow)
+    }
+}
+
+/// The ALLOWING round trip — the denial first (nothing joined, the
+/// Welcome preserved), then the allow (the same Welcome joins and
+/// registers): the gate's decision is the only variable.
+#[tokio::test]
+async fn the_pdp_denial_preserves_and_the_allow_joins_the_same_welcome() {
+    use wmp_core::mls::MlsProvider as _;
+    let (pdp_addr, allow) = ControllablePdp::spawn();
+
+    // The orchestrator mints the group; the config declares the
+    // candidate; the PDP is the controllable one.
+    let orchestrator =
+        wmp_mls::OpenMlsProvider::for_identity("x509:san:dns:orchestrator.example").unwrap();
+    let (group_id, _) = orchestrator.create_group(1, &[]).unwrap();
+
+    let dir = fixture_dir();
+    let (mut config, _) = config_with(vec![]);
+    config.join_pdp_url = format!("http://{pdp_addr}/access/v1/evaluation");
+    config.groups = vec![siros_verifier_service::wmp::WmpGroupDeclaration {
+        id: group_id.clone(),
+        via: "x509:san:dns:orchestrator.example".to_string(),
+    }];
+    let surface = WmpSurface::new(config, &dir).expect("the surface builds");
+
+    // The member's package + the Welcome (the real MLS exchange).
+    let key_package = surface.fresh_key_package(1).unwrap();
+    let (_commit, welcome) = orchestrator.add_member(&group_id, &key_package).unwrap();
+    let declaration = surface.resolve_candidate(&group_id).unwrap();
+
+    // DENY first: the gate refuses; the registry holds nothing — and
+    // the Welcome is NOT consumed (the same bytes join below).
+    allow.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        surface
+            .join_by_welcome(&declaration, &welcome)
+            .await
+            .is_err(),
+        "the denied join refuses"
+    );
+    assert!(
+        surface.joined_groups().await.is_empty(),
+        "the denial joins nothing"
+    );
+
+    // ALLOW: the SAME Welcome joins and registers.
+    allow.store(true, std::sync::atomic::Ordering::SeqCst);
+    let joined = surface
+        .join_by_welcome(&declaration, &welcome)
+        .await
+        .expect("the allowed join processes");
+    assert_eq!(joined.id, group_id);
+    let registry = surface.joined_groups().await;
+    assert_eq!(registry.len(), 1, "the registry holds the join");
+    assert_eq!(registry[0].id, group_id);
 }

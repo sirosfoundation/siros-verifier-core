@@ -474,10 +474,35 @@ impl WmpSurface {
         decisions
     }
 
+    /// Resolve a configured candidate by group id: the delivery's
+    /// group_id SELECTS the candidate — it is never trusted policy
+    /// context itself. The gate evaluates the CANDIDATE's `via`, and
+    /// an id that names no candidate is refused before any evaluation.
+    pub fn resolve_candidate(&self, group_id: &str) -> Result<WmpGroupDeclaration> {
+        self.config_groups
+            .iter()
+            .find(|g| g.id == group_id)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!(
+                    "the group {group_id:?} names no configured candidate —                      the [wmp] config is the candidate enumeration and an                      unconfigured group cannot be joined"
+                )
+            })
+    }
+
     /// The join: process a Welcome the orchestrator delivered, through
-    /// the policy gate. The declared group id must match the Welcome's
-    /// own MLS GroupId — a mismatch is a misdelivery, refused loudly.
-    /// The joined group enters the registry (the epoch at join time).
+    /// the policy gate. The declaration must be a CONFIGURED candidate
+    /// (resolve_candidate) — the caller's context is never trusted.
+    /// The Welcome's own MLS GroupId must match the declaration — a
+    /// mismatch is a misdelivery, refused loudly.
+    ///
+    /// **Known limit (wallet-core #127):** the pinned provider's
+    /// process_welcome commits the group into its map before the id
+    /// is returned, so a mismatched Welcome leaves the rogue group in
+    /// the provider's in-memory state even though this method refuses
+    /// and the registry never lists it. The upstream
+    /// refuse-before-commit processing closes the window; the re-pin
+    /// drops this note.
     pub async fn join_by_welcome(
         &self,
         declaration: &WmpGroupDeclaration,

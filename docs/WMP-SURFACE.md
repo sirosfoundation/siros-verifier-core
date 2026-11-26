@@ -146,6 +146,28 @@ environment and shared by every participant. Deliberately not chosen —
 but the flag stands: if implementation or operations hits the drift,
 enumeration stops being an open item and becomes a requirement.
 
+**The join surface's endpoints** (served only when `[wmp]` is
+present): `GET /wmp/key-package` — the orchestrator fetches the
+member's fresh KeyPackage (minted per call, RFC 9420 single-use; the
+private key stays in the service's keystore) and adds the member by
+it; `POST /wmp/joins {group_id, welcome}` — the delivery. The posted
+`group_id` SELECTS a configured candidate — it is never trusted
+policy context itself: the gate evaluates the candidate's own `via`,
+and an id naming no candidate is refused before any evaluation. The
+sender's own authentication (mTLS, a delivery signature) is the open
+item — the configured candidate is today's channel's trust anchor.
+
+**Known limits, both closed by the wallet-core re-pin when [#127](https://github.com/sirosfoundation/siros-wallet-core/issues/127)
+ships:**
+- The pinned provider's `process_welcome` commits the group into its
+  in-memory map before the group id returns, so a mismatched Welcome
+  leaves the rogue group in the provider's state (refused, unlisted in
+  the registry, unusable through the surface — but present). The
+  upstream refuse-before-commit processing closes it.
+- The pinned `generate_key_package` mints a fresh signer and a
+  BasicCredential — the package advertises the basic identity, not the
+  configured X.509 one. The upstream cert-bound packages close it.
+
 The concrete mechanisms — how the group definition is expressed in
 configuration, how the orchestrator discovers the participants and
 drives the assembly, and how the declaration reconciles with the live
