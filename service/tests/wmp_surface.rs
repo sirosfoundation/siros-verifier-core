@@ -337,9 +337,12 @@ fn an_ed25519_identity_key_binds_its_leaf() {
         .unwrap()
         .self_signed(&kp)
         .unwrap();
+    // The config BEFORE the fixture overwrite: config_in would generate
+    // a P-256 pair over both files — the constructor must consume THIS
+    // Ed25519 leaf and ITS matching key.
+    let config = config_in(&dir, vec![]);
     std::fs::write(dir.join("identity_chain.pem"), cert.pem()).unwrap();
     std::fs::write(dir.join("identity_key.pem"), kp.serialize_pem()).unwrap();
-    let config = config_in(&dir, vec![]);
     WmpSurface::new(config, &dir)
         .expect("an Ed25519 identity key binds its leaf through the constructor");
 }
