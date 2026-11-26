@@ -11,3 +11,4 @@ pub mod http;
 pub mod mongo_store;
 pub mod vc_layout;
 pub mod wmp;
+pub mod wmp_http;

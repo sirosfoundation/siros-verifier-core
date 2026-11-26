@@ -397,6 +397,11 @@ impl WmpSurface {
         &self.config_invites
     }
 
+    /// The config-identified group candidates' count.
+    pub fn config_groups_len(&self) -> usize {
+        self.config_groups.len()
+    }
+
     /// The verifier's WMP identity.
     pub fn identity(&self) -> &str {
         self.provider.identity()
