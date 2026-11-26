@@ -112,9 +112,28 @@ belongs where.
 The config's remaining role is the CANDIDATE enumeration: AuthZEN is a
 question-answer protocol, so the verifier asks about named groups —
 `[[wmp.groups]]` names the candidates the deployment knows about, and
-the PDP decides each. (A discovery mechanism that enumerates the groups
-without config naming them is an open item for the later discussion;
-AuthZEN's boolean answer does not carry a list by itself.)
+the PDP decides each.
+
+**Watch for the need to ENUMERATE.** The candidate-list shape carries
+a drift risk that becomes a real need the moment the rules and the
+config disagree: the rules may say member-of-Y while the config never
+names Y — the verifier never asks, never joins, and the divergence is
+silent. The scenarios that force enumeration:
+- **redeployment reconciliation** — the live group set (the flow
+  store's joined groups) must reconcile against the *intended* set,
+  which lives in the rules, not the config;
+- **roster changes** — a group added to the rules should be picked up
+  without a config edit;
+- **the store's own truth** — the joined set the service rehydrates
+  needs a source of intent to diff against.
+
+The candidate mechanisms, when the need lands: a PDP-side enumeration
+(a list-bearing answer — an AuthZEN extension or a sideband query), the
+orchestrator's group list (the engine knows what it assembled — an
+orchestrator-side API), or the intended set declared once per
+environment and shared by every participant. Deliberately not chosen —
+but the flag stands: if implementation or operations hits the drift,
+enumeration stops being an open item and becomes a requirement.
 
 The concrete mechanisms — how the group definition is expressed in
 configuration, how the orchestrator discovers the participants and
