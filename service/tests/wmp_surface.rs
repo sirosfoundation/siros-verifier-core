@@ -316,10 +316,13 @@ fn a_compressed_leaf_point_binds_the_matching_key() {
         };
         rebuilt.to_der().unwrap()
     };
+    // The config BEFORE the fixture overwrite: config_in would generate
+    // a fresh uncompressed identity over both files — the constructor
+    // must consume THIS compressed leaf and ITS matching key.
+    let config = config_in(&dir, vec![]);
     let block = pem::Pem::new("CERTIFICATE", modified);
     std::fs::write(dir.join("identity_chain.pem"), pem::encode(&block)).unwrap();
     std::fs::write(dir.join("identity_key.pem"), kp.serialize_pem()).unwrap();
-    let config = config_in(&dir, vec![]);
     WmpSurface::new(config, &dir)
         .expect("a compressed leaf point binds the matching key through the constructor");
 }
