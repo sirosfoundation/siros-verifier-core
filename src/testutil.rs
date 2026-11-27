@@ -487,6 +487,10 @@ pub mod mdoc_sim {
         pub use_mac: bool,
         pub extra_root_member: bool,
         pub status: i64,
+        /// The MSO's own `status` member (the issuer-signed revocation
+        /// reference, Token Status List): present makes the sim emit it
+        /// inside the MSO — the verifier's fail-closed target.
+        pub mso_status: Option<(i64, String)>,
         /// COSE alg label put in the issuerAuth protected header (signature is still ES256).
         pub issuer_alg: i64,
         pub doc_count: usize,
@@ -521,6 +525,7 @@ pub mod mdoc_sim {
                 use_mac: false,
                 extra_root_member: false,
                 status: 0,
+                mso_status: None,
                 issuer_alg: -7,
                 doc_count: 1,
                 duplicate_status: false,
@@ -630,7 +635,7 @@ pub mod mdoc_sim {
                 .map(|ns| (t(ns), C::Map(digests.clone())))
                 .collect(),
         );
-        let mso = C::Map(vec![
+        let mut mso_members = vec![
             (t("version"), t("1.0")),
             (t("digestAlgorithm"), t(&spec.digest_alg)),
             (t("valueDigests"), value_digests),
@@ -642,15 +647,25 @@ pub mod mdoc_sim {
                 )]),
             ),
             (t("docType"), t(&spec.mso_doc_type)),
-            (
-                t("validityInfo"),
-                C::Map(vec![
-                    (t("signed"), tdate("2026-01-01T00:00:00Z")),
-                    (t("validFrom"), tdate(&spec.valid_from)),
-                    (t("validUntil"), tdate(&spec.valid_until)),
-                ]),
-            ),
-        ]);
+        ];
+        if let Some((idx, uri)) = &spec.mso_status {
+            mso_members.push((
+                t("status"),
+                C::Map(vec![(
+                    t("status_list"),
+                    C::Map(vec![(t("idx"), i(*idx)), (t("uri"), t(uri))]),
+                )]),
+            ));
+        }
+        mso_members.push((
+            t("validityInfo"),
+            C::Map(vec![
+                (t("signed"), tdate("2026-01-01T00:00:00Z")),
+                (t("validFrom"), tdate(&spec.valid_from)),
+                (t("validUntil"), tdate(&spec.valid_until)),
+            ]),
+        ));
+        let mso = C::Map(mso_members);
         let payload = enc(&tag24(enc(&mso)));
         let protected = enc(&C::Map(vec![(i(1), i(spec.issuer_alg))]));
         let sig_struct = enc(&C::Array(vec![

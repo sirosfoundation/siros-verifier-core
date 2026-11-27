@@ -393,6 +393,19 @@ fn verify_document(doc: &Value, p: &Params) -> Result<MdocVerified> {
     if as_text(get(&mso, "version")?)? != "1.0" {
         return Err(policy("mso_version"));
     }
+    // The MSO's revocation status (issue #82, the security report's
+    // second finding): a `status` member this verifier cannot check is
+    // REFUSED, not silently accepted. The SD-JWT path fails closed when
+    // it cannot check status; the mdoc path must match its posture. The
+    // full Token Status List evaluation (the same
+    // `verify_token_cwt`-backed check the SD-JWT path runs) is the
+    // follow-up; until it lands, an mdoc carrying a status reference is
+    // rejected with the reason named, never passed as valid.
+    if get(&mso, "status").is_ok() {
+        return Err(policy(
+            "mdoc_status_not_checked: the MSO carries a revocation status this verifier cannot verify yet — refused rather than silently accepted (issue #82)",
+        ));
+    }
     let dig_alg = as_text(get(&mso, "digestAlgorithm")?)?.to_owned();
     if as_text(get(&mso, "docType")?)? != doc_type {
         return Err(policy("doc_type_mismatch"));

@@ -1443,7 +1443,7 @@ mod hints_cap {
     /// issuance pattern: a fresh issuer key + cert per presentation,
     /// so each token names a genuinely distinct (iss, kid)).
     fn distinct_presentation(i: usize) -> String {
-        let (issuer_cert, mut issuer_key) = self_signed_ec("issuer.example", "ES256");
+        let (_issuer_cert, mut issuer_key) = self_signed_ec("issuer.example", "ES256");
         // The kid/JWKS profile names the key by kid: the hint extraction
         // requires one (no x5c, kid present — the amplification's shape).
         issuer_key.kid = Some(format!("kid-{i}"));
