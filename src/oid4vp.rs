@@ -1069,17 +1069,21 @@ pub fn process_response_plain(
 /// between the open and the verification. The request-expiry guard runs
 /// again here so splitting the pipeline cannot outlive the request the
 /// same envelope answered.
-pub fn process_opened_response(
-    session: &Session,
-    opened: OpenedResponse,
-    now: i64,
-    resolver: &dyn IssuerKeyResolver,
-) -> Result<Vec<PresentationResult>> {
-    if now >= session.expires_at {
-        return Err(policy("request has expired"));
-    }
+/// Validate the decrypted response's SHAPE against the session's
+/// query, before any network fetch is driven by its contents: the
+/// `vp_token` object's credential ids must be exactly the query's ids
+/// (each requested one present, nothing unrequested), and each
+/// credential's presentations must be a non-empty array of strings
+/// with the query's `multiple` rule respected.
+///
+/// This is the pre-discovery half of [`process_opened_response`]'s
+/// checks, extracted so the network path (the issuer-key discovery)
+/// runs only on responses that already passed it: an unauthenticated
+/// junk response that names slow issuers under the kid/JWKS profile
+/// must be refused here, holding no verification slot and fetching
+/// nothing (the security report's third finding).
+pub fn validate_response_shape(session: &Session, opened: &OpenedResponse) -> Result<()> {
     let vp = &opened.vp_token;
-
     if session.dcql_query.get("credential_sets").is_some() {
         return Err(policy("credential_sets are not supported in the spike"));
     }
@@ -1093,7 +1097,8 @@ pub fn process_opened_response(
             .iter()
             .find(|q| q.get("id").and_then(Value::as_str) == Some(id))
     };
-
+    // Nothing unrequested (the network fetch below must never be driven
+    // by a credential id the query did not ask for).
     for id in vp.keys() {
         if find(id).is_none() {
             return Err(policy(format!(
@@ -1101,6 +1106,48 @@ pub fn process_opened_response(
             )));
         }
     }
+    // Everything requested is present, in the query's own shape.
+    for q in queries {
+        let id = q
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| malformed("credential query without id"))?;
+        let list = vp
+            .get(id)
+            .and_then(Value::as_array)
+            .ok_or_else(|| policy(format!("required credential {id} is missing")))?;
+        let multiple = q.get("multiple").and_then(Value::as_bool).unwrap_or(false);
+        if list.is_empty() || (!multiple && list.len() != 1) {
+            return Err(policy(format!("wrong number of presentations for {id}")));
+        }
+        for item in list {
+            if item.as_str().is_none() {
+                return Err(malformed("presentation must be a string"));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn process_opened_response(
+    session: &Session,
+    opened: OpenedResponse,
+    now: i64,
+    resolver: &dyn IssuerKeyResolver,
+) -> Result<Vec<PresentationResult>> {
+    if now >= session.expires_at {
+        return Err(policy("request has expired"));
+    }
+    // The shape validation (the pre-discovery checks) already ran on the
+    // network path; this is the depth re-check for direct embeds that
+    // skipped it.
+    validate_response_shape(session, &opened)?;
+    let vp = &opened.vp_token;
+    let queries = session
+        .dcql_query
+        .get("credentials")
+        .and_then(Value::as_array)
+        .ok_or_else(|| malformed("dcql_query without credentials"))?;
     let audience = session.holder_binding_audience();
     let params = VerifyParams::new(
         now,
@@ -1120,10 +1167,6 @@ pub fn process_opened_response(
             .get(id)
             .and_then(Value::as_array)
             .ok_or_else(|| policy(format!("required credential {id} is missing")))?;
-        let multiple = q.get("multiple").and_then(Value::as_bool).unwrap_or(false);
-        if list.is_empty() || (!multiple && list.len() != 1) {
-            return Err(policy(format!("wrong number of presentations for {id}")));
-        }
         for item in list {
             let presentation = item
                 .as_str()

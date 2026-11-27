@@ -1310,3 +1310,222 @@ fn plain_direct_post_round_trips_without_the_jwe_layer() {
         "a JWE answers only the encrypted modes: {error}"
     );
 }
+
+// ---- the pre-discovery response-shape validation (issue #83) ---------------------
+
+mod response_shape {
+    use super::*;
+
+    fn shape_session(q: Value) -> (String, Session) {
+        let w = world();
+        start(&w, q)
+    }
+
+    fn opened(vp_token: Value) -> OpenedResponse {
+        OpenedResponse {
+            vp_token: vp_token
+                .as_object()
+                .expect("the test vp_token is an object")
+                .clone(),
+        }
+    }
+
+    #[test]
+    fn an_unrequested_credential_id_is_refused_at_the_shape_check() {
+        // The security report's third finding: the junk response that
+        // names credentials the query did not ask for must be refused
+        // BEFORE any network fetch is driven by its contents. The shape
+        // check runs at the open — the discovery never sees it.
+        let (_jar, session) = shape_session(json!({
+            "credentials": [{"id": "pid", "format": "dc+sd-jwt",
+                "meta": {"vct_values": ["urn:eudi:pid:1"]},
+                "claims": [{"path": ["given_name"]}]}],
+        }));
+        let opened = opened(json!({
+            "pid": ["legit.presentation.jwt"],
+            "NOT_ASKED": ["junk.with.slow.kid"],
+        }));
+        let err =
+            validate_response_shape(&session, &opened).expect_err("the unrequested id must refuse");
+        assert!(
+            format!("{err}").contains("unrequested credential id"),
+            "the refusal names the id: {err}"
+        );
+    }
+
+    #[test]
+    fn a_missing_requested_credential_is_refused_at_the_shape_check() {
+        let (_jar, session) = shape_session(json!({
+            "credentials": [{"id": "pid", "format": "dc+sd-jwt",
+                "meta": {"vct_values": ["urn:eudi:pid:1"]},
+                "claims": [{"path": ["given_name"]}]}],
+        }));
+        let opened = opened(json!({"OTHER": ["x"]}));
+        assert!(
+            validate_response_shape(&session, &opened).is_err(),
+            "the missing requested credential must refuse"
+        );
+    }
+
+    #[test]
+    fn a_wrong_presentation_count_is_refused_at_the_shape_check() {
+        let (_jar, session) = shape_session(json!({
+            "credentials": [{"id": "pid", "format": "dc+sd-jwt",
+                "meta": {"vct_values": ["urn:eudi:pid:1"]},
+                "claims": [{"path": ["given_name"]}]}],
+        }));
+        // `multiple` absent (the default): exactly one presentation.
+        let opened = opened(json!({"pid": ["one", "two"]}));
+        let err = validate_response_shape(&session, &opened).expect_err("the count must refuse");
+        assert!(
+            format!("{err}").contains("wrong number"),
+            "the refusal names the count: {err}"
+        );
+    }
+
+    #[test]
+    fn a_matching_response_passes_the_shape_check() {
+        let (_jar, session) = shape_session(json!({
+            "credentials": [{"id": "pid", "format": "dc+sd-jwt",
+                "meta": {"vct_values": ["urn:eudi:pid:1"]},
+                "claims": [{"path": ["given_name"]}]}],
+        }));
+        let opened = opened(json!({"pid": ["legit.presentation.jwt"]}));
+        validate_response_shape(&session, &opened).expect("the matching response passes");
+    }
+
+    #[test]
+    fn a_multiple_query_accepts_several_presentations() {
+        let (_jar, session) = shape_session(json!({
+            "credentials": [{"id": "pid", "format": "dc+sd-jwt", "multiple": true,
+                "meta": {"vct_values": ["urn:eudi:pid:1"]},
+                "claims": [{"path": ["given_name"]}]}],
+        }));
+        let opened = opened(json!({"pid": ["one", "two"]}));
+        validate_response_shape(&session, &opened).expect("the multiple query accepts the list");
+    }
+
+    #[test]
+    fn a_non_string_presentation_is_refused_at_the_shape_check() {
+        let (_jar, session) = shape_session(json!({
+            "credentials": [{"id": "pid", "format": "dc+sd-jwt",
+                "meta": {"vct_values": ["urn:eudi:pid:1"]},
+                "claims": [{"path": ["given_name"]}]}],
+        }));
+        let opened = opened(json!({"pid": [42]}));
+        assert!(
+            validate_response_shape(&session, &opened).is_err(),
+            "the non-string presentation must refuse"
+        );
+    }
+
+    #[test]
+    fn an_empty_presentation_list_is_refused_at_the_shape_check() {
+        let (_jar, session) = shape_session(json!({
+            "credentials": [{"id": "pid", "format": "dc+sd-jwt",
+                "meta": {"vct_values": ["urn:eudi:pid:1"]},
+                "claims": [{"path": ["given_name"]}]}],
+        }));
+        let opened = opened(json!({"pid": []}));
+        assert!(
+            validate_response_shape(&session, &opened).is_err(),
+            "the empty list must refuse"
+        );
+    }
+}
+
+// ---- the issuer-key hints cap (issue #83, the amplification) --------------------
+mod hints_cap {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// One real SD-JWT issued by a distinct issuer (the file's own
+    /// issuance pattern: a fresh issuer key + cert per presentation,
+    /// so each token names a genuinely distinct (iss, kid)).
+    fn distinct_presentation(i: usize) -> String {
+        let (issuer_cert, mut issuer_key) = self_signed_ec("issuer.example", "ES256");
+        // The kid/JWKS profile names the key by kid: the hint extraction
+        // requires one (no x5c, kid present — the amplification's shape).
+        issuer_key.kid = Some(format!("kid-{i}"));
+        let holder = ec_jwk("ES256", "holder");
+        let mut spec = IssueSpec::new(json!({
+            "iss": format!("https://slow-{i}.example"),
+            "vct": "urn:eudi:pid:1",
+            "iat": NOW - 10, "exp": NOW + 100_000,
+            "given_name": "Ada",
+        }));
+        spec.holder_pub = Some(public_of(&holder));
+        // The kid/JWKS profile (no x5c — the amplification's actual
+        // target): the hint extraction reads the header's kid + the
+        // payload's iss, so these tokens name their distinct issuers.
+        spec.conceal = vec![vec![Seg::Key("given_name")]];
+        let issued = issue(&issuer_key, &spec).unwrap();
+        present(
+            &issued,
+            &[0],
+            Some(KbSpec {
+                holder: &holder,
+                aud: "https://verifier.example",
+                nonce: "n",
+                iat: NOW,
+            }),
+            sdjwt::HashAlg::Sha256,
+        )
+        .unwrap()
+    }
+
+    /// The distinct (iss, kid, alg) hints a response would name, under
+    /// the plugin's cap (mirrored here; the constant must stay in sync).
+    fn hints_from(presentations: &[String]) -> HashSet<(String, String, String)> {
+        let text = json!({"pid": presentations}).to_string();
+        let mut hints: HashSet<(String, String, String)> = HashSet::new();
+        let Ok(vp) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return hints;
+        };
+        let Some(entries) = vp.as_object() else {
+            return hints;
+        };
+        const MAX_ISSUER_KEY_HINTS: usize = 8;
+        'entries: for value in entries.values() {
+            let Some(list) = value.as_array() else {
+                continue;
+            };
+            for presentation in list.iter().filter_map(|item| item.as_str()) {
+                if let Ok(Some(triple)) = sdjwt::issuer_key_hint(presentation) {
+                    if hints.len() >= MAX_ISSUER_KEY_HINTS {
+                        break 'entries;
+                    }
+                    hints.insert(triple);
+                }
+            }
+        }
+        hints
+    }
+
+    #[test]
+    fn the_distinct_hints_are_capped_per_response() {
+        // 12 real presentations from 12 distinct issuers — the genuine
+        // amplification shape — collect at most 8 hints: the discovery
+        // fetch fan-out stays bounded even for a shaped response.
+        let presentations: Vec<String> = (0..12).map(distinct_presentation).collect();
+        let hints = hints_from(&presentations);
+        assert!(
+            hints.len() <= 8,
+            "the distinct hints are capped: got {}",
+            hints.len()
+        );
+    }
+
+    #[test]
+    fn a_legitimate_response_stays_under_the_cap() {
+        // One presentation per requested credential, one issuer: the
+        // cap must never bite a genuine response.
+        let presentations: Vec<String> = vec![distinct_presentation(0)];
+        let hints = hints_from(&presentations);
+        assert_eq!(
+            hints.len(),
+            1,
+            "the genuine response names exactly one hint"
+        );
+    }
+}

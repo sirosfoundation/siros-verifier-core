@@ -694,6 +694,14 @@ async fn fetch_issuer_jwks(
 /// x5c-profile token, an mdoc DeviceResponse, a decoy) or that resolves its
 /// own carrier contributes nothing — the format layer re-decides per token
 /// at verification.
+/// The cap on distinct issuer-key hints per response: the discovery
+/// fetch (an issuer-metadata + a JWKS GET per hint) is bounded by this,
+/// so a single response cannot drive an unbounded fetch fan-out (the
+/// security report's amplification). A legitimate response carries one
+/// presentation per requested credential, each naming at most one
+/// (iss, kid) — a handful of hints is generous.
+const MAX_ISSUER_KEY_HINTS: usize = 8;
+
 fn issuer_jwks_hints(vp_token_text: &str) -> HashSet<(String, String, String)> {
     let mut hints: HashSet<(String, String, String)> = HashSet::new();
     let Ok(vp) = serde_json::from_str::<serde_json::Value>(vp_token_text) else {
@@ -702,7 +710,7 @@ fn issuer_jwks_hints(vp_token_text: &str) -> HashSet<(String, String, String)> {
     let Some(entries) = vp.as_object() else {
         return hints;
     };
-    for value in entries.values() {
+    'entries: for value in entries.values() {
         let Some(list) = value.as_array() else {
             continue;
         };
@@ -710,6 +718,13 @@ fn issuer_jwks_hints(vp_token_text: &str) -> HashSet<(String, String, String)> {
             if let Ok(Some((iss, kid, alg))) =
                 siros_verifier_core::sdjwt::issuer_key_hint(presentation)
             {
+                if hints.len() >= MAX_ISSUER_KEY_HINTS {
+                    // A response that passed the shape check but names more
+                    // distinct issuer keys than any legitimate presentation
+                    // would: refuse it rather than fetch the fan-out (the
+                    // discovery stays capped even for shaped responses).
+                    break 'entries;
+                }
                 hints.insert((iss, kid, alg));
             }
         }
