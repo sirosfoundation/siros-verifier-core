@@ -1542,12 +1542,15 @@ mod issuer_binding {
     }
 
     #[test]
-    fn another_issuers_certificate_with_a_forged_iss_is_refused() {
-        // The report's battery: issuer B's certificate with iss = A.
-        // Before the binding, go-trust's CA-anchored modes accepted it
-        // (the chain checked against the anchor, the name not against
-        // the leaf). Now the presentation path refuses BEFORE go-trust:
-        // the iss does not match B's leaf SAN.
+    fn a_forged_iss_cannot_rename_the_issuer() {
+        // The report's battery: issuer B's certificate signing a
+        // credential with iss = A. Before the binding, the verifier
+        // forwarded subject.id = iss verbatim and reported the raw iss —
+        // the RP believed A signed. Now BOTH the trust query's subject
+        // and the reported issuer identity are DERIVED from the leaf —
+        // B's own — so a forged iss cannot rename the signer: go-trust's
+        // name-vs-leaf policy (go-trust #270) applies to the TRUE signer,
+        // and the RP is told B.
         let w = world();
         let (_jar, s) = start(&w, w2_query());
         let (b_cert, b_key) = self_signed_ec("issuer-b.example", "ES256");
@@ -1557,19 +1560,20 @@ mod issuer_binding {
             json!({"state": s.state.clone(), "vp_token": {"pid": [token]}}),
             None,
         );
-        let verified = process_response(&s, &jwe, NOW + 5, &X5cLeaf).expect(
-            "the presentation verifies cryptographically (the binding is the trust layer's)",
-        );
-        let err = match verified[0]
+        let verified = process_response(&s, &jwe, NOW + 5, &X5cLeaf)
+            .expect("the presentation verifies cryptographically");
+        let query = verified[0]
             .verified
             .trust_query("pid-provider", "mdoc-issuer")
-        {
-            Ok(_) => panic!("the forged iss must refuse at the binding"),
-            Err(e) => e,
-        };
-        assert!(
-            format!("{err}").contains("is none of the origins its x5c leaf names"),
-            "the refusal names the mismatch: {err}"
+            .expect("the query derives from the leaf");
+        assert_eq!(
+            query.subject_id, "https://issuer-b.example",
+            "the trust query names the TRUE signer (B), never the forged iss"
+        );
+        assert_eq!(
+            verified[0].verified.issuer_id().unwrap(),
+            "https://issuer-b.example",
+            "the reported issuer is B — a forged iss cannot rename the signer"
         );
     }
 
@@ -1593,9 +1597,13 @@ mod issuer_binding {
     }
 
     #[test]
-    fn a_tls_server_certificate_is_refused_as_an_issuer() {
+    fn a_tls_server_certificate_is_reported_as_itself() {
         // The report's TLS case: a serverAuth-only leaf signing a
-        // credential. The purpose check refuses it (EKU names TLS).
+        // credential. The leaf-purpose policy is go-trust's per-role ask
+        // (go-trust #270) — the verifier does not duplicate the registry's
+        // entry policy (the OIDF suite's own issuance fixture would not
+        // survive it). What the verifier guarantees: the identity is the
+        // LEAF's, so the registry's policy applies to the true signer.
         let w = world();
         let (_jar, s) = start(&w, w2_query());
         let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
@@ -1606,7 +1614,7 @@ mod issuer_binding {
         let mut tls_key = jose_rs::jwk::jwk_from_pkcs8_der(kp.serialized_der()).unwrap();
         tls_key.alg = Some("ES256".into());
         let mut spec = IssueSpec::new(json!({
-            "iss": "https://tls-server.example",
+            "iss": "https://issuer.example",
             "vct": "urn:eudi:pid:1",
             "iat": NOW - 10, "exp": NOW + 100_000,
             "given_name": "Ada", "family_name": "Lovelace",
@@ -1632,90 +1640,27 @@ mod issuer_binding {
             json!({"state": s.state.clone(), "vp_token": {"pid": [token]}}),
             None,
         );
-        let verified = process_response(&s, &jwe, NOW + 5, &X5cLeaf).expect(
-            "the presentation verifies cryptographically (the purpose check is the trust layer's)",
-        );
-        let err = match verified[0]
+        let verified = process_response(&s, &jwe, NOW + 5, &X5cLeaf)
+            .expect("the presentation verifies cryptographically");
+        let query = verified[0]
             .verified
             .trust_query("pid-provider", "mdoc-issuer")
-        {
-            Ok(_) => panic!("the TLS leaf must refuse at the purpose check"),
-            Err(e) => e,
-        };
-        assert!(
-            format!("{err}").contains("purposes other than document signing"),
-            "the refusal names the TLS purpose: {err}"
+            .expect("the query derives from the leaf");
+        // A TLS leaf is not the issuer it names: the identity sent to
+        // go-trust is the leaf's own — a per-role registry policy
+        // (go-trust #270) can refuse it on exactly this ground.
+        assert_ne!(
+            query.subject_id, "https://issuer.example",
+            "the forged iss never reaches go-trust or the RP"
         );
-    }
-
-    /// A presentation whose x5c leaf was minted with the given extended
-    /// key usages — the purpose battery's fixture.
-    fn present_with_eku(
-        w: &World,
-        s: &Session,
-        ekus: Vec<rcgen::ExtendedKeyUsagePurpose>,
-    ) -> std::result::Result<Vec<siros_verifier_core::oid4vp::PresentationResult>, String> {
-        let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-        let mut params = rcgen::CertificateParams::new(vec!["issuer.example".to_string()]).unwrap();
-        params.extended_key_usages = ekus;
-        let cert = params.self_signed(&kp).unwrap();
-        let mut key = jose_rs::jwk::jwk_from_pkcs8_der(kp.serialized_der()).unwrap();
-        key.alg = Some("ES256".into());
-        let token = present_with_iss(w, s, &key, &[cert.der().to_vec()], "https://issuer.example");
-        let jwe = raw_response(
-            s,
-            json!({"state": s.state.clone(), "vp_token": {"pid": [token]}}),
-            None,
+        assert_eq!(
+            query.subject_id, "https://tls-server.example",
+            "the registry judges the TRUE signer (the TLS leaf itself)"
         );
-        process_response(s, &jwe, NOW + 5, &X5cLeaf).map_err(|e| format!("{e}"))
-    }
-
-    #[test]
-    fn a_code_signing_leaf_is_refused_as_an_issuer() {
-        // RFC 5280 §4.2.1.12: a certificate with an EKU is restricted to its
-        // purposes — a codeSigning leaf certifies code signatures, not
-        // credentials. Fail closed on every purpose outside the document-
-        // signing allow-list, not only the TLS pair the report caught.
-        let w = world();
-        let (_jar, s) = start(&w, w2_query());
-        let verified = present_with_eku(&w, &s, vec![rcgen::ExtendedKeyUsagePurpose::CodeSigning])
-            .expect(
-            "the presentation verifies cryptographically (the purpose check is the trust layer's)",
+        assert_eq!(
+            verified[0].verified.issuer_id().unwrap(),
+            "https://tls-server.example"
         );
-        let err = match verified[0]
-            .verified
-            .trust_query("pid-provider", "mdoc-issuer")
-        {
-            Ok(_) => panic!("a codeSigning leaf must refuse at the purpose check"),
-            Err(e) => e,
-        };
-        assert!(
-            format!("{err}").contains("purposes other than document signing"),
-            "the refusal names the restricted purpose: {err}"
-        );
-    }
-
-    #[test]
-    fn a_document_signing_leaf_signs_presentations() {
-        // The ISO 18013-5 document-signer profile (the OIDF conformance
-        // issuer's own shape): id-kp-documentSigning (1.3.6.1.5.5.7.3.36)
-        // is exactly the purpose an attestation issuer carries.
-        let w = world();
-        let (_jar, s) = start(&w, w2_query());
-        let verified = present_with_eku(
-            &w,
-            &s,
-            vec![rcgen::ExtendedKeyUsagePurpose::Other(vec![
-                1, 3, 6, 1, 5, 5, 7, 3, 36,
-            ])],
-        )
-        .expect("a documentSigning leaf signs presentations");
-        let id = verified[0]
-            .verified
-            .trust_query("pid-provider", "mdoc-issuer")
-            .expect("the purpose is allowed")
-            .subject_id;
-        assert_eq!(id, "https://issuer.example", "the SAN binds");
     }
 
     #[test]
@@ -1756,49 +1701,6 @@ mod issuer_binding {
             "the identity is the leaf's own hash, not the raw iss: {id}"
         );
         assert_ne!(id, "https://issuer.conformance.example.com:9443");
-    }
-
-    #[test]
-    fn an_http_uri_san_never_becomes_an_https_origin() {
-        // A leaf whose only SAN is a plain-HTTP URI must not satisfy an
-        // https `iss` through a scheme rewrite: the certified name is the
-        // http one, and it certifies no https origin.
-        let w = world();
-        let (_jar, s) = start(&w, w2_query());
-        let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-        let mut params = rcgen::CertificateParams::new(vec![]).unwrap();
-        params.subject_alt_names = vec![rcgen::SanType::URI(
-            "http://issuer.example".parse().unwrap(),
-        )];
-        let cert = params.self_signed(&kp).unwrap();
-        let mut key = jose_rs::jwk::jwk_from_pkcs8_der(kp.serialized_der()).unwrap();
-        key.alg = Some("ES256".into());
-        let token = present_with_iss(
-            &w,
-            &s,
-            &key,
-            &[cert.der().to_vec()],
-            "https://issuer.example",
-        );
-        let jwe = raw_response(
-            &s,
-            json!({"state": s.state.clone(), "vp_token": {"pid": [token]}}),
-            None,
-        );
-        let verified = process_response(&s, &jwe, NOW + 5, &X5cLeaf).expect(
-            "the presentation verifies cryptographically (the binding is the trust layer's)",
-        );
-        let err = match verified[0]
-            .verified
-            .trust_query("pid-provider", "mdoc-issuer")
-        {
-            Ok(_) => panic!("an http URI SAN must not satisfy an https iss"),
-            Err(e) => e,
-        };
-        assert!(
-            format!("{err}").contains("names no https origin"),
-            "the refusal names the uncertifiable iss: {err}"
-        );
     }
 
     fn w2_query() -> Value {

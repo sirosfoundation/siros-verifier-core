@@ -228,10 +228,9 @@ impl VerifiedCredential {
 
     pub fn trust_query(&self, role: &str, mdoc_role: &str) -> Result<TrustQuery> {
         match self {
-            // The SD-JWT path's query REFUSES here when the issuer is not
-            // bound (issue #81): an iss that does not match the x5c leaf,
-            // or a leaf unfit to sign attestations, never reaches
-            // go-trust as a candidate.
+            // The query's subject is the BOUND identity (issue #81): the
+            // leaf-derived one, never raw `iss` — so go-trust's name-vs-
+            // leaf policy applies to the true signer (go-trust #270).
             Self::SdJwt(verified) => TrustQuery::for_issuer(&verified.issuer, role, &verified.vct),
             Self::Mdoc(verified) => Ok(TrustQuery::for_mdoc_issuer(
                 &verified.issuer,
