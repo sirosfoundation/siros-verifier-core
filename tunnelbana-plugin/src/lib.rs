@@ -1903,14 +1903,11 @@ impl VpBackend {
                     description: status_list_reason(&e),
                 }
             })?;
-        // The status-list signer binds like every SD-JWT issuer (issue
-        // #81): the query refuses an unbound signer here.
-        let query = TrustQuery::for_issuer(&token.issuer, "status-list-signer", "status-list")
-            .map_err(|e| StatusListRefusal {
-                code: "status_list_signer_not_bound",
-                status: 400,
-                description: format!("{e}"),
-            })?;
+        // The status-list signer's query is the TSL shape (issue #81): the
+        // token's `iss` names the list, not the signer, so the constructor
+        // binds nothing here — the signer's own certificate policy is
+        // go-trust's role policy (go-trust #270).
+        let query = TrustQuery::for_status_list_signer(&token.issuer);
         // The signer's trust evaluation is a PDP round-trip like every
         // other: it accumulates into trust_ms as well, or a slow go-trust
         // hides inside status_ms and the trust total understates it.
