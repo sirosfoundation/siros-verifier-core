@@ -291,7 +291,12 @@ impl Frontend for UiFrontend {
     }
 
     async fn handle_backend_error(&self, _ctx: &mut Context, error: &Error) -> Result<Response> {
-        Ok(error_page(error.status_hint()))
+        // The refusal's own reason reaches the integrator twice (issue #74):
+        // a warn line with the error's full sentence, and the same sentence
+        // on the page — the generic "Presentation failed" text left a
+        // start refusal indistinguishable from a crash.
+        tracing::warn!(error = %error, status = error.status_hint(), "the UI's backend request refused");
+        Ok(error_page(error.status_hint(), &error.to_string()))
     }
 }
 
@@ -427,9 +432,12 @@ fn result_page(response: &InternalData) -> String {
     )
 }
 
-fn error_page(status: u16) -> Response {
+fn error_page(status: u16, reason: &str) -> Response {
+    // The refusal's own sentence rides the page (issue #74): the caller
+    // sees WHICH bad request it was, not only that it failed.
     let body = format!(
-        r#"<h1>Presentation failed</h1><p>The credential presentation could not be completed (HTTP {status}). No verified attributes were released.</p><a class="back" href="/">Try again</a>"#
+        r#"<h1>Presentation failed</h1><p>The credential presentation could not be completed (HTTP {status}). No verified attributes were released.</p><p class="siros-failure-description">{}</p><a class="back" href="/">Try again</a>"#,
+        html_escape(reason)
     );
     Response::new(status)
         .with_header("content-type", "text/html; charset=utf-8")
@@ -448,6 +456,24 @@ pub(crate) fn html_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_error_page_carries_the_refusal_reason() {
+        // Issue #74: a refused start's own sentence ("only a configured
+        // zkp_req preset is supported" for the stale-bounds case) must
+        // reach the caller — the generic page left it indistinguishable
+        // from a crash.
+        let page = error_page(
+            400,
+            "bad request: only a configured zkp_req preset is supported",
+        );
+        let body = String::from_utf8(page.body).unwrap();
+        assert!(body.contains("Presentation failed"), "{body}");
+        assert!(
+            body.contains("only a configured zkp_req preset is supported"),
+            "the gate's own reason rides the page: {body}"
+        );
+    }
 
     #[test]
     fn landing_offers_qr_and_dc_api() {
