@@ -298,29 +298,38 @@ pub(crate) fn check_issuer_leaf_purpose(leaf_der: &[u8]) -> Result<()> {
             "the issuer leaf's keyUsage does not include digitalSignature",
         ));
     }
-    // EKU: allow-list. A bare serverAuth leaf is a TLS certificate
-    // (the report's case); an issuer carries no EKU or a
-    // document-signing-appropriate one. `serverAuth`/`clientAuth`
-    // alone are refused.
+    // EKU: allow-list (RFC 5280 §4.2.1.12 — a certificate with an EKU is
+    // restricted to its indicated purposes). An attestation issuer's
+    // certificate carries no EKU (the unconstrained case), or purposes that
+    // name document signing — `id-kp-documentSigning` (1.3.6.1.5.5.7.3.36,
+    // the ISO 18013-5 document-signer profile the OIDF conformance issuer
+    // uses) or `anyExtendedKeyUsage` (the explicit wildcard). Anything else
+    // — `serverAuth` (the report's TLS case), `clientAuth`, `codeSigning`,
+    // `emailProtection`, `timeStamping`, `ocspSigning`, or an unknown
+    // purpose — is a restricted-purpose leaf and refuses: a certificate
+    // restricted to a purpose other than signing documents cannot sign
+    // credentials. Fail closed on the unknown (a registry, not this check,
+    // holds the real issuer policy — go-trust #270).
     let eku_oid = ObjectIdentifier::new_unwrap("2.5.29.37");
     for extension in tbs.extensions.iter().flatten() {
-        if extension.extn_id == eku_oid {
-            let eku = ExtendedKeyUsage::from_der(extension.extn_value.as_bytes()).map_err(|e| {
-                crate::error::malformed(format!("the issuer leaf's EKU does not parse: {e}"))
-            })?;
-            let forbidden = [
-                "1.3.6.1.5.5.7.3.1", // serverAuth
-                "1.3.6.1.5.5.7.3.2", // clientAuth
-            ];
-            if eku
-                .0
-                .iter()
-                .any(|purpose| forbidden.iter().any(|f| purpose.to_string() == *f))
-            {
-                return Err(crate::error::policy(
-                    "the issuer leaf's EKU names TLS purposes (serverAuth/clientAuth) — a TLS certificate is not an attestation signer",
-                ));
-            }
+        if extension.extn_id != eku_oid {
+            continue;
+        }
+        let eku = ExtendedKeyUsage::from_der(extension.extn_value.as_bytes()).map_err(|e| {
+            crate::error::malformed(format!("the issuer leaf's EKU does not parse: {e}"))
+        })?;
+        let allowed = [
+            "1.3.6.1.5.5.7.3.36", // id-kp-documentSigning
+            "2.5.29.37.0",        // anyExtendedKeyUsage
+        ];
+        if !eku
+            .0
+            .iter()
+            .all(|purpose| allowed.iter().any(|a| purpose.to_string() == *a))
+        {
+            return Err(crate::error::policy(
+                "the issuer leaf's EKU names purposes other than document signing — a certificate restricted to another purpose is not an attestation signer",
+            ));
         }
     }
     Ok(())
