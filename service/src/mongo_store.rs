@@ -85,6 +85,10 @@ impl MongoFlowStore {
             .build()
     }
 
+    /// `response_code` (issue #84, OpenID4VP §14.2) persists with a terminal
+    /// outcome: minted by the `direct_post` finish, presented (and matched)
+    /// atomically by the collecting transition's filter.
+    #[allow(clippy::too_many_arguments)]
     async fn transition(
         &self,
         filter: Document,
@@ -92,28 +96,27 @@ impl MongoFlowStore {
         lease_until: i64,
         return_document: ReturnDocument,
         failure_description: Option<&str>,
+        response_code: Option<&str>,
     ) -> StoreResult<Option<Flow>> {
         let clear_secrets = !matches!(&outcome, Outcome::Processing(_));
         let outcome = bson::to_bson(&outcome)
             .map_err(|e| FlowStoreError(format!("flow outcome encoding failed: {e}")))?;
         let update = if clear_secrets {
-            match failure_description {
-                Some(description) => doc! {
-                    "$set": {
-                        "outcome": outcome,
-                        "failure_description": description,
-                        "jar": "",
-                        "sealed_session": "",
-                    }
-                },
-                None => doc! {
-                    "$set": {
-                        "outcome": outcome,
-                        "jar": "",
-                        "sealed_session": "",
-                    }
-                },
+            // The Response Code is not a session secret: it must survive the
+            // terminal write (the collecting browser still has to present
+            // it), so it is set alongside the outcome, never cleared here.
+            let mut set = doc! {
+                "outcome": outcome,
+                "jar": "",
+                "sealed_session": "",
+            };
+            if let Some(description) = failure_description {
+                set.insert("failure_description", description);
             }
+            if let Some(code) = response_code {
+                set.insert("response_code", code);
+            }
+            doc! { "$set": set }
         } else {
             // Only in-flight claims carry a processing lease deadline; the
             // terminal transitions below never read it.
@@ -183,6 +186,7 @@ impl FlowStore for MongoFlowStore {
                 now.saturating_add(lease_secs),
                 ReturnDocument::After,
                 None,
+                None,
             )
             .await?;
         if let Some(flow) = claimed {
@@ -202,10 +206,17 @@ impl FlowStore for MongoFlowStore {
         now: i64,
         claim_id: &str,
         outcome: TerminalOutcome,
+        response_code: Option<&str>,
     ) -> StoreResult<FinishResult> {
         let failure_description = match &outcome {
             TerminalOutcome::Failed { description, .. } => Some(description.clone()),
             _ => None,
+        };
+        // The §14.2 Response Code (issue #84) persists with a done outcome
+        // (None on a failure: no credential material, no gate).
+        let response_code = match &outcome {
+            TerminalOutcome::Done(_) => Some(response_code.unwrap_or("")),
+            TerminalOutcome::Failed { .. } => None,
         };
         let finished = self
             .transition(
@@ -219,6 +230,7 @@ impl FlowStore for MongoFlowStore {
                 0,
                 ReturnDocument::Before,
                 failure_description.as_deref(),
+                response_code,
             )
             .await?
             .is_some();
@@ -229,14 +241,49 @@ impl FlowStore for MongoFlowStore {
         })
     }
 
-    async fn collect(&self, id: &str, now: i64) -> StoreResult<CollectResult> {
+    async fn collect(
+        &self,
+        id: &str,
+        now: i64,
+        response_code: Option<&str>,
+    ) -> StoreResult<CollectResult> {
+        // The §14.2 gate (issue #84): a done flow is collected only by the
+        // requester presenting the flow's stored Response Code — the match
+        // rides the atomic transition's filter, so a missing or wrong code
+        // refuses without consuming (the wallet's `redirect_uri` still
+        // completes it). An absent or empty presented code matches nothing:
+        // fail closed.
+        if let Some(presented) = response_code.filter(|code| !code.is_empty()) {
+            let collected = self
+                .transition(
+                    doc! {
+                        "_id": id,
+                        "retain_until": { "$gt": now },
+                        "outcome.state": "done",
+                        "response_code": presented,
+                    },
+                    Outcome::Collected,
+                    0,
+                    ReturnDocument::Before,
+                    None,
+                    None,
+                )
+                .await?;
+            if let Some(flow) = collected {
+                return match flow.outcome {
+                    Outcome::Done(result) => Ok(CollectResult::Done(result)),
+                    _ => Err(FlowStoreError("invalid MongoDB collect transition".into())),
+                };
+            }
+        }
+        // Refusals and request expiry need no gate: their pages carry no
+        // credential material.
         let collected = self
             .transition(
                 doc! {
                     "_id": id,
                     "retain_until": { "$gt": now },
                     "$or": [
-                        { "outcome.state": "done" },
                         { "outcome.state": "failed" },
                         { "outcome.state": "pending", "expires_at": { "$lte": now } },
                     ],
@@ -244,6 +291,7 @@ impl FlowStore for MongoFlowStore {
                 Outcome::Collected,
                 0,
                 ReturnDocument::Before,
+                None,
                 None,
             )
             .await?;
@@ -253,7 +301,6 @@ impl FlowStore for MongoFlowStore {
             let browser_launched =
                 siros_verifier_core_tunnelbana::ui::is_ui_requester(flow.requester.as_deref());
             return match flow.outcome {
-                Outcome::Done(result) => Ok(CollectResult::Done(result)),
                 Outcome::Failed(code) => Ok(CollectResult::Failed {
                     code,
                     description: failure_description,
@@ -263,11 +310,13 @@ impl FlowStore for MongoFlowStore {
                 _ => Err(FlowStoreError("invalid MongoDB collect transition".into())),
             };
         }
-        // A valid response may have claimed the record after our conditional
-        // update. It is still in progress, never an unknown flow.
+        // No atomic transition matched. A live flow is still in progress —
+        // or a done flow whose code did not match, left untouched and
+        // collectable by the wallet's return.
         Ok(match self.load(id, now).await? {
             None => CollectResult::Unknown,
             Some(flow) if matches!(flow.outcome, Outcome::Collected) => CollectResult::Unknown,
+            Some(flow) if matches!(flow.outcome, Outcome::Done(_)) => CollectResult::CodeMismatch,
             Some(_) => CollectResult::Pending,
         })
     }

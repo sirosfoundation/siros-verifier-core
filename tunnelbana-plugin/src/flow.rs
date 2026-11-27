@@ -55,6 +55,16 @@ pub struct Flow {
     /// carries no reason and for flows persisted before the field existed.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub failure_description: String,
+    /// The one-time OpenID4VP §14.2 Response Code (issue #84): minted when
+    /// the wallet's presentation result is persisted, returned to the wallet
+    /// in the `direct_post` answer's `redirect_uri`, and required from the
+    /// completing browser. It binds the completion to the wallet that
+    /// actually presented — the flow's cookie alone no longer collects.
+    /// Empty while the flow is open and for flows persisted before the
+    /// field existed. Not cleared by `clear_secrets`: the code must survive
+    /// the terminal write, and the flow record never leaves the store.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub response_code: String,
 }
 
 impl Flow {
@@ -114,6 +124,11 @@ pub enum CollectResult {
     Pending,
     Expired,
     Done(String),
+    /// A done flow whose stored Response Code the requester did not present
+    /// (missing or mismatched — the same refusal either way, so a probe
+    /// learns nothing). The flow is left untouched: the genuine completion
+    /// arrives later through the wallet's `redirect_uri`.
+    CodeMismatch,
     /// The stable machine refusal code plus the bounded, client-safe reason.
     /// `browser_launched` marks a flow the browser started directly through
     /// the UI frontend: its refusal renders on the failure page. RP-initiated
@@ -162,8 +177,17 @@ pub trait FlowStore: Send + Sync {
         now: i64,
         claim_id: &str,
         outcome: TerminalOutcome,
+        response_code: Option<&str>,
     ) -> StoreResult<FinishResult>;
-    async fn collect(&self, id: &str, now: i64) -> StoreResult<CollectResult>;
+    /// Collect the flow's terminal result. `response_code` is the OpenID4VP
+    /// §14.2 code the completing browser presents; a done flow with a minted
+    /// code refuses without consuming when it is absent or wrong.
+    async fn collect(
+        &self,
+        id: &str,
+        now: i64,
+        response_code: Option<&str>,
+    ) -> StoreResult<CollectResult>;
 }
 
 /// Single-process store used by tests and explicitly configured local deployments.
@@ -241,6 +265,7 @@ impl FlowStore for MemoryFlowStore {
         now: i64,
         claim_id: &str,
         outcome: TerminalOutcome,
+        response_code: Option<&str>,
     ) -> StoreResult<FinishResult> {
         let mut flows = self.lock()?;
         Self::remove_expired_retention(&mut flows, id, now);
@@ -253,12 +278,22 @@ impl FlowStore for MemoryFlowStore {
         if let TerminalOutcome::Failed { description, .. } = &outcome {
             flow.failure_description = description.clone();
         }
+        // Only a done result mints the Response Code: a refusal carries no
+        // credential material, so its page needs no binding.
+        if let TerminalOutcome::Done(_) = &outcome {
+            flow.response_code = response_code.unwrap_or_default().to_owned();
+        }
         flow.outcome = outcome.into();
         flow.clear_secrets();
         Ok(FinishResult::Finished)
     }
 
-    async fn collect(&self, id: &str, now: i64) -> StoreResult<CollectResult> {
+    async fn collect(
+        &self,
+        id: &str,
+        now: i64,
+        response_code: Option<&str>,
+    ) -> StoreResult<CollectResult> {
         let mut flows = self.lock()?;
         Self::remove_expired_retention(&mut flows, id, now);
         let Some(flow) = flows.get_mut(id) else {
@@ -267,7 +302,23 @@ impl FlowStore for MemoryFlowStore {
         let result = match &flow.outcome {
             Outcome::Pending if flow.expired(now) => CollectResult::Expired,
             Outcome::Pending | Outcome::Processing(_) => return Ok(CollectResult::Pending),
-            Outcome::Done(result) => CollectResult::Done(result.clone()),
+            // The Response Code gate (issue #84): a done flow is collected
+            // only by the requester the wallet handed the code to — the
+            // browser that opened the wallet (same-device) or the DC API
+            // answer the frontend itself relays. A missing or wrong code
+            // refuses without consuming, so a probe cannot burn the
+            // genuine completion that arrives later through the wallet's
+            // redirect_uri. A flow persisted before the field existed has
+            // an empty code and refuses the same way: fail closed — a
+            // cookie alone never collects.
+            Outcome::Done(result) => {
+                let stored = &flow.response_code;
+                let presented = response_code.unwrap_or("");
+                if stored.is_empty() || stored != presented {
+                    return Ok(CollectResult::CodeMismatch);
+                }
+                CollectResult::Done(result.clone())
+            }
             Outcome::Failed(code) => CollectResult::Failed {
                 code: code.clone(),
                 description: flow.failure_description.clone(),

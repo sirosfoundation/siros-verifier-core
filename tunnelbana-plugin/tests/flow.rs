@@ -132,12 +132,18 @@ impl FlowStore for FinishFailingStore {
         _now: i64,
         _claim_id: &str,
         _outcome: TerminalOutcome,
+        _response_code: Option<&str>,
     ) -> StoreResult<FinishResult> {
         Err(FlowStoreError("injected finish outage".into()))
     }
 
-    async fn collect(&self, id: &str, now: i64) -> StoreResult<CollectResult> {
-        self.inner.collect(id, now).await
+    async fn collect(
+        &self,
+        id: &str,
+        now: i64,
+        response_code: Option<&str>,
+    ) -> StoreResult<CollectResult> {
+        self.inner.collect(id, now, response_code).await
     }
 }
 
@@ -600,6 +606,29 @@ async fn complete(f: &Fx, state: &State) -> Result<BackendAction, String> {
         .map_err(|e| e.to_string())
 }
 
+/// The browser completes through the bound channel: the wallet handed the
+/// answer's code to the browser that opened it (issue #84).
+async fn complete_bound(f: &Fx, state: &State, answer_body: &str) -> Result<BackendAction, String> {
+    complete_with(f, state, Some(&common::bound_code(answer_body))).await
+}
+
+/// Complete presenting an explicit code (`None` polls without one).
+async fn complete_with(f: &Fx, state: &State, code: Option<&str>) -> Result<BackendAction, String> {
+    let mut request = req("vp/complete", "GET");
+    if let Some(code) = code {
+        request
+            .query
+            .insert("response_code".to_owned(), code.to_owned());
+        request
+            .query_pairs
+            .push(("response_code".to_owned(), code.to_owned()));
+    }
+    let mut ctx = Context::new(request, state.clone());
+    f.b.handle_endpoint(&mut ctx, "complete")
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// A refused flow completes to the failure page carrying its human-readable
 /// reason — never a success, and never the legacy bare `authentication
 /// error: <code>` string. `code`, when given, must ride the page.
@@ -648,9 +677,12 @@ async fn happy_path_delivers_mapped_attributes_once() {
         BackendAction::Respond(_)
     ));
     let jar = fetch_jar(&f, &id).await;
-    let (st, _) = post(&f, &id, &wallet(&f, &jar)).await;
+    let (st, answer) = post(&f, &id, &wallet(&f, &jar)).await;
     assert_eq!(st, 200);
-    let BackendAction::AuthResponse(d) = complete(&f, &state).await.unwrap() else {
+    // The done answer carries the §14.2 redirect_uri (issue #84): its
+    // one-time response_code is what completes the flow.
+    assert!(answer.contains("redirect_uri"), "the answer: {answer}");
+    let BackendAction::AuthResponse(d) = complete_bound(&f, &state, &answer).await.unwrap() else {
         panic!("expected auth response")
     };
     assert_eq!(d.requester.as_deref(), Some(ui::QR_REQUESTER));
@@ -671,13 +703,68 @@ async fn happy_path_delivers_mapped_attributes_once() {
 }
 
 #[tokio::test]
+async fn a_done_flow_without_the_response_code_waits_for_the_wallets_return() {
+    // Issue #84, OpenID4VP §14.2: the flow's cookie alone no longer
+    // collects. The browser polling without the wallet's code — or a
+    // probe carrying a wrong one — gets the same page, and the flow
+    // stays collectable for the wallet's redirect.
+    let f = fx();
+    let (state, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    let (st, answer) = post(&f, &id, &wallet(&f, &jar)).await;
+    assert_eq!(st, 200, "{answer}");
+    // Without the code: the wallet-return page, never the result.
+    let BackendAction::Respond(page) = complete(&f, &state).await.unwrap() else {
+        panic!("a code-less completion must not deliver")
+    };
+    let page = String::from_utf8_lossy(&page.body).into_owned();
+    assert!(page.contains("Return to the verifier"), "the page: {page}");
+    assert!(
+        !page.contains("Lovelace") && !page.contains("Ada"),
+        "{page}"
+    );
+    // A wrong code: the same page — no oracle distinguishes the two.
+    let BackendAction::Respond(wrong) = complete_with(&f, &state, Some("an-attacker-s-guess"))
+        .await
+        .unwrap()
+    else {
+        panic!("a wrong code must not deliver")
+    };
+    assert!(String::from_utf8_lossy(&wrong.body).contains("Return to the verifier"));
+    // The genuine code still delivers — the probes burned nothing.
+    let BackendAction::AuthResponse(_) = complete_bound(&f, &state, &answer).await.unwrap() else {
+        panic!("the bound completion delivers")
+    };
+    // ...exactly once.
+    assert!(complete_bound(&f, &state, &answer).await.is_err());
+}
+
+#[tokio::test]
+async fn the_result_names_the_invocation_when_no_class_is_configured() {
+    // Issue #84: the RP is told how the result was obtained. No configured
+    // `auth_class_ref` — the default is the invocation kind: a direct-post
+    // completion is §14.2-bound (the wallet handed the code to the browser).
+    let mut cfg = pid_cfg("/family_name", "get", None, 16);
+    cfg.auth_class_ref = None;
+    let f = assemble(cfg, mock_pdp(100_000, false), pid_parts());
+    let (state, id) = start(&f).await;
+    let jar = fetch_jar(&f, &id).await;
+    let (st, answer) = post(&f, &id, &wallet(&f, &jar)).await;
+    assert_eq!(st, 200, "{answer}");
+    let BackendAction::AuthResponse(d) = complete_bound(&f, &state, &answer).await.unwrap() else {
+        panic!("the bound completion delivers")
+    };
+    assert_eq!(d.auth_info.auth_class_ref.as_deref(), Some(ACR_LINK_BOUND));
+}
+
+#[tokio::test]
 async fn every_verified_credential_s_claims_reach_the_result() {
     let (f, loyalty) = fx_multi(json!("gold"));
     let (state, id) = start(&f).await;
     let jar = fetch_jar(&f, &id).await;
     let (st, body) = post(&f, &id, &wallet_multi(&f, &loyalty, &jar)).await;
     assert_eq!(st, 200, "{body}");
-    let BackendAction::AuthResponse(d) = complete(&f, &state).await.unwrap() else {
+    let BackendAction::AuthResponse(d) = complete_bound(&f, &state, &body).await.unwrap() else {
         panic!("expected auth response")
     };
     assert_eq!(d.requester.as_deref(), Some(ui::QR_REQUESTER));
@@ -709,7 +796,7 @@ async fn the_subject_may_come_from_a_later_credential() {
     let jar = fetch_jar(&f, &id).await;
     let (st, body) = post(&f, &id, &wallet_multi(&f, &loyalty, &jar)).await;
     assert_eq!(st, 200, "{body}");
-    let BackendAction::AuthResponse(d) = complete(&f, &state).await.unwrap() else {
+    let BackendAction::AuthResponse(d) = complete_bound(&f, &state, &body).await.unwrap() else {
         panic!("expected auth response")
     };
     assert_eq!(d.subject_id.as_deref(), Some("gold"));
@@ -723,7 +810,7 @@ async fn the_subject_comes_from_the_first_credential_that_carries_it() {
     let jar = fetch_jar(&f, &id).await;
     let (st, body) = post(&f, &id, &wallet_multi(&f, &loyalty, &jar)).await;
     assert_eq!(st, 200, "{body}");
-    let BackendAction::AuthResponse(d) = complete(&f, &state).await.unwrap() else {
+    let BackendAction::AuthResponse(d) = complete_bound(&f, &state, &body).await.unwrap() else {
         panic!("expected auth response")
     };
     assert_eq!(d.subject_id.as_deref(), Some("urn:eudi:pid:1"));
@@ -838,7 +925,7 @@ async fn an_intermediary_configured_backend_arms_the_verifier_info_members() {
     let (st, body) = post(&f, &id, &wallet(&f, &jar)).await;
     assert_eq!(st, 200, "{body}");
     assert!(matches!(
-        complete(&f, &state).await.unwrap(),
+        complete_bound(&f, &state, &body).await.unwrap(),
         BackendAction::AuthResponse(_)
     ));
     // The WRPRC the arm validated parses at the fixture clock.
@@ -1050,7 +1137,7 @@ async fn an_embedded_jwk_status_list_needs_the_configured_key_source() {
     let (st, body) = post(&f, &id, &wallet(&f, &jar)).await;
     assert_eq!(st, 200, "{body}");
     assert!(matches!(
-        complete(&f, &state).await.unwrap(),
+        complete_bound(&f, &state, &body).await.unwrap(),
         BackendAction::AuthResponse(_)
     ));
     assert_eq!(
@@ -1177,9 +1264,9 @@ async fn warm_receipt_survives_a_pdp_outage_until_it_expires() {
     // first login warms the receipt
     let (s1, id1) = start(&f).await;
     let jar = fetch_jar(&f, &id1).await;
-    assert_eq!(post(&f, &id1, &wallet(&f, &jar)).await.0, 200);
+    let answer1 = post(&f, &id1, &wallet(&f, &jar)).await.1;
     assert!(matches!(
-        complete(&f, &s1).await.unwrap(),
+        complete_bound(&f, &s1, &answer1).await.unwrap(),
         BackendAction::AuthResponse(_)
     ));
     assert_eq!(f.pdp.calls.load(Ordering::SeqCst), 1);
@@ -1189,9 +1276,9 @@ async fn warm_receipt_survives_a_pdp_outage_until_it_expires() {
     f.clock.store(T0 + 600, Ordering::SeqCst); // fresh: refresh_after is T0 + 1800
     let (s2, id2) = start(&f).await;
     let jar = fetch_jar(&f, &id2).await;
-    assert_eq!(post(&f, &id2, &wallet(&f, &jar)).await.0, 200);
+    let answer2 = post(&f, &id2, &wallet(&f, &jar)).await.1;
     assert!(matches!(
-        complete(&f, &s2).await.unwrap(),
+        complete_bound(&f, &s2, &answer2).await.unwrap(),
         BackendAction::AuthResponse(_)
     ));
     assert_eq!(
@@ -1204,9 +1291,9 @@ async fn warm_receipt_survives_a_pdp_outage_until_it_expires() {
     f.clock.store(T0 + 2000, Ordering::SeqCst);
     let (s3, id3) = start(&f).await;
     let jar = fetch_jar(&f, &id3).await;
-    assert_eq!(post(&f, &id3, &wallet(&f, &jar)).await.0, 200);
+    let answer3 = post(&f, &id3, &wallet(&f, &jar)).await.1;
     assert!(matches!(
-        complete(&f, &s3).await.unwrap(),
+        complete_bound(&f, &s3, &answer3).await.unwrap(),
         BackendAction::AuthResponse(_)
     ));
     assert_eq!(
@@ -1227,8 +1314,8 @@ async fn receipt_lifetime_follows_trust_data_next_update() {
     let f = fx_with(900); // the registry's data expires 15 minutes from now
     let (s, id) = start(&f).await;
     let jar = fetch_jar(&f, &id).await;
-    assert_eq!(post(&f, &id, &wallet(&f, &jar)).await.0, 200);
-    complete(&f, &s).await.unwrap();
+    let answer = post(&f, &id, &wallet(&f, &jar)).await.1;
+    complete_bound(&f, &s, &answer).await.unwrap();
     f.pdp.down.store(true, Ordering::SeqCst);
     f.clock.store(T0 + 901, Ordering::SeqCst);
     let (_s, id) = start(&f).await;
@@ -1246,10 +1333,10 @@ async fn replayed_wallet_response_is_rejected_and_does_not_double_deliver() {
     let (state, id) = start(&f).await;
     let jar = fetch_jar(&f, &id).await;
     let jwe = wallet(&f, &jar);
-    assert_eq!(post(&f, &id, &jwe).await.0, 200);
+    let answer = post(&f, &id, &jwe).await.1;
     assert_eq!(post(&f, &id, &jwe).await.0, 409);
     assert!(matches!(
-        complete(&f, &state).await.unwrap(),
+        complete_bound(&f, &state, &answer).await.unwrap(),
         BackendAction::AuthResponse(_)
     ));
 }
@@ -1435,7 +1522,7 @@ async fn a_queued_response_aborts_without_verifying_when_admission_is_full() {
     .expect("a fresh response must be admitted after its predecessors died");
     assert_eq!(st, 200, "{body}");
     assert!(matches!(
-        complete(&queued, &state).await.unwrap(),
+        complete_bound(&queued, &state, &body).await.unwrap(),
         BackendAction::AuthResponse(_)
     ));
 }
@@ -1482,14 +1569,14 @@ async fn a_wallet_retry_recovers_a_flow_whose_runner_died_mid_processing() {
     ));
     f.clock.store(T0 + 2, Ordering::SeqCst);
     // The wallet's retry re-claims the expired lease and re-drives the flow.
-    assert_eq!(post(&f, &id, &jwe).await.0, 200);
+    let answer = post(&f, &id, &jwe).await.1;
     assert_eq!(
         post(&f, &id, &jwe).await.0,
         409,
         "replay protection is intact after recovery"
     );
     assert!(matches!(
-        complete(&f, &state).await.unwrap(),
+        complete_bound(&f, &state, &answer).await.unwrap(),
         BackendAction::AuthResponse(_)
     ));
 }
@@ -1502,9 +1589,9 @@ async fn two_replicas_share_the_complete_flow_and_replay_guard() {
     let (state, id) = start(&a).await;
     let jar = fetch_jar(&b, &id).await;
     let jwe = wallet(&a, &jar);
-    assert_eq!(post(&b, &id, &jwe).await.0, 200);
+    let answer = post(&b, &id, &jwe).await.1;
     assert!(matches!(
-        complete(&b, &state).await.unwrap(),
+        complete_bound(&b, &state, &answer).await.unwrap(),
         BackendAction::AuthResponse(_)
     ));
     assert_eq!(post(&a, &id, &jwe).await.0, 409);
@@ -1514,7 +1601,7 @@ async fn two_replicas_share_the_complete_flow_and_replay_guard() {
 async fn concurrent_replica_responses_and_collections_each_have_one_winner() {
     let store = Arc::new(MemoryFlowStore::default());
     let a = fx().with_storage(store.clone());
-    let b = fx().with_storage(store);
+    let b = fx().with_storage(store.clone());
     let (state, id) = start(&a).await;
     let jar = fetch_jar(&b, &id).await;
     let jwe = wallet(&a, &jar);
@@ -1523,7 +1610,14 @@ async fn concurrent_replica_responses_and_collections_each_have_one_winner() {
     statuses.sort_unstable();
     assert_eq!(statuses, [200, 409]);
 
-    let (first, second) = tokio::join!(complete(&a, &state), complete(&b, &state));
+    // Both replicas present the §14.2 response_code the winning answer
+    // minted (read from the shared store as the wallet relay would carry
+    // it): exactly one collects.
+    let code = store.get(&id, T0).await.unwrap().unwrap().response_code;
+    let (first, second) = tokio::join!(
+        complete_with(&a, &state, Some(&code)),
+        complete_with(&b, &state, Some(&code))
+    );
     let delivered = [first, second]
         .into_iter()
         .filter(|result| matches!(result, Ok(BackendAction::AuthResponse(_))))
@@ -2069,16 +2163,16 @@ async fn without_freshness_data_the_receipt_is_capped_at_the_default_lifetime() 
     f.pdp.go_trust_today.store(true, Ordering::SeqCst);
     let (s, id) = start(&f).await;
     let jar = fetch_jar(&f, &id).await;
-    assert_eq!(post(&f, &id, &wallet(&f, &jar)).await.0, 200);
-    complete(&f, &s).await.unwrap();
+    let answer = post(&f, &id, &wallet(&f, &jar)).await.1;
+    complete_bound(&f, &s, &answer).await.unwrap();
     assert_eq!(f.pdp.calls.load(Ordering::SeqCst), 1);
     // PDP down: the receipt (5 minutes, not the tenant's 60) still covers a login inside its life...
     f.pdp.down.store(true, Ordering::SeqCst);
     f.clock.store(T0 + 100, Ordering::SeqCst);
     let (s, id) = start(&f).await;
     let jar = fetch_jar(&f, &id).await;
-    assert_eq!(post(&f, &id, &wallet(&f, &jar)).await.0, 200);
-    complete(&f, &s).await.unwrap();
+    let answer = post(&f, &id, &wallet(&f, &jar)).await.1;
+    complete_bound(&f, &s, &answer).await.unwrap();
     // ...and no longer once it has lapsed, although the tenant ceiling is an hour.
     f.clock.store(T0 + 301, Ordering::SeqCst);
     let (_s, id) = start(&f).await;
@@ -2097,9 +2191,9 @@ async fn a_permit_over_timestampless_trust_data_still_completes_the_flow() {
     f.pdp.go_trust_always_trusted.store(true, Ordering::SeqCst);
     let (s, id) = start(&f).await;
     let jar = fetch_jar(&f, &id).await;
-    assert_eq!(post(&f, &id, &wallet(&f, &jar)).await.0, 200);
+    let answer = post(&f, &id, &wallet(&f, &jar)).await.1;
     assert!(matches!(
-        complete(&f, &s).await.unwrap(),
+        complete_bound(&f, &s, &answer).await.unwrap(),
         BackendAction::AuthResponse(_)
     ));
     // The receipt (tenant ceiling 3600, not the 300 default) covers a second
@@ -2108,9 +2202,9 @@ async fn a_permit_over_timestampless_trust_data_still_completes_the_flow() {
     f.clock.store(T0 + 400, Ordering::SeqCst);
     let (s, id) = start(&f).await;
     let jar = fetch_jar(&f, &id).await;
-    assert_eq!(post(&f, &id, &wallet(&f, &jar)).await.0, 200);
+    let answer = post(&f, &id, &wallet(&f, &jar)).await.1;
     assert!(matches!(
-        complete(&f, &s).await.unwrap(),
+        complete_bound(&f, &s, &answer).await.unwrap(),
         BackendAction::AuthResponse(_)
     ));
     assert_eq!(
@@ -2654,7 +2748,7 @@ async fn telemetry_records_the_trust_wait() {
     let (st, body) = post(&f, &id, &wallet(&f, &jar)).await;
     assert_eq!(st, 200, "{body}");
     assert!(matches!(
-        complete(&f, &state).await.unwrap(),
+        complete_bound(&f, &state, &body).await.unwrap(),
         BackendAction::AuthResponse(_)
     ));
     let event = completion_event(&id);

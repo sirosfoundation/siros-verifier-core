@@ -46,6 +46,14 @@ use tunnelbana_core::{Error, Response, Result};
 pub const NS: &str = "VP_BACKEND";
 pub const FLOW_KEY: &str = "flow_id";
 
+/// Default `acr` when the deployment names no `auth_class_ref` (issue #84):
+/// how the result was obtained, so the relying party can refuse the kind it
+/// does not want. The §14.2 Response Code binds the direct-post completion to
+/// the wallet's answer (the browser it returned), and the DC API session
+/// binds its channel by construction.
+pub const ACR_LINK_BOUND: &str = "urn:siros:openid4vp:link-bound";
+pub const ACR_DC_API: &str = "urn:siros:openid4vp:dc-api";
+
 #[cfg(feature = "http")]
 const STATUS_LIST_MAX_BYTES: usize = 64 * 1024;
 #[cfg(feature = "http")]
@@ -1809,12 +1817,41 @@ impl VpBackend {
         outcome: TerminalOutcome,
         response: Response,
     ) -> Result<(Response, FinalizeOutcome)> {
+        // The Response Code (issue #84, OpenID4VP §14.2) is minted with the
+        // done result and persists with it: only the requester the wallet
+        // hands it to — the starting browser, through the answer's
+        // `redirect_uri` — can complete. Failures mint nothing (their page
+        // carries no credential material).
+        let response_code = match &outcome {
+            TerminalOutcome::Done(_) => Some(new_response_code()),
+            TerminalOutcome::Failed { .. } => None,
+        };
         match self
             .store
-            .finish(id, (self.clock)(), claim_id, outcome)
+            .finish(
+                id,
+                (self.clock)(),
+                claim_id,
+                outcome,
+                response_code.as_deref(),
+            )
             .await
         {
-            Ok(FinishResult::Finished) => Ok((response, FinalizeOutcome::Persisted)),
+            Ok(FinishResult::Finished) => {
+                // The wallet answer becomes the §14.2 redirect: the wallet
+                // opens `redirect_uri` in the starting browser (the DC API
+                // SDK hands it to the page that drove the exchange), and
+                // the browser presents the code at `/complete`. The empty
+                // object answer never bound anything — it is what let a
+                // flow's cookie alone collect whoever presented.
+                let response = match response_code {
+                    Some(code) => Response::json(&serde_json::json!({
+                        "redirect_uri": format!("{}/complete?response_code={code}", self.module_base),
+                    }))?,
+                    None => response,
+                };
+                Ok((response, FinalizeOutcome::Persisted))
+            }
             Ok(FinishResult::Conflict) => Ok((
                 Response::text(409, "flow completion conflict"),
                 FinalizeOutcome::Conflict,
@@ -2138,6 +2175,9 @@ impl VpBackend {
             }
         };
         drop(_unseal_timer);
+        // The invocation kind for the result's default `acr` (issue #84) —
+        // captured here, before the session moves into the blocking task.
+        let dc_api = session.dc_api_origin.is_some();
         // RFC 6749 section 3.1 prohibits repeated request/response parameters.
         // The HTTP adapter preserves form pairs so this boundary must not
         // silently accept a last-write-wins interpretation.
@@ -2263,14 +2303,19 @@ impl VpBackend {
                 return Decision::failed(e.code(), Response::text(400, "issuer not bound"));
             }
         };
-        let mut data = InternalData {
-            auth_info: AuthenticationInformation {
-                auth_class_ref: self.cfg.auth_class_ref.clone(),
-                issuer: Some(issuer_id),
+        let mut data =
+            InternalData {
+                auth_info: AuthenticationInformation {
+                    // The configured class wins; otherwise the invocation kind
+                    // (issue #84) tells the RP how the result was obtained.
+                    auth_class_ref: self.cfg.auth_class_ref.clone().or_else(|| {
+                        Some(if dc_api { ACR_DC_API } else { ACR_LINK_BOUND }.to_owned())
+                    }),
+                    issuer: Some(issuer_id),
+                    ..Default::default()
+                },
                 ..Default::default()
-            },
-            ..Default::default()
-        };
+            };
         data.requester = requester.clone();
         for p in &verified {
             // The query refuses an unbound issuer here (issue #81's
@@ -2491,12 +2536,13 @@ impl VpBackend {
         let Some(first) = verified.first() else {
             return Decision::failed("no_presentation", Response::text(400, "no presentation"));
         };
-        let mut data = match self.map_zkp(z, profile, first) {
-            Ok(d) => d,
-            Err(code) => {
-                return Decision::failed(&code, Response::text(422, "cannot map attributes"));
-            }
-        };
+        let mut data =
+            match self.map_zkp(z, profile, first, matches!(channel, Channel::DcApi { .. })) {
+                Ok(d) => d,
+                Err(code) => {
+                    return Decision::failed(&code, Response::text(422, "cannot map attributes"));
+                }
+            };
         data.requester = requester;
         let sealed_result = match self
             .sealer
@@ -2515,21 +2561,27 @@ impl VpBackend {
         z: &ZkpMode,
         profile: &ZkpProfile,
         presentation: &VerifiedPresentation,
+        dc_api: bool,
     ) -> std::result::Result<InternalData, String> {
         use base64::Engine;
         let encode = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
-        let mut data = InternalData {
-            auth_info: AuthenticationInformation {
-                auth_class_ref: z.cfg.auth_class_ref.clone(),
-                issuer: Some(format!(
-                    "zkp:{}:{}",
-                    presentation.system_id, presentation.issuer_key_thumbprint
-                )),
+        let mut data =
+            InternalData {
+                auth_info: AuthenticationInformation {
+                    // The configured class wins; otherwise the invocation kind
+                    // (issue #84) — the ZKP path mirrors the core path's.
+                    auth_class_ref: z.cfg.auth_class_ref.clone().or_else(|| {
+                        Some(if dc_api { ACR_DC_API } else { ACR_LINK_BOUND }.to_owned())
+                    }),
+                    issuer: Some(format!(
+                        "zkp:{}:{}",
+                        presentation.system_id, presentation.issuer_key_thumbprint
+                    )),
+                    ..Default::default()
+                },
+                subject_type: SubjectType::Pairwise,
                 ..Default::default()
-            },
-            subject_type: SubjectType::Pairwise,
-            ..Default::default()
-        };
+            };
         for (name, handle) in &profile.cfg.attribute_map {
             if let Some(pseudonym) = presentation.pseudonyms.get(handle) {
                 data.attributes
@@ -2610,8 +2662,19 @@ impl VpBackend {
             .get_str(NS, FLOW_KEY)
             .ok_or_else(|| Error::Authn("no_flow".into()))?;
         let now = (self.clock)();
-        match self.store.collect(&id, now).await {
+        // The §14.2 Response Code the wallet's answer carried: the completion
+        // is bound to the requester that presented it (issue #84).
+        let presented = ctx.request.query.get("response_code").map(String::as_str);
+        match self.store.collect(&id, now, presented).await {
             Ok(CollectResult::Unknown) => Err(Error::Authn("unknown_flow".into())),
+            Ok(CollectResult::CodeMismatch) => {
+                // A done flow the requester cannot bind: no code (the page
+                // polling here before the wallet returns) or a wrong one (a
+                // probe). The same page either way — no oracle — and the
+                // flow stays untouched: the wallet's `redirect_uri` still
+                // completes it.
+                Ok(BackendAction::Respond(wallet_return_page()))
+            }
             Ok(CollectResult::Pending) => {
                 Ok(BackendAction::Respond(waiting_page(&self.module_base)))
             }
@@ -2682,6 +2745,20 @@ fn waiting_page(module_base: &str) -> Response {
         html_escape(module_base)
     );
     Response::html(ui::page("Waiting for your wallet", &body))
+}
+
+/// The §14.2 refusal page (issue #84): a done flow whose completion request
+/// carried no Response Code — the browser polling `/complete` while the
+/// wallet has not returned yet, or a fixation probe with the cookie alone.
+/// The same page either way, and the flow is untouched: the wallet's
+/// `redirect_uri` (the answer's) still completes it with the code.
+fn wallet_return_page() -> Response {
+    let body = r#"<h1>Return to the verifier from your wallet</h1>
+<p>The presentation was received. Your wallet returns you here with the
+response code that shows the sign-in.</p>
+<p>Open the wallet you presented with and finish there.</p>
+<p><a href="/">Start a new request</a></p>"#;
+    Response::html(ui::page("Return to the verifier from your wallet", body))
 }
 
 /// The terminal failure page: the stable refusal code for support and logs,
@@ -2755,6 +2832,17 @@ fn random_master() -> [u8; 32] {
 
 fn new_flow_id() -> String {
     let mut b = [0u8; 16];
+    getrandom::fill(&mut b).expect("OS randomness");
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
+}
+
+/// A fresh OpenID4VP §14.2 Response Code (issue #84): 256 bits of OS
+/// randomness, URL-safe so it rides the `redirect_uri` query unescaped.
+/// Minted once per presentation result and consumed once by the completing
+/// browser — guessing is 2^-256 and a wrong guess refuses without consuming.
+fn new_response_code() -> String {
+    let mut b = [0u8; 32];
     getrandom::fill(&mut b).expect("OS randomness");
     use base64::Engine;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
@@ -2854,6 +2942,7 @@ impl Backend for VpBackend {
             subject_pointer,
             outcome: Outcome::Pending,
             failure_description: String::new(),
+            response_code: String::new(),
         };
         if self.store.insert(flow, now).await.is_err() {
             return Ok(Response::text(503, "flow store unavailable"));

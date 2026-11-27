@@ -65,6 +65,7 @@ fn pending_flow(id: &str, now: i64) -> Flow {
         subject_pointer: "/sub".into(),
         outcome: Outcome::Pending,
         failure_description: String::new(),
+        response_code: String::new(),
     }
 }
 
@@ -392,18 +393,25 @@ async fn real_mongo_atomic_contract_and_ttl_index() {
                 "flow-1",
                 now + 301,
                 winning_claim,
-                TerminalOutcome::Done("v1.sealed-result".into())
+                TerminalOutcome::Done("v1.sealed-result".into()),
+                Some("code-1")
             )
             .await
             .unwrap(),
         FinishResult::Finished
     );
     assert_eq!(
-        store.collect("flow-1", now + 302).await.unwrap(),
+        store
+            .collect("flow-1", now + 302, Some("code-1"))
+            .await
+            .unwrap(),
         CollectResult::Done("v1.sealed-result".into())
     );
     assert_eq!(
-        store.collect("flow-1", now + 302).await.unwrap(),
+        store
+            .collect("flow-1", now + 302, Some("code-1"))
+            .await
+            .unwrap(),
         CollectResult::Unknown
     );
 
@@ -419,7 +427,10 @@ async fn real_mongo_atomic_contract_and_ttl_index() {
         ClaimResult::Claimed(_)
     ));
     assert_eq!(
-        store.collect("flow-2", now + 301).await.unwrap(),
+        store
+            .collect("flow-2", now + 301, Some("code-2"))
+            .await
+            .unwrap(),
         CollectResult::Pending,
         "a valid claim winning before collection is not an unknown flow"
     );
@@ -429,14 +440,18 @@ async fn real_mongo_atomic_contract_and_ttl_index() {
                 "flow-2",
                 now + 301,
                 "claim-before-expiry",
-                TerminalOutcome::Done("v1.second-result".into())
+                TerminalOutcome::Done("v1.second-result".into()),
+                Some("code-2")
             )
             .await
             .unwrap(),
         FinishResult::Finished
     );
     assert_eq!(
-        store.collect("flow-2", now + 301).await.unwrap(),
+        store
+            .collect("flow-2", now + 301, Some("code-2"))
+            .await
+            .unwrap(),
         CollectResult::Done("v1.second-result".into())
     );
 
@@ -445,7 +460,7 @@ async fn real_mongo_atomic_contract_and_ttl_index() {
         .await
         .unwrap();
     assert_eq!(
-        store.collect("flow-3", now + 300).await.unwrap(),
+        store.collect("flow-3", now + 300, None).await.unwrap(),
         CollectResult::Expired
     );
     assert_eq!(
@@ -518,7 +533,8 @@ async fn real_mongo_lease_recovery_mirrors_the_memory_contract() {
                 "flow-1",
                 now + 11,
                 "dead-claim",
-                TerminalOutcome::Done("late-result".into())
+                TerminalOutcome::Done("late-result".into()),
+                Some("code-dead")
             )
             .await
             .unwrap(),
@@ -531,18 +547,25 @@ async fn real_mongo_lease_recovery_mirrors_the_memory_contract() {
                 "flow-1",
                 now + 11,
                 "retry-claim",
-                TerminalOutcome::Done("v1.sealed-result".into())
+                TerminalOutcome::Done("v1.sealed-result".into()),
+                Some("code-1")
             )
             .await
             .unwrap(),
         FinishResult::Finished
     );
     assert_eq!(
-        store.collect("flow-1", now + 12).await.unwrap(),
+        store
+            .collect("flow-1", now + 12, Some("code-1"))
+            .await
+            .unwrap(),
         CollectResult::Done("v1.sealed-result".into())
     );
     assert_eq!(
-        store.collect("flow-1", now + 12).await.unwrap(),
+        store
+            .collect("flow-1", now + 12, Some("code-1"))
+            .await
+            .unwrap(),
         CollectResult::Unknown,
         "recovered processing still delivers exactly once"
     );
@@ -592,7 +615,8 @@ async fn real_mongo_lease_recovery_mirrors_the_memory_contract() {
                 "flow-late",
                 now + 300,
                 "claim-a",
-                TerminalOutcome::Done("late-result".into())
+                TerminalOutcome::Done("late-result".into()),
+                Some("code-late")
             )
             .await
             .unwrap(),
@@ -600,11 +624,17 @@ async fn real_mongo_lease_recovery_mirrors_the_memory_contract() {
         "the original holder may still complete an in-flight response"
     );
     assert_eq!(
-        store.collect("flow-late", now + 301).await.unwrap(),
+        store
+            .collect("flow-late", now + 301, Some("code-late"))
+            .await
+            .unwrap(),
         CollectResult::Done("late-result".into())
     );
     assert_eq!(
-        store.collect("flow-late", now + 301).await.unwrap(),
+        store
+            .collect("flow-late", now + 301, Some("code-late"))
+            .await
+            .unwrap(),
         CollectResult::Unknown
     );
 
@@ -720,7 +750,8 @@ async fn the_persisted_flow_document_carries_secrets_only_under_sealed_keys() {
                 "stored-shape",
                 now + 1,
                 "shape-claim",
-                TerminalOutcome::Done("v1.sealed-Lovelace-result".into())
+                TerminalOutcome::Done("v1.sealed-Lovelace-result".into()),
+                Some("shape-code")
             )
             .await
             .unwrap(),
@@ -735,7 +766,16 @@ async fn the_persisted_flow_document_carries_secrets_only_under_sealed_keys() {
         .expect("the completed flow is persisted");
     let mut keys_after: Vec<&str> = stored_after.keys().map(String::as_str).collect();
     keys_after.sort_unstable();
-    assert_eq!(keys_after, keys, "the terminal result adds no new field");
+    // The terminal result adds exactly the §14.2 Response Code (issue #84):
+    // the one field the collecting browser must still present.
+    let mut keys_and_code = keys.clone();
+    keys_and_code.push("response_code");
+    keys_and_code.sort_unstable();
+    assert_eq!(
+        keys_after, keys_and_code,
+        "the terminal result adds only the response_code"
+    );
+    assert_eq!(stored_after.get_str("response_code").unwrap(), "shape-code");
     let outcome = stored_after.get_document("outcome").unwrap();
     let mut outcome_keys: Vec<&str> = outcome.keys().map(String::as_str).collect();
     outcome_keys.sort_unstable();
