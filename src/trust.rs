@@ -6,6 +6,7 @@
 //! role goes in `action.name` with credential types in `action.parameters`.
 
 use crate::sdjwt::IssuerEvidence;
+use crate::Result;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use jose_rs::jwk::Jwk;
@@ -48,13 +49,61 @@ pub struct TrustQuery {
 }
 
 impl TrustQuery {
-    pub fn for_issuer(ev: &IssuerEvidence, role: &str, vct: &str) -> Self {
-        Self {
-            subject_id: ev.iss.clone(),
+    /// Query for an SD-JWT VC issuer (issue #81, the security report's
+    /// first finding): the subject identity is BOUND to the presented
+    /// evidence, never raw `iss` — whoever holds the key of any certificate
+    /// chaining to an accepted anchor can no longer name any `iss` they like
+    /// in what reaches go-trust or the relying party.
+    ///
+    /// With an `x5c` chain the identity is DERIVED from the validated leaf:
+    /// the https origins its SubjectAltName names — `https` URI SANs exactly
+    /// as written (an `http://` URI is not an https origin and never becomes
+    /// one), then non-wildcard DNS SANs as `https://<host>` (the TLS
+    /// semantics: a hostname certifies its https origin) — or, when the leaf
+    /// carries no usable SAN, the leaf's own `x509_hash:<sha256>` (the same
+    /// scheme the mdoc path uses). go-trust's name-vs-leaf policy then
+    /// applies to the TRUE signer ("the matched trust entry" — the report's
+    /// Fix wording), including whether a `iss` that names another entity is
+    /// accepted for that entry, and the entry's own leaf-purpose policy
+    /// (go-trust #270, the coordinated registry half). The verifier does not
+    /// duplicate the registry's entry policy: the OIDF conformance suite's
+    /// own issuance fixture (a self-signed `CN=conformance.example.com`
+    /// leaf with `iss` at the suite's URL) is not a binding the verifier
+    /// rejects — the allow-all registry the suite pins permits the true
+    /// signer, and a real registry refuses it.
+    ///
+    /// Without `x5c` (the kid/JWKS profile) the `iss` stands: the discovery
+    /// is https-only and the metadata must name the same issuer, so the
+    /// `iss` there is the profile's own binding. The trust decision runs
+    /// through go-trust either way.
+    pub fn for_issuer(ev: &IssuerEvidence, role: &str, vct: &str) -> Result<Self> {
+        let leaf = ev.x5c_der.first();
+        let subject_id = match leaf {
+            None => ev.iss.clone(),
+            Some(leaf) => issuer_leaf_identity(leaf)?,
+        };
+        Ok(Self {
+            subject_id,
             x5c: ev.x5c_der.iter().map(|d| B64.encode(d)).collect(),
             jwk: minimal_public_jwk(&ev.jwk),
             role: role.to_owned(),
             credential_types: vec![vct.to_owned()],
+            as_of: None,
+        })
+    }
+
+    /// Query for a Token Status List signer: a status token's `iss` names
+    /// the LIST (the TSL shape), not the signer, so the presentation
+    /// binding above does not apply and the signer's certificate policy is
+    /// go-trust's own role policy (go-trust #270), not this binding. The
+    /// `iss` — the list's subject — is the query's subject.
+    pub fn for_status_list_signer(ev: &IssuerEvidence) -> Self {
+        Self {
+            subject_id: ev.iss.clone(),
+            x5c: ev.x5c_der.iter().map(|d| B64.encode(d)).collect(),
+            jwk: minimal_public_jwk(&ev.jwk),
+            role: "status-list-signer".to_owned(),
+            credential_types: vec!["status-list".to_owned()],
             as_of: None,
         }
     }
@@ -103,6 +152,74 @@ impl TrustQuery {
         }
         query
     }
+}
+
+/// The leaf's SAN extension decoded to its https origins: `None` when the
+/// certificate carries no SAN extension at all (the self-contained issuer
+/// shape — the pinned OIDF conformance issuer among them), `Some` —
+/// possibly empty — when it does. The origins follow the profile's
+/// precedence: `https` URI SANs exactly as written first, then non-wildcard
+/// DNS SANs as `https://<host>` (the TLS semantics: a hostname certifies its
+/// https origin). An `http://` URI SAN is not an https origin and never
+/// becomes one — a scheme rewrite would let a plain-HTTP name satisfy an
+/// https `iss` — and a wildcard certifies no single origin.
+pub(crate) fn issuer_leaf_san_origins(leaf_der: &[u8]) -> Result<Option<Vec<String>>> {
+    use x509_cert::der::oid::ObjectIdentifier;
+    use x509_cert::ext::pkix::name::GeneralName;
+    use x509_cert::ext::pkix::SubjectAltName;
+
+    let cert = x509_cert::Certificate::from_der(leaf_der)
+        .map_err(|e| crate::error::malformed(format!("the issuer leaf does not parse: {e}")))?;
+    let san_oid = ObjectIdentifier::new_unwrap("2.5.29.17");
+    let mut has_san = false;
+    let mut uris = Vec::new();
+    let mut dns = Vec::new();
+    for extension in cert.tbs_certificate.extensions.iter().flatten() {
+        if extension.extn_id != san_oid {
+            continue;
+        }
+        has_san = true;
+        let san = SubjectAltName::from_der(extension.extn_value.as_bytes()).map_err(|e| {
+            crate::error::malformed(format!("the issuer leaf's SAN does not parse: {e}"))
+        })?;
+        for name in san.0 {
+            match name {
+                GeneralName::UniformResourceIdentifier(uri) => {
+                    let value = uri.to_string();
+                    if value.starts_with("https://") {
+                        uris.push(value);
+                    }
+                }
+                GeneralName::DnsName(host) => {
+                    let host = host.to_string();
+                    if !host.starts_with("*.") {
+                        dns.push(format!("https://{host}"));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if !has_san {
+        return Ok(None);
+    }
+    uris.extend(dns);
+    Ok(Some(uris))
+}
+
+/// The SD-JWT issuer's bound identity from the leaf certificate: the first
+/// https origin its SubjectAltName names, or — when the leaf carries no
+/// usable SAN — the leaf's own hash (the `x509_hash` scheme, the same
+/// fallback the mdoc path uses). Never raw `iss`, and never a name the
+/// certificate does not certify.
+pub(crate) fn issuer_leaf_identity(leaf_der: &[u8]) -> Result<String> {
+    let origins = issuer_leaf_san_origins(leaf_der)?.unwrap_or_default();
+    if let Some(first) = origins.first() {
+        return Ok(first.clone());
+    }
+    use sha2::Digest;
+    let hash = sha2::Sha256::digest(leaf_der);
+    Ok(format!("x509_hash:{}", crate::b64u(&hash)))
 }
 
 fn mdoc_issuer_id(chain: &crate::mdoc::MdocIssuer) -> Option<String> {

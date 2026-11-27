@@ -191,6 +191,7 @@ fn happy_path_end_to_end() {
     // what the trust layer would send to go-trust
     let q = v
         .trust_query("https://example.org/roles/pid-issuer", "mdoc-issuer")
+        .expect("the issuer binds")
         .to_authzen();
     assert_eq!(
         q["subject"],
@@ -963,6 +964,7 @@ fn mdoc_redirect_and_dc_api_verify_with_their_own_handovers() {
         );
         let trust = credential
             .trust_query("pid-provider", "mdoc-issuer")
+            .expect("the issuer binds")
             .to_authzen();
         assert_eq!(trust["action"]["name"], "mdoc-issuer");
         assert_eq!(trust["resource"]["type"], "x5c");
@@ -1496,5 +1498,216 @@ mod response_shape {
             open_response(&session, &jwe, NOW + 5).is_err(),
             "the empty list must refuse"
         );
+    }
+}
+
+// ---- the issuer binding (issue #81, the security report's first finding) ------------
+
+mod issuer_binding {
+    use super::*;
+
+    /// A session + a presentation SD-JWT signed by `signer_key` with the
+    /// given iss, x5c = signer's chain, valid KB against the session.
+    fn present_with_iss(
+        w: &World,
+        s: &Session,
+        signer_key: &Jwk,
+        signer_chain: &[Vec<u8>],
+        iss: &str,
+    ) -> String {
+        let mut spec = IssueSpec::new(json!({
+            "iss": iss,
+            "vct": "urn:eudi:pid:1",
+            "iat": NOW - 10, "exp": NOW + 100_000,
+            "given_name": "Ada", "family_name": "Lovelace",
+            "birthdate": "1815-12-10",
+        }));
+        spec.holder_pub = Some(public_of(&w.holder));
+        spec.x5c_der = signer_chain.to_vec();
+        spec.conceal = vec![vec![Seg::Key("given_name")], vec![Seg::Key("family_name")]];
+        spec.decoys = 1;
+        let issued = issue(signer_key, &spec).unwrap();
+        present(
+            &issued,
+            &[0, 1],
+            Some(KbSpec {
+                holder: &w.holder,
+                aud: &s.client_id,
+                nonce: &s.nonce,
+                iat: NOW,
+            }),
+            sdjwt::HashAlg::Sha256,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_forged_iss_cannot_rename_the_issuer() {
+        // The report's battery: issuer B's certificate signing a
+        // credential with iss = A. Before the binding, the verifier
+        // forwarded subject.id = iss verbatim and reported the raw iss —
+        // the RP believed A signed. Now BOTH the trust query's subject
+        // and the reported issuer identity are DERIVED from the leaf —
+        // B's own — so a forged iss cannot rename the signer: go-trust's
+        // name-vs-leaf policy (go-trust #270) applies to the TRUE signer,
+        // and the RP is told B.
+        let w = world();
+        let (_jar, s) = start(&w, w2_query());
+        let (b_cert, b_key) = self_signed_ec("issuer-b.example", "ES256");
+        let token = present_with_iss(&w, &s, &b_key, &[b_cert], "https://issuer.example");
+        let jwe = raw_response(
+            &s,
+            json!({"state": s.state.clone(), "vp_token": {"pid": [token]}}),
+            None,
+        );
+        let verified = process_response(&s, &jwe, NOW + 5, &X5cLeaf)
+            .expect("the presentation verifies cryptographically");
+        let query = verified[0]
+            .verified
+            .trust_query("pid-provider", "mdoc-issuer")
+            .expect("the query derives from the leaf");
+        assert_eq!(
+            query.subject_id, "https://issuer-b.example",
+            "the trust query names the TRUE signer (B), never the forged iss"
+        );
+        assert_eq!(
+            verified[0].verified.issuer_id().unwrap(),
+            "https://issuer-b.example",
+            "the reported issuer is B — a forged iss cannot rename the signer"
+        );
+    }
+
+    #[test]
+    fn the_genuine_issuers_certificate_binds() {
+        // The control: A's certificate with iss = A passes.
+        let w = world();
+        let (_jar, s) = start(&w, w2_query());
+        let token = real_presentation(&w, &s, &[0, 1]);
+        let jwe = raw_response(
+            &s,
+            json!({"state": s.state.clone(), "vp_token": {"pid": [token]}}),
+            None,
+        );
+        let verified = process_response(&s, &jwe, NOW + 5, &X5cLeaf)
+            .expect("the genuine presentation verifies");
+        assert_eq!(verified.len(), 1);
+        // The REPORTED issuer is the BOUND identity (the leaf's SAN), never raw iss.
+        let id = verified[0].verified.issuer_id().unwrap();
+        assert_eq!(id, "https://issuer.example");
+    }
+
+    #[test]
+    fn a_tls_server_certificate_is_reported_as_itself() {
+        // The report's TLS case: a serverAuth-only leaf signing a
+        // credential. The leaf-purpose policy is go-trust's per-role ask
+        // (go-trust #270) — the verifier does not duplicate the registry's
+        // entry policy (the OIDF suite's own issuance fixture would not
+        // survive it). What the verifier guarantees: the identity is the
+        // LEAF's, so the registry's policy applies to the true signer.
+        let w = world();
+        let (_jar, s) = start(&w, w2_query());
+        let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params =
+            rcgen::CertificateParams::new(vec!["tls-server.example".to_string()]).unwrap();
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        let cert = params.self_signed(&kp).unwrap();
+        let mut tls_key = jose_rs::jwk::jwk_from_pkcs8_der(kp.serialized_der()).unwrap();
+        tls_key.alg = Some("ES256".into());
+        let mut spec = IssueSpec::new(json!({
+            "iss": "https://issuer.example",
+            "vct": "urn:eudi:pid:1",
+            "iat": NOW - 10, "exp": NOW + 100_000,
+            "given_name": "Ada", "family_name": "Lovelace",
+        }));
+        spec.holder_pub = Some(public_of(&w.holder));
+        spec.x5c_der = vec![cert.der().to_vec()];
+        spec.conceal = vec![vec![Seg::Key("given_name")], vec![Seg::Key("family_name")]];
+        let issued = issue(&tls_key, &spec).unwrap();
+        let token = present(
+            &issued,
+            &[0, 1],
+            Some(KbSpec {
+                holder: &w.holder,
+                aud: &s.client_id,
+                nonce: &s.nonce,
+                iat: NOW,
+            }),
+            sdjwt::HashAlg::Sha256,
+        )
+        .unwrap();
+        let jwe = raw_response(
+            &s,
+            json!({"state": s.state.clone(), "vp_token": {"pid": [token]}}),
+            None,
+        );
+        let verified = process_response(&s, &jwe, NOW + 5, &X5cLeaf)
+            .expect("the presentation verifies cryptographically");
+        let query = verified[0]
+            .verified
+            .trust_query("pid-provider", "mdoc-issuer")
+            .expect("the query derives from the leaf");
+        // A TLS leaf is not the issuer it names: the identity sent to
+        // go-trust is the leaf's own — a per-role registry policy
+        // (go-trust #270) can refuse it on exactly this ground.
+        assert_ne!(
+            query.subject_id, "https://issuer.example",
+            "the forged iss never reaches go-trust or the RP"
+        );
+        assert_eq!(
+            query.subject_id, "https://tls-server.example",
+            "the registry judges the TRUE signer (the TLS leaf itself)"
+        );
+        assert_eq!(
+            verified[0].verified.issuer_id().unwrap(),
+            "https://tls-server.example"
+        );
+    }
+
+    #[test]
+    fn a_leaf_without_sans_binds_by_hash_and_is_not_refused() {
+        // The OIDF conformance issuer's shape (the pinned suite's own
+        // fixture): an end-entity signing certificate with no
+        // SubjectAlternativeName at all. There is nothing for an `iss` to
+        // mismatch — the binding is the certificate's own hash, and
+        // go-trust's registry decides on the true signer either way.
+        let w = world();
+        let (_jar, s) = start(&w, w2_query());
+        let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let params = rcgen::CertificateParams::new(vec![]).unwrap();
+        let cert = params.self_signed(&kp).unwrap();
+        let mut key = jose_rs::jwk::jwk_from_pkcs8_der(kp.serialized_der()).unwrap();
+        key.alg = Some("ES256".into());
+        let token = present_with_iss(
+            &w,
+            &s,
+            &key,
+            &[cert.der().to_vec()],
+            "https://issuer.conformance.example.com:9443",
+        );
+        let jwe = raw_response(
+            &s,
+            json!({"state": s.state.clone(), "vp_token": {"pid": [token]}}),
+            None,
+        );
+        let verified = process_response(&s, &jwe, NOW + 5, &X5cLeaf)
+            .expect("a SAN-less issuer verifies (the binding is the hash)");
+        let query = verified[0]
+            .verified
+            .trust_query("pid-provider", "mdoc-issuer")
+            .expect("no SANs to mismatch: not refused");
+        let id = query.subject_id;
+        assert!(
+            id.starts_with("x509_hash:"),
+            "the identity is the leaf's own hash, not the raw iss: {id}"
+        );
+        assert_ne!(id, "https://issuer.conformance.example.com:9443");
+    }
+
+    fn w2_query() -> Value {
+        json!({
+            "credentials": [{"id": "pid", "format": "dc+sd-jwt",
+                "meta": {"vct_values": ["urn:eudi:pid:1"]},
+                "claims": [{"path": ["given_name"]}, {"path": ["family_name"]}]}],
+        })
     }
 }

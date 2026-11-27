@@ -26,7 +26,10 @@ fn genuine_suite_token_verifies_and_reads_revocation_bits() {
     let token = verify_token(TOKEN, LIST_URI, &X5cLeaf, NOW).unwrap();
     assert_eq!(status_at(&token, &reference(5)).unwrap(), 1);
     assert_eq!(status_at(&token, &reference(4)).unwrap(), 0);
-    let query = TrustQuery::for_issuer(&token.issuer, "status-list-signer", "status-list");
+    // The TSL shape (issue #81): the signer's query is its own
+    // constructor — the token's iss names the list, and go-trust's role
+    // policy judges the signer (go-trust #270).
+    let query = TrustQuery::for_status_list_signer(&token.issuer);
     assert_eq!(query.role, "status-list-signer");
     assert_eq!(query.subject_id, reference(0).uri);
 }
@@ -249,7 +252,7 @@ fn a_chain_smuggled_inside_the_jwk_never_reaches_the_trust_query() {
     };
     let verified = verify_token(&token, LIST_URI, &jwk_only, NOW).unwrap();
     // ...the resolver's provenance carries no chain...
-    let query = TrustQuery::for_issuer(&verified.issuer, "status-list-signer", "status-list");
+    let query = TrustQuery::for_status_list_signer(&verified.issuer);
     assert!(
         query.x5c.is_empty(),
         "no chain evidence for an embedded key"
