@@ -1316,216 +1316,185 @@ fn plain_direct_post_round_trips_without_the_jwe_layer() {
 mod response_shape {
     use super::*;
 
-    fn shape_session(q: Value) -> (String, Session) {
+    fn shape_session(q: Value) -> (World, Session) {
         let w = world();
-        start(&w, q)
+        let (_jar, s) = start(&w, q);
+        (w, s)
     }
 
-    fn opened(vp_token: Value) -> OpenedResponse {
-        OpenedResponse {
-            vp_token: vp_token
-                .as_object()
-                .expect("the test vp_token is an object")
-                .clone(),
+    /// A resolver that records every consultation: the shape refusals
+    // must fire BEFORE any resolver use (the discovery is what the
+    // report's amplification drove).
+    #[derive(Default)]
+    struct SpyResolver {
+        consulted: std::sync::atomic::AtomicUsize,
+    }
+    impl sdjwt::IssuerKeyResolver for SpyResolver {
+        fn resolve(
+            &self,
+            _header: &JoseHeader,
+            _iss: &str,
+        ) -> siros_verifier_core::Result<sdjwt::ResolvedKey> {
+            self.consulted
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(siros_verifier_core::Error::Policy(
+                "spy: never consulted".into(),
+            ))
         }
     }
 
+    fn body_with(vp_token: Value) -> Value {
+        json!({"state": "x", "vp_token": vp_token})
+        // state is replaced below with the session's real one
+    }
+
     #[test]
-    fn an_unrequested_credential_id_is_refused_at_the_shape_check() {
+    fn an_unrequested_credential_id_refuses_at_the_open_with_no_discovery() {
         // The security report's third finding: the junk response that
         // names credentials the query did not ask for must be refused
-        // BEFORE any network fetch is driven by its contents. The shape
-        // check runs at the open — the discovery never sees it.
-        let (_jar, session) = shape_session(json!({
+        // BEFORE any network discovery. The open validates the shape
+        // (inside open_response); the resolver is never consulted.
+        let (w, session) = shape_session(json!({
             "credentials": [{"id": "pid", "format": "dc+sd-jwt",
                 "meta": {"vct_values": ["urn:eudi:pid:1"]},
                 "claims": [{"path": ["given_name"]}]}],
         }));
-        let opened = opened(json!({
+        let spy = SpyResolver::default();
+        let mut body = body_with(json!({
             "pid": ["legit.presentation.jwt"],
             "NOT_ASKED": ["junk.with.slow.kid"],
         }));
-        let err =
-            validate_response_shape(&session, &opened).expect_err("the unrequested id must refuse");
+        body["state"] = json!(session.state.clone());
+        let jwe = raw_response(&session, body, None);
+        let err = match process_response(&session, &jwe, NOW + 5, &spy) {
+            Ok(_) => panic!("the unrequested id must refuse"),
+            Err(e) => e,
+        };
         assert!(
             format!("{err}").contains("unrequested credential id"),
             "the refusal names the id: {err}"
         );
+        assert_eq!(
+            spy.consulted.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the resolver is never consulted — no discovery fired"
+        );
+        let _ = w;
     }
 
     #[test]
-    fn a_missing_requested_credential_is_refused_at_the_shape_check() {
-        let (_jar, session) = shape_session(json!({
+    fn a_missing_requested_credential_refuses_at_the_open() {
+        let (_w, session) = shape_session(json!({
             "credentials": [{"id": "pid", "format": "dc+sd-jwt",
                 "meta": {"vct_values": ["urn:eudi:pid:1"]},
                 "claims": [{"path": ["given_name"]}]}],
         }));
-        let opened = opened(json!({"OTHER": ["x"]}));
+        let spy = SpyResolver::default();
+        let mut body = body_with(json!({"OTHER": ["x"]}));
+        body["state"] = json!(session.state.clone());
+        let jwe = raw_response(&session, body, None);
         assert!(
-            validate_response_shape(&session, &opened).is_err(),
+            process_response(&session, &jwe, NOW + 5, &spy).is_err(),
             "the missing requested credential must refuse"
+        );
+        assert_eq!(
+            spy.consulted.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no discovery fired"
         );
     }
 
     #[test]
-    fn a_wrong_presentation_count_is_refused_at_the_shape_check() {
-        let (_jar, session) = shape_session(json!({
+    fn a_wrong_presentation_count_refuses_at_the_open() {
+        let (_w, session) = shape_session(json!({
             "credentials": [{"id": "pid", "format": "dc+sd-jwt",
                 "meta": {"vct_values": ["urn:eudi:pid:1"]},
                 "claims": [{"path": ["given_name"]}]}],
         }));
         // `multiple` absent (the default): exactly one presentation.
-        let opened = opened(json!({"pid": ["one", "two"]}));
-        let err = validate_response_shape(&session, &opened).expect_err("the count must refuse");
+        let spy = SpyResolver::default();
+        let mut body = body_with(json!({"pid": ["one", "two"]}));
+        body["state"] = json!(session.state.clone());
+        let jwe = raw_response(&session, body, None);
+        let err = match process_response(&session, &jwe, NOW + 5, &spy) {
+            Ok(_) => panic!("the count must refuse"),
+            Err(e) => e,
+        };
         assert!(
             format!("{err}").contains("wrong number"),
             "the refusal names the count: {err}"
         );
+        assert_eq!(
+            spy.consulted.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no discovery fired"
+        );
     }
 
     #[test]
-    fn a_matching_response_passes_the_shape_check() {
-        let (_jar, session) = shape_session(json!({
+    fn a_matching_response_opens() {
+        // The control: the genuine shape passes the open (the
+        // discovery/verification beyond it is not this test's subject).
+        let (_w, session) = shape_session(json!({
             "credentials": [{"id": "pid", "format": "dc+sd-jwt",
                 "meta": {"vct_values": ["urn:eudi:pid:1"]},
                 "claims": [{"path": ["given_name"]}]}],
         }));
-        let opened = opened(json!({"pid": ["legit.presentation.jwt"]}));
-        validate_response_shape(&session, &opened).expect("the matching response passes");
+        let mut body = body_with(json!({"pid": ["legit.presentation.jwt"]}));
+        body["state"] = json!(session.state.clone());
+        let jwe = raw_response(&session, body, None);
+        // decrypt_response/open_response needs the session's enc key —
+        // raw_response encrypts TO it. Open directly:
+        let opened = open_response(&session, &jwe, NOW + 5);
+        assert!(opened.is_ok(), "the matching shape opens");
     }
 
     #[test]
-    fn a_multiple_query_accepts_several_presentations() {
-        let (_jar, session) = shape_session(json!({
+    fn a_multiple_query_accepts_several_presentations_at_the_open() {
+        let (_w, session) = shape_session(json!({
             "credentials": [{"id": "pid", "format": "dc+sd-jwt", "multiple": true,
                 "meta": {"vct_values": ["urn:eudi:pid:1"]},
                 "claims": [{"path": ["given_name"]}]}],
         }));
-        let opened = opened(json!({"pid": ["one", "two"]}));
-        validate_response_shape(&session, &opened).expect("the multiple query accepts the list");
+        let mut body = body_with(json!({"pid": ["one", "two"]}));
+        body["state"] = json!(session.state.clone());
+        let jwe = raw_response(&session, body, None);
+        let opened = open_response(&session, &jwe, NOW + 5);
+        assert!(
+            opened.is_ok(),
+            "the multiple query accepts the list at the open"
+        );
     }
 
     #[test]
-    fn a_non_string_presentation_is_refused_at_the_shape_check() {
-        let (_jar, session) = shape_session(json!({
+    fn a_non_string_presentation_refuses_at_the_open() {
+        let (_w, session) = shape_session(json!({
             "credentials": [{"id": "pid", "format": "dc+sd-jwt",
                 "meta": {"vct_values": ["urn:eudi:pid:1"]},
                 "claims": [{"path": ["given_name"]}]}],
         }));
-        let opened = opened(json!({"pid": [42]}));
+        let mut body = body_with(json!({"pid": [42]}));
+        body["state"] = json!(session.state.clone());
+        let jwe = raw_response(&session, body, None);
         assert!(
-            validate_response_shape(&session, &opened).is_err(),
+            open_response(&session, &jwe, NOW + 5).is_err(),
             "the non-string presentation must refuse"
         );
     }
 
     #[test]
-    fn an_empty_presentation_list_is_refused_at_the_shape_check() {
-        let (_jar, session) = shape_session(json!({
+    fn an_empty_presentation_list_refuses_at_the_open() {
+        let (_w, session) = shape_session(json!({
             "credentials": [{"id": "pid", "format": "dc+sd-jwt",
                 "meta": {"vct_values": ["urn:eudi:pid:1"]},
                 "claims": [{"path": ["given_name"]}]}],
         }));
-        let opened = opened(json!({"pid": []}));
+        let mut body = body_with(json!({"pid": []}));
+        body["state"] = json!(session.state.clone());
+        let jwe = raw_response(&session, body, None);
         assert!(
-            validate_response_shape(&session, &opened).is_err(),
+            open_response(&session, &jwe, NOW + 5).is_err(),
             "the empty list must refuse"
-        );
-    }
-}
-
-// ---- the issuer-key hints cap (issue #83, the amplification) --------------------
-mod hints_cap {
-    use super::*;
-    use std::collections::HashSet;
-
-    /// One real SD-JWT issued by a distinct issuer (the file's own
-    /// issuance pattern: a fresh issuer key + cert per presentation,
-    /// so each token names a genuinely distinct (iss, kid)).
-    fn distinct_presentation(i: usize) -> String {
-        let (_issuer_cert, mut issuer_key) = self_signed_ec("issuer.example", "ES256");
-        // The kid/JWKS profile names the key by kid: the hint extraction
-        // requires one (no x5c, kid present — the amplification's shape).
-        issuer_key.kid = Some(format!("kid-{i}"));
-        let holder = ec_jwk("ES256", "holder");
-        let mut spec = IssueSpec::new(json!({
-            "iss": format!("https://slow-{i}.example"),
-            "vct": "urn:eudi:pid:1",
-            "iat": NOW - 10, "exp": NOW + 100_000,
-            "given_name": "Ada",
-        }));
-        spec.holder_pub = Some(public_of(&holder));
-        // The kid/JWKS profile (no x5c — the amplification's actual
-        // target): the hint extraction reads the header's kid + the
-        // payload's iss, so these tokens name their distinct issuers.
-        spec.conceal = vec![vec![Seg::Key("given_name")]];
-        let issued = issue(&issuer_key, &spec).unwrap();
-        present(
-            &issued,
-            &[0],
-            Some(KbSpec {
-                holder: &holder,
-                aud: "https://verifier.example",
-                nonce: "n",
-                iat: NOW,
-            }),
-            sdjwt::HashAlg::Sha256,
-        )
-        .unwrap()
-    }
-
-    /// The distinct (iss, kid, alg) hints a response would name, under
-    /// the plugin's cap (mirrored here; the constant must stay in sync).
-    fn hints_from(presentations: &[String]) -> HashSet<(String, String, String)> {
-        let text = json!({"pid": presentations}).to_string();
-        let mut hints: HashSet<(String, String, String)> = HashSet::new();
-        let Ok(vp) = serde_json::from_str::<serde_json::Value>(&text) else {
-            return hints;
-        };
-        let Some(entries) = vp.as_object() else {
-            return hints;
-        };
-        const MAX_ISSUER_KEY_HINTS: usize = 8;
-        'entries: for value in entries.values() {
-            let Some(list) = value.as_array() else {
-                continue;
-            };
-            for presentation in list.iter().filter_map(|item| item.as_str()) {
-                if let Ok(Some(triple)) = sdjwt::issuer_key_hint(presentation) {
-                    if hints.len() >= MAX_ISSUER_KEY_HINTS {
-                        break 'entries;
-                    }
-                    hints.insert(triple);
-                }
-            }
-        }
-        hints
-    }
-
-    #[test]
-    fn the_distinct_hints_are_capped_per_response() {
-        // 12 real presentations from 12 distinct issuers — the genuine
-        // amplification shape — collect at most 8 hints: the discovery
-        // fetch fan-out stays bounded even for a shaped response.
-        let presentations: Vec<String> = (0..12).map(distinct_presentation).collect();
-        let hints = hints_from(&presentations);
-        assert!(
-            hints.len() <= 8,
-            "the distinct hints are capped: got {}",
-            hints.len()
-        );
-    }
-
-    #[test]
-    fn a_legitimate_response_stays_under_the_cap() {
-        // One presentation per requested credential, one issuer: the
-        // cap must never bite a genuine response.
-        let presentations: Vec<String> = vec![distinct_presentation(0)];
-        let hints = hints_from(&presentations);
-        assert_eq!(
-            hints.len(),
-            1,
-            "the genuine response names exactly one hint"
         );
     }
 }

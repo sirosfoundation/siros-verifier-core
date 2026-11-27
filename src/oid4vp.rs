@@ -1003,7 +1003,15 @@ pub fn open_response(session: &Session, jwe: &str, now: i64) -> Result<OpenedRes
         .and_then(Value::as_object)
         .cloned()
         .ok_or_else(|| malformed("missing vp_token object"))?;
-    Ok(OpenedResponse { vp_token })
+    let opened = OpenedResponse { vp_token };
+    // The shape validates HERE (issue #83, the security report's third
+    // finding): no unrequested credential id, no wrong cardinality, no
+    // non-string presentation ever leaves the open — the network
+    // discovery a caller drives from the opened value can never be
+    // steered by a response that failed these checks. The adapter's
+    // post-open recheck stays for embeds that bypass open_response.
+    validate_response_shape(session, &opened)?;
+    Ok(opened)
 }
 
 /// Process the wallet's `direct_post.jwt` response (the `response` form value).
