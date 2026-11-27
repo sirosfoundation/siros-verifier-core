@@ -191,6 +191,7 @@ fn happy_path_end_to_end() {
     // what the trust layer would send to go-trust
     let q = v
         .trust_query("https://example.org/roles/pid-issuer", "mdoc-issuer")
+        .expect("the issuer binds")
         .to_authzen();
     assert_eq!(
         q["subject"],
@@ -963,6 +964,7 @@ fn mdoc_redirect_and_dc_api_verify_with_their_own_handovers() {
         );
         let trust = credential
             .trust_query("pid-provider", "mdoc-issuer")
+            .expect("the issuer binds")
             .to_authzen();
         assert_eq!(trust["action"]["name"], "mdoc-issuer");
         assert_eq!(trust["resource"]["type"], "x5c");
