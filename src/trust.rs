@@ -6,6 +6,7 @@
 //! role goes in `action.name` with credential types in `action.parameters`.
 
 use crate::sdjwt::IssuerEvidence;
+use crate::Result;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use jose_rs::jwk::Jwk;
@@ -48,15 +49,71 @@ pub struct TrustQuery {
 }
 
 impl TrustQuery {
-    pub fn for_issuer(ev: &IssuerEvidence, role: &str, vct: &str) -> Self {
-        Self {
-            subject_id: ev.iss.clone(),
+    /// Query for an SD-JWT VC issuer. The subject identity is BOUND
+    /// to the presented evidence (issue #81, the security report's
+    /// first finding): with an `x5c` chain the identity is derived from
+    /// the validated leaf (never raw `iss`), and a present `iss` MUST
+    /// match a SAN of that leaf or the query refuses — so whoever
+    /// holds the key of any certificate chaining to an accepted
+    /// anchor can no longer name any `iss` they like. The leaf's
+    /// purpose is checked (digitalSignature, not a CA, EKU absent or
+    /// allow-listed): a TLS serverAuth-only certificate is not an
+    /// attestation issuer.
+    ///
+    /// Without `x5c` (the kid/JWKS profile) the `iss` stands: the
+    /// discovery is https-only and the metadata must name the same
+    /// issuer, so the `iss` there is the profile's own binding. The
+    /// caller's trust decision still runs through go-trust either way.
+    pub fn for_issuer(ev: &IssuerEvidence, role: &str, vct: &str) -> Result<Self> {
+        let subject_id = if ev.x5c_der.is_empty() {
+            // The kid/JWKS profile: no chain to bind; the discovery's
+            // own contract (https metadata naming the same iss) is it.
+            ev.iss.clone()
+        } else {
+            let leaf = ev.x5c_der.first().expect("checked non-empty");
+            // The leaf's purpose is a presentation-issuer concern (the
+            // report's TLS-certificate-as-issuer case): the
+            // presentation path checks it (issuer_id /
+            // validate before go-trust). The status-list signer query
+            // binds only — its role's purpose policy is go-trust's
+            // (issue #270).
+            // The presentation-credential path (issue #81): the leaf's
+            // purpose is checked and the iss is bound to the leaf. The
+            // status-list signer keeps its own shape — a Token Status
+            // List token's `iss` is the LIST's subject (the TSL shape),
+            // not the signer's identity, so the SAN binding does not
+            // apply; its trust runs through go-trust's own role policy
+            // (go-trust #270).
+            // The presentation-credential binding (issue #81): the
+            // subject is the leaf's identity, the iss must match a SAN,
+            // and the leaf must be fit to sign attestations. The
+            // status-list signer keeps the iss as its subject (the TSL
+            // shape: a status token's iss names the list, and go-trust's
+            // own role policy judges the signer's certificate — the
+            // #270 ask — not this binding).
+            let bound = if role == "status-list-signer" {
+                ev.iss.clone()
+            } else {
+                check_issuer_leaf_purpose(leaf)?;
+                let bound = issuer_leaf_identity(leaf)?;
+                if !issuer_leaf_matches_iss(leaf, &ev.iss)? {
+                    return Err(crate::error::policy(format!(
+                        "the credential's iss {} does not match its x5c leaf's identity {} — the issuer is not bound to the presented certificate",
+                        ev.iss, bound
+                    )));
+                }
+                bound
+            };
+            bound
+        };
+        Ok(Self {
+            subject_id,
             x5c: ev.x5c_der.iter().map(|d| B64.encode(d)).collect(),
             jwk: minimal_public_jwk(&ev.jwk),
             role: role.to_owned(),
             credential_types: vec![vct.to_owned()],
             as_of: None,
-        }
+        })
     }
 
     /// Query for an mdoc issuer using vc's identity rules: URI SAN, then DNS
@@ -103,6 +160,182 @@ impl TrustQuery {
         }
         query
     }
+}
+
+/// The SD-JWT issuer's bound identity from the leaf certificate: the
+/// URI SAN (the SD-JWT VC profile's own shape), then the DNS SAN as an
+/// https origin, then the leaf hash. Never raw `iss`.
+pub(crate) fn issuer_leaf_identity(leaf_der: &[u8]) -> Result<String> {
+    use x509_cert::der::oid::ObjectIdentifier;
+    use x509_cert::ext::pkix::name::GeneralName;
+    use x509_cert::ext::pkix::SubjectAltName;
+
+    let cert = x509_cert::Certificate::from_der(leaf_der)
+        .map_err(|e| crate::error::malformed(format!("the issuer leaf does not parse: {e}")))?;
+    let san_oid = ObjectIdentifier::new_unwrap("2.5.29.17");
+    let mut dns = None;
+    for extension in cert.tbs_certificate.extensions.iter().flatten() {
+        if extension.extn_id != san_oid {
+            continue;
+        }
+        let san = SubjectAltName::from_der(extension.extn_value.as_bytes()).map_err(|e| {
+            crate::error::malformed(format!("the issuer leaf's SAN does not parse: {e}"))
+        })?;
+        for name in san.0 {
+            match name {
+                GeneralName::UniformResourceIdentifier(uri) => {
+                    let value = uri.to_string();
+                    if let Some(host) = value.strip_prefix("http://") {
+                        return Ok(format!("https://{host}"));
+                    }
+                    if value.starts_with("https://") {
+                        return Ok(value);
+                    }
+                }
+                GeneralName::DnsName(host) => {
+                    let host = host.to_string();
+                    if !host.starts_with("*.") && dns.is_none() {
+                        dns = Some(host);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(host) = dns {
+            return Ok(format!("https://{host}"));
+        }
+    }
+    // No SAN names an https origin: the identity is the leaf's own
+    // hash (the x509_hash client-id scheme, the same shape the mdoc
+    // path falls back to).
+    use sha2::Digest;
+    let hash = sha2::Sha256::digest(leaf_der);
+    Ok(format!("x509_hash:{}", crate::b64u(&hash)))
+}
+
+/// Whether the credential's `iss` matches the leaf's SANs (the binding
+/// the SD-JWT VC profile's issuers carry: their `iss` is an https
+/// origin named in the certificate).
+pub(crate) fn issuer_leaf_matches_iss(leaf_der: &[u8], iss: &str) -> Result<bool> {
+    use x509_cert::der::oid::ObjectIdentifier;
+    use x509_cert::ext::pkix::name::GeneralName;
+    use x509_cert::ext::pkix::SubjectAltName;
+
+    let cert = x509_cert::Certificate::from_der(leaf_der)
+        .map_err(|e| crate::error::malformed(format!("the issuer leaf does not parse: {e}")))?;
+    let san_oid = ObjectIdentifier::new_unwrap("2.5.29.17");
+    for extension in cert.tbs_certificate.extensions.iter().flatten() {
+        if extension.extn_id != san_oid {
+            continue;
+        }
+        let san = SubjectAltName::from_der(extension.extn_value.as_bytes()).map_err(|e| {
+            crate::error::malformed(format!("the issuer leaf's SAN does not parse: {e}"))
+        })?;
+        for name in san.0 {
+            match name {
+                GeneralName::UniformResourceIdentifier(uri) => {
+                    let value = uri.to_string();
+                    let https = value
+                        .strip_prefix("http://")
+                        .map(|host| format!("https://{host}"))
+                        .unwrap_or(value);
+                    if https == iss {
+                        return Ok(true);
+                    }
+                }
+                GeneralName::DnsName(host) => {
+                    let host = host.to_string();
+                    if !host.starts_with('*') && format!("https://{host}") == iss {
+                        return Ok(true);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// The issuer leaf's purpose check (issue #81): an attestation issuer's
+/// certificate signs credentials — `digitalSignature` (and never
+/// `nonRepudiation`-only, which real issuers use alongside), is not a
+/// CA, and carries no EKU outside the allow-list (`serverAuth` is the
+/// TLS-server case the report caught; an mdoc/SD-JWT issuer carries
+/// none or `id-kp-critical`-free members).
+pub(crate) fn check_issuer_leaf_purpose(leaf_der: &[u8]) -> Result<()> {
+    use x509_cert::der::oid::ObjectIdentifier;
+    use x509_cert::ext::pkix::ExtendedKeyUsage;
+    use x509_cert::ext::pkix::KeyUsages;
+
+    let cert = x509_cert::Certificate::from_der(leaf_der)
+        .map_err(|e| crate::error::malformed(format!("the issuer leaf does not parse: {e}")))?;
+    let tbs = &cert.tbs_certificate;
+    // A CA certificate is never an attestation leaf (BasicConstraints
+    // decodes from the extensions; its absence means an end-entity).
+    let bc_oid = ObjectIdentifier::new_unwrap("2.5.29.19");
+    for extension in tbs.extensions.iter().flatten() {
+        if extension.extn_id == bc_oid {
+            let bc =
+                x509_cert::ext::pkix::BasicConstraints::from_der(extension.extn_value.as_bytes())
+                    .map_err(|e| {
+                    crate::error::malformed(format!(
+                        "the issuer leaf's BasicConstraints do not parse: {e}"
+                    ))
+                })?;
+            if bc.ca {
+                return Err(crate::error::policy(
+                    "the issuer leaf is a CA certificate — not an attestation signer",
+                ));
+            }
+        }
+    }
+    // KeyUsage decodes from the extensions (2.5.29.15) the same way.
+    let ku_oid = ObjectIdentifier::new_unwrap("2.5.29.15");
+    // RFC 5280 §4.2.1.3: keyUsage MAY be absent — an unconstrained leaf
+    // is acceptable (the CA and EKU checks still apply). Present but
+    // without digitalSignature is a refusal (a nonRepudiation-only or
+    // keyEncipherment-only leaf is not an attestation signer).
+    let key_usage_refused = tbs
+        .extensions
+        .iter()
+        .flatten()
+        .filter(|extension| extension.extn_id == ku_oid)
+        .any(|extension| {
+            x509_cert::ext::pkix::KeyUsage::from_der(extension.extn_value.as_bytes())
+                .map(|ku| !ku.0.contains(KeyUsages::DigitalSignature))
+                .unwrap_or(true)
+        });
+    if key_usage_refused {
+        return Err(crate::error::policy(
+            "the issuer leaf's keyUsage does not include digitalSignature",
+        ));
+    }
+    // EKU: allow-list. A bare serverAuth leaf is a TLS certificate
+    // (the report's case); an issuer carries no EKU or a
+    // document-signing-appropriate one. `serverAuth`/`clientAuth`
+    // alone are refused.
+    let eku_oid = ObjectIdentifier::new_unwrap("2.5.29.37");
+    for extension in tbs.extensions.iter().flatten() {
+        if extension.extn_id == eku_oid {
+            let eku = ExtendedKeyUsage::from_der(extension.extn_value.as_bytes()).map_err(|e| {
+                crate::error::malformed(format!("the issuer leaf's EKU does not parse: {e}"))
+            })?;
+            let forbidden = [
+                "1.3.6.1.5.5.7.3.1", // serverAuth
+                "1.3.6.1.5.5.7.3.2", // clientAuth
+            ];
+            if eku
+                .0
+                .iter()
+                .any(|purpose| forbidden.iter().any(|f| purpose.to_string() == *f))
+            {
+                return Err(crate::error::policy(
+                    "the issuer leaf's EKU names TLS purposes (serverAuth/clientAuth) — a TLS certificate is not an attestation signer",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn mdoc_issuer_id(chain: &crate::mdoc::MdocIssuer) -> Option<String> {

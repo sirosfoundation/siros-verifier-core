@@ -202,24 +202,42 @@ impl VerifiedCredential {
         }
     }
 
-    pub fn issuer_id(&self) -> String {
+    pub fn issuer_id(&self) -> Result<String> {
         match self {
-            Self::SdJwt(verified) => verified.issuer.iss.clone(),
-            Self::Mdoc(verified) => verified
+            // The BOUND identity (issue #81): the SD-JWT path derives it
+            // from the validated leaf — never raw `iss` — so the relying
+            // party is told who actually signed, and two issuers cannot
+            // collide on a forged name. The kid/JWKS profile's `iss`
+            // stands (its own discovery binds it).
+            Self::SdJwt(verified) => {
+                let ev = &verified.issuer;
+                if ev.x5c_der.is_empty() {
+                    return Ok(ev.iss.clone());
+                }
+                let leaf = ev.x5c_der.first().expect("checked non-empty");
+                crate::trust::issuer_leaf_identity(leaf)
+            }
+            Self::Mdoc(verified) => Ok(verified
                 .issuer
                 .x5c_der
                 .first()
                 .map(|leaf| x509_hash_client_id(leaf))
-                .unwrap_or_default(),
+                .unwrap_or_default()),
         }
     }
 
-    pub fn trust_query(&self, role: &str, mdoc_role: &str) -> TrustQuery {
+    pub fn trust_query(&self, role: &str, mdoc_role: &str) -> Result<TrustQuery> {
         match self {
+            // The SD-JWT path's query REFUSES here when the issuer is not
+            // bound (issue #81): an iss that does not match the x5c leaf,
+            // or a leaf unfit to sign attestations, never reaches
+            // go-trust as a candidate.
             Self::SdJwt(verified) => TrustQuery::for_issuer(&verified.issuer, role, &verified.vct),
-            Self::Mdoc(verified) => {
-                TrustQuery::for_mdoc_issuer(&verified.issuer, mdoc_role, &verified.doc_type)
-            }
+            Self::Mdoc(verified) => Ok(TrustQuery::for_mdoc_issuer(
+                &verified.issuer,
+                mdoc_role,
+                &verified.doc_type,
+            )),
         }
     }
 

@@ -1903,7 +1903,14 @@ impl VpBackend {
                     description: status_list_reason(&e),
                 }
             })?;
-        let query = TrustQuery::for_issuer(&token.issuer, "status-list-signer", "status-list");
+        // The status-list signer binds like every SD-JWT issuer (issue
+        // #81): the query refuses an unbound signer here.
+        let query = TrustQuery::for_issuer(&token.issuer, "status-list-signer", "status-list")
+            .map_err(|e| StatusListRefusal {
+                code: "status_list_signer_not_bound",
+                status: 400,
+                description: format!("{e}"),
+            })?;
         // The signer's trust evaluation is a PDP round-trip like every
         // other: it accumulates into trust_ms as well, or a slow go-trust
         // hides inside status_ms and the trust total understates it.
@@ -2250,20 +2257,33 @@ impl VpBackend {
         }
         // One result carries every verified document: the first credential names the
         // issuer, and each credential's mapped claims are appended in query order.
+        // The issuer identity is the BOUND one (issue #81): derived from
+        // the validated leaf, never raw iss — and its derivation here
+        // refuses first (an unbound issuer never reaches the result).
+        let issuer_id = match verified[0].verified.issuer_id() {
+            Ok(id) => id,
+            Err(e) => {
+                return Decision::failed(e.code(), Response::text(400, "issuer not bound"));
+            }
+        };
         let mut data = InternalData {
             auth_info: AuthenticationInformation {
                 auth_class_ref: self.cfg.auth_class_ref.clone(),
-                issuer: Some(verified[0].verified.issuer_id()),
+                issuer: Some(issuer_id),
                 ..Default::default()
             },
             ..Default::default()
         };
         data.requester = requester.clone();
         for p in &verified {
-            let q = p
-                .verified
-                .trust_query(&self.cfg.role, &self.cfg.mdoc_role)
-                .to_authzen();
+            // The query refuses an unbound issuer here (issue #81's
+            // derivation) — before go-trust is ever consulted.
+            let q = match p.verified.trust_query(&self.cfg.role, &self.cfg.mdoc_role) {
+                Ok(query) => query.to_authzen(),
+                Err(e) => {
+                    return Decision::failed(e.code(), Response::text(400, "issuer not bound"));
+                }
+            };
             let _trust_timer = StepTimer::start(&mut timings.trust_ms);
             let permitted = self.gate.permits(&q, now).await;
             drop(_trust_timer);
