@@ -27,6 +27,7 @@ fn flow(id: &str) -> Flow {
         subject_pointer: "/sub".into(),
         outcome: Outcome::Pending,
         failure_description: String::new(),
+        response_code: String::new(),
     }
 }
 
@@ -49,7 +50,8 @@ async fn only_one_response_claim_and_one_collection_win() {
                 TerminalOutcome::Failed {
                     code: "stale".into(),
                     description: "the stored lease was superseded".into()
-                }
+                },
+                None
             )
             .await
             .unwrap(),
@@ -61,7 +63,8 @@ async fn only_one_response_claim_and_one_collection_win() {
                 "flow-1",
                 NOW + 301,
                 "claim-a",
-                TerminalOutcome::Done("sealed-result".into())
+                TerminalOutcome::Done("sealed-result".into()),
+                Some("code-1")
             )
             .await
             .unwrap(),
@@ -69,8 +72,8 @@ async fn only_one_response_claim_and_one_collection_win() {
         "a response claimed before request expiry may finish"
     );
     let (a, b) = tokio::join!(
-        store.collect("flow-1", NOW + 302),
-        store.collect("flow-1", NOW + 302)
+        store.collect("flow-1", NOW + 302, Some("code-1")),
+        store.collect("flow-1", NOW + 302, Some("code-1"))
     );
     assert_eq!(a.unwrap(), CollectResult::Done("sealed-result".into()));
     assert_eq!(b.unwrap(), CollectResult::Unknown);
@@ -91,7 +94,8 @@ async fn only_one_response_claim_and_one_collection_win() {
                 TerminalOutcome::Failed {
                     code: "stale".into(),
                     description: "the stored lease was superseded".into()
-                }
+                },
+                None
             )
             .await
             .unwrap(),
@@ -109,11 +113,11 @@ async fn expiry_and_retention_have_exact_boundaries() {
         ClaimResult::Expired
     );
     assert_eq!(
-        store.collect("flow-1", NOW + 300).await.unwrap(),
+        store.collect("flow-1", NOW + 300, None).await.unwrap(),
         CollectResult::Expired
     );
     assert_eq!(
-        store.collect("flow-1", NOW + 300).await.unwrap(),
+        store.collect("flow-1", NOW + 300, None).await.unwrap(),
         CollectResult::Unknown
     );
 
@@ -131,7 +135,8 @@ async fn expiry_and_retention_have_exact_boundaries() {
                 TerminalOutcome::Failed {
                     code: "too_late".into(),
                     description: "the processing lease expired before the finish".into()
-                }
+                },
+                None
             )
             .await
             .unwrap(),
@@ -166,6 +171,7 @@ async fn terminal_finish_clears_secrets_without_deleting_the_tombstone() {
             NOW,
             "claim",
             TerminalOutcome::Done("sealed-result".into()),
+            Some("the-code"),
         )
         .await
         .unwrap();
@@ -173,6 +179,9 @@ async fn terminal_finish_clears_secrets_without_deleting_the_tombstone() {
     assert!(stored.jar.is_empty());
     assert!(stored.sealed_session.is_empty());
     assert_eq!(stored.outcome, Outcome::Done("sealed-result".into()));
+    // The §14.2 code (issue #84) persists with the terminal result —
+    // it is not a session secret and must not be cleared by the write.
+    assert_eq!(stored.response_code, "the-code");
 }
 
 #[tokio::test]
@@ -216,7 +225,8 @@ async fn an_expired_processing_lease_is_reclaimed_and_the_dead_claim_conflicts()
                 "flow-1",
                 NOW + 11,
                 "dead-claim",
-                TerminalOutcome::Done("late-result".into())
+                TerminalOutcome::Done("late-result".into()),
+                Some("code-dead")
             )
             .await
             .unwrap(),
@@ -229,18 +239,25 @@ async fn an_expired_processing_lease_is_reclaimed_and_the_dead_claim_conflicts()
                 "flow-1",
                 NOW + 11,
                 "retry-claim",
-                TerminalOutcome::Done("sealed-result".into())
+                TerminalOutcome::Done("sealed-result".into()),
+                Some("code-1")
             )
             .await
             .unwrap(),
         FinishResult::Finished
     );
     assert_eq!(
-        store.collect("flow-1", NOW + 12).await.unwrap(),
+        store
+            .collect("flow-1", NOW + 12, Some("code-1"))
+            .await
+            .unwrap(),
         CollectResult::Done("sealed-result".into())
     );
     assert_eq!(
-        store.collect("flow-1", NOW + 12).await.unwrap(),
+        store
+            .collect("flow-1", NOW + 12, Some("code-1"))
+            .await
+            .unwrap(),
         CollectResult::Unknown,
         "recovered processing still delivers exactly once"
     );
@@ -291,7 +308,8 @@ async fn a_dead_lease_is_not_reclaimed_once_the_request_expired() {
                 "flow-late",
                 NOW + 300,
                 "claim-a",
-                TerminalOutcome::Done("late-result".into())
+                TerminalOutcome::Done("late-result".into()),
+                Some("code-late")
             )
             .await
             .unwrap(),
@@ -299,11 +317,261 @@ async fn a_dead_lease_is_not_reclaimed_once_the_request_expired() {
         "the original holder may still complete an in-flight response"
     );
     assert_eq!(
-        store.collect("flow-late", NOW + 301).await.unwrap(),
+        store
+            .collect("flow-late", NOW + 301, Some("code-late"))
+            .await
+            .unwrap(),
         CollectResult::Done("late-result".into())
     );
     assert_eq!(
-        store.collect("flow-late", NOW + 301).await.unwrap(),
+        store
+            .collect("flow-late", NOW + 301, Some("code-late"))
+            .await
+            .unwrap(),
+        CollectResult::Unknown
+    );
+}
+
+// ---- the §14.2 Response Code gate (issue #84) ---------------------------------
+
+#[tokio::test]
+async fn a_done_flow_refuses_collection_without_the_response_code() {
+    let store = MemoryFlowStore::default();
+    store.insert(flow("flow-1"), NOW).await.unwrap();
+    assert!(matches!(
+        store.claim("flow-1", NOW, "claim", 60).await.unwrap(),
+        ClaimResult::Claimed(_)
+    ));
+    assert_eq!(
+        store
+            .finish(
+                "flow-1",
+                NOW,
+                "claim",
+                TerminalOutcome::Done("sealed-result".into()),
+                Some("the-code")
+            )
+            .await
+            .unwrap(),
+        FinishResult::Finished
+    );
+    // No code and a wrong code refuse identically — no oracle — and
+    // neither consumes: the genuine completion still arrives.
+    assert_eq!(
+        store.collect("flow-1", NOW + 1, None).await.unwrap(),
+        CollectResult::CodeMismatch
+    );
+    assert_eq!(
+        store
+            .collect("flow-1", NOW + 1, Some("wrong"))
+            .await
+            .unwrap(),
+        CollectResult::CodeMismatch
+    );
+    assert_eq!(
+        store.get("flow-1", NOW + 1).await.unwrap().unwrap().outcome,
+        Outcome::Done("sealed-result".into()),
+        "a refused probe leaves the flow collectable"
+    );
+    // The matching code collects, exactly once.
+    assert_eq!(
+        store
+            .collect("flow-1", NOW + 1, Some("the-code"))
+            .await
+            .unwrap(),
+        CollectResult::Done("sealed-result".into())
+    );
+    assert_eq!(
+        store
+            .collect("flow-1", NOW + 1, Some("the-code"))
+            .await
+            .unwrap(),
+        CollectResult::Unknown
+    );
+}
+
+#[tokio::test]
+async fn a_failed_flow_needs_no_response_code() {
+    let store = MemoryFlowStore::default();
+    store.insert(flow("flow-1"), NOW).await.unwrap();
+    assert!(matches!(
+        store.claim("flow-1", NOW, "claim", 60).await.unwrap(),
+        ClaimResult::Claimed(_)
+    ));
+    assert_eq!(
+        store
+            .finish(
+                "flow-1",
+                NOW,
+                "claim",
+                TerminalOutcome::Failed {
+                    code: "refused".into(),
+                    description: "the issuer is not trusted".into()
+                },
+                None
+            )
+            .await
+            .unwrap(),
+        FinishResult::Finished
+    );
+    // A refusal carries no credential material: its page is not gated.
+    assert_eq!(
+        store.collect("flow-1", NOW + 1, None).await.unwrap(),
+        CollectResult::Failed {
+            code: "refused".into(),
+            description: "the issuer is not trusted".into(),
+            browser_launched: false,
+        }
+    );
+}
+
+#[tokio::test]
+async fn a_done_flow_persisted_before_the_field_fails_closed() {
+    let store = MemoryFlowStore::default();
+    // The pre-#84 shape: a done result with no stored code. Fail closed —
+    // the same refusal as a wrong code, never a cookie-only collection.
+    let mut legacy = flow("legacy");
+    legacy.outcome = Outcome::Done("sealed-result".into());
+    store.insert(legacy, NOW).await.unwrap();
+    assert_eq!(
+        store.collect("legacy", NOW + 1, None).await.unwrap(),
+        CollectResult::CodeMismatch
+    );
+}
+
+#[tokio::test]
+async fn the_gate_leaves_non_done_outcomes_alone() {
+    // Only a DONE flow needs the §14.2 code: a pending flow answers its
+    // waiting page, an expired one its expiry, an unknown id nothing — the
+    // presented code is irrelevant to each (their pages carry no result).
+    let store = MemoryFlowStore::default();
+    store.insert(flow("gate-pending"), NOW).await.unwrap();
+    assert_eq!(
+        store
+            .collect("gate-pending", NOW + 1, Some("any-code"))
+            .await
+            .unwrap(),
+        CollectResult::Pending
+    );
+    assert_eq!(
+        store
+            .collect("gate-pending", NOW + 301, Some("any-code"))
+            .await
+            .unwrap(),
+        CollectResult::Expired
+    );
+    assert_eq!(
+        store
+            .collect("never-started", NOW + 1, Some("any-code"))
+            .await
+            .unwrap(),
+        CollectResult::Unknown
+    );
+}
+
+#[tokio::test]
+async fn the_gate_does_not_shadow_the_lease_lifecycle() {
+    // The §14.2 code neither enables nor blocks the processing lease: a
+    // claimed flow stays a replay to a second POST, and once finished the
+    // code gates only the collection, not the claim or the finish.
+    let store = MemoryFlowStore::default();
+    store.insert(flow("gate-lease"), NOW).await.unwrap();
+    assert!(matches!(
+        store.claim("gate-lease", NOW, "claim-a", 60).await.unwrap(),
+        ClaimResult::Claimed(_)
+    ));
+    assert_eq!(
+        store
+            .claim("gate-lease", NOW + 1, "claim-b", 60)
+            .await
+            .unwrap(),
+        ClaimResult::Replay,
+        "the lease is untouched by any collection attempt"
+    );
+    assert_eq!(
+        store
+            .finish(
+                "gate-lease",
+                NOW + 1,
+                "claim-a",
+                TerminalOutcome::Done("v1.result".into()),
+                Some("lease-code")
+            )
+            .await
+            .unwrap(),
+        FinishResult::Finished
+    );
+    // A wrong code does not consume; the right one delivers exactly once.
+    assert_eq!(
+        store
+            .collect("gate-lease", NOW + 2, Some("wrong"))
+            .await
+            .unwrap(),
+        CollectResult::CodeMismatch
+    );
+    assert_eq!(
+        store
+            .collect("gate-lease", NOW + 2, Some("lease-code"))
+            .await
+            .unwrap(),
+        CollectResult::Done("v1.result".into())
+    );
+    assert_eq!(
+        store
+            .collect("gate-lease", NOW + 2, Some("lease-code"))
+            .await
+            .unwrap(),
+        CollectResult::Unknown
+    );
+}
+
+#[tokio::test]
+async fn a_collected_flow_speaks_never_again_whatever_code_arrives() {
+    // After the one genuine collection the record is a tombstone: any
+    // replayed response gets its replay answer and any code — the genuine
+    // one included — gets nothing. The gate never resurrects a result.
+    let store = MemoryFlowStore::default();
+    store.insert(flow("gate-tombstone"), NOW).await.unwrap();
+    assert!(matches!(
+        store
+            .claim("gate-tombstone", NOW, "claim", 60)
+            .await
+            .unwrap(),
+        ClaimResult::Claimed(_)
+    ));
+    assert_eq!(
+        store
+            .finish(
+                "gate-tombstone",
+                NOW,
+                "claim",
+                TerminalOutcome::Done("v1.result".into()),
+                Some("tomb-code")
+            )
+            .await
+            .unwrap(),
+        FinishResult::Finished
+    );
+    assert_eq!(
+        store
+            .collect("gate-tombstone", NOW + 1, Some("tomb-code"))
+            .await
+            .unwrap(),
+        CollectResult::Done("v1.result".into())
+    );
+    assert_eq!(
+        store
+            .collect("gate-tombstone", NOW + 1, Some("tomb-code"))
+            .await
+            .unwrap(),
+        CollectResult::Unknown,
+        "the used code collects nothing a second time"
+    );
+    assert_eq!(
+        store
+            .collect("gate-tombstone", NOW + 1, Some("another"))
+            .await
+            .unwrap(),
         CollectResult::Unknown
     );
 }

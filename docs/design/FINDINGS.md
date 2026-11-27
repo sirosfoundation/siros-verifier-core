@@ -221,11 +221,17 @@ browser, expired flows, hostile flow ids, wrong method, missing parameter, missi
 ## Security notes
 
 - Flow ids are 128-bit random, validated by length and alphabet before any lookup. A flow accepts exactly one wallet
-  response (replay gets 409). Results are collected once, only by the browser holding the matching cookie.
+  response (replay gets 409). Results are collected once, only by the requester presenting the OpenID4VP §14.2
+  Response Code (issue #84): the done answer's `redirect_uri` carries a fresh one-time code, `/complete` refuses a
+  missing or wrong code without consuming the flow, and a pre-`response_code` record fails closed. The code reaches the
+  starting browser through the wallet (same-device) or the DC API answer the page itself relays.
 - Failures surface as stable codes (`issuer_not_trusted`, `trust_unavailable`, `subject_claim_missing`, ...) and the
   wallet-facing responses carry no claim values.
-- Cross-device flows have the usual phishing risk: whoever started the flow gets the identity of whoever scans the code.
-  The plugin does not mitigate this; same-device flows (a link, not a QR) and user-visible confirmation are the usual answers.
+- Cross-device flows keep the usual phishing risk: the Response Code does not travel the cross-device channel either,
+  so a cross-device completion cannot present it — the wallet must relay the code (a coordinated wallet change) or the
+  deployment uses the DC API, whose answers the same browser relays. The result's default `acr` tells the RP how the
+  result was obtained (`urn:siros:openid4vp:link-bound`, `:dc-api`), so a sensitive RP can refuse the kind it does not
+  want; a configured `auth_class_ref` wins.
 
 ## Not done
 

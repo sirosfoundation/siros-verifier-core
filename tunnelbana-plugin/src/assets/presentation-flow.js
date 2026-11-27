@@ -408,7 +408,12 @@ export class PresentationFlow {
       credentials: "same-origin",
     });
     if (!response.ok) throw new Error(`The verifier rejected the presentation (HTTP ${response.status})`);
-    return {status: "done", complete_uri: this.assertBackendUrl(payload.complete_uri)};
+    // The answer carries the OpenID4VP §14.2 redirect_uri: navigating there
+    // presents the one-time response code this same browser just relayed —
+    // the completion is bound to this exchange, not to the flow cookie alone.
+    const answer = await response.json();
+    if (!answer.redirect_uri) throw new Error("The verifier returned no redirect_uri for the completion");
+    return {status: "done", redirect_uri: this.assertBackendUrl(answer.redirect_uri)};
   }
 
   renderLaunch(mechanism, payload) {
@@ -459,7 +464,15 @@ export class PresentationFlow {
   }
 
   renderResult(result) {
-    window.location.assign(result.complete_uri);
+    // The DC API exchange carried the §14.2 redirect_uri in its answer:
+    // navigating there presents the response code this browser relays.
+    if (result.redirect_uri) {
+      window.location.assign(this.assertBackendUrl(result.redirect_uri));
+      return;
+    }
+    // A wallet-app flow: the wallet holds the response code and opens the
+    // completion itself. Navigating to /complete without it cannot collect.
+    this.setStatus("Presentation received. Return to the verifier from your wallet to finish signing in.");
   }
 
   renderError(error) {
@@ -490,8 +503,12 @@ export class PresentationFlow {
         if (response.ok) {
           const result = await response.json();
           if (result.status === "done") {
-            result.complete_uri = this.assertBackendUrl(result.complete_uri);
-            return result;
+            // Wallet-app flow: the response code went to the wallet (the
+            // answer's redirect_uri), and the wallet opens it here when the
+            // user finishes there. This page cannot navigate to /complete
+            // itself — it does not hold the code — so it stops polling and
+            // waits for the wallet's return (issue #84, OpenID4VP §14.2).
+            return {status: "done"};
           }
           if (["failed", "expired", "unknown"].includes(result.status)) {
             // Terminal: the verifier's bounded, human-readable reason when it

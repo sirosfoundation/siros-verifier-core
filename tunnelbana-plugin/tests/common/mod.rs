@@ -1,4 +1,9 @@
 //! Fixtures shared by the tunnelbana integration test binaries.
+//!
+//! Each integration binary compiles this module independently, so a binary
+//! that uses only part of it would warn the rest dead — allow that here.
+
+#![allow(dead_code)]
 
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
@@ -44,11 +49,36 @@ impl FlowStore for ClockBumpingClaimStore {
         now: i64,
         claim_id: &str,
         outcome: TerminalOutcome,
+        response_code: Option<&str>,
     ) -> StoreResult<FinishResult> {
-        self.inner.finish(id, now, claim_id, outcome).await
+        self.inner
+            .finish(id, now, claim_id, outcome, response_code)
+            .await
     }
 
-    async fn collect(&self, id: &str, now: i64) -> StoreResult<CollectResult> {
-        self.inner.collect(id, now).await
+    async fn collect(
+        &self,
+        id: &str,
+        now: i64,
+        response_code: Option<&str>,
+    ) -> StoreResult<CollectResult> {
+        self.inner.collect(id, now, response_code).await
     }
+}
+
+/// The §14.2 answer channel (issue #84): the done answer's `redirect_uri`
+/// carries the one-time response code the completing browser presents.
+/// Shared by the integration binaries so the channel's shape is pinned once.
+pub fn bound_code(answer_body: &str) -> String {
+    let answer: serde_json::Value =
+        serde_json::from_str(answer_body).expect("the wallet answer is JSON");
+    let redirect = answer["redirect_uri"]
+        .as_str()
+        .expect("the done answer carries redirect_uri");
+    let code = redirect
+        .rsplit("response_code=")
+        .next()
+        .expect("redirect_uri carries response_code");
+    assert!(!code.is_empty(), "an empty response_code: {redirect}");
+    code.to_owned()
 }

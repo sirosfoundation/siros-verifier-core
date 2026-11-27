@@ -6,6 +6,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
+
+mod common;
 use siros_verifier_core::testutil::*;
 use siros_verifier_core_tunnelbana::*;
 use tunnelbana_core::context::Context;
@@ -139,11 +141,19 @@ fn world() -> World {
 }
 
 fn get(path: &str, cookie: Option<&str>) -> HttpRequestData {
+    // The real HTTP layer splits the path from its query before routing;
+    // this harness does the same so `?response_code=` rides the query.
+    let (path, query) = path.split_once('?').unwrap_or((path, ""));
     let mut r = HttpRequestData {
         path: path.into(),
         method: "GET".into(),
         ..Default::default()
     };
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        r.query.insert(k.to_owned(), v.to_owned());
+        r.query_pairs.push((k.to_owned(), v.to_owned()));
+    }
     if let Some(c) = cookie {
         r.cookies.insert(COOKIE.into(), c.into());
     }
@@ -215,12 +225,22 @@ async fn full_login_through_the_real_proxy() {
     let pending: Value = serde_json::from_slice(&pending.body).unwrap();
     assert_eq!(pending["status"], "pending");
 
-    assert_eq!(wallet_posts(&w, &id).await.status, 200);
+    let answer = wallet_posts(&w, &id).await;
+    assert_eq!(answer.status, 200);
+    // The wallet answer names the §14.2 redirect_uri; the browser the wallet
+    // returns to presents the code (issue #84).
+    let code = common::bound_code(std::str::from_utf8(&answer.body).expect("answer json"));
 
     let ready = w.proxy.run(get("vp/status", Some(&cookie))).await;
     let ready: Value = serde_json::from_slice(&ready.body).unwrap();
     assert_eq!(ready["status"], "done");
-    let done = w.proxy.run(get("vp/complete", Some(&cookie))).await;
+    let done = w
+        .proxy
+        .run(get(
+            &format!("vp/complete?response_code={code}"),
+            Some(&cookie),
+        ))
+        .await;
     assert_eq!(done.status, 200, "{}", String::from_utf8_lossy(&done.body));
     let v: Value = serde_json::from_slice(&done.body).unwrap();
     assert_eq!(v["sub"], "Lovelace");
@@ -252,13 +272,27 @@ async fn untrusted_issuer_reaches_the_frontend_as_an_error() {
 async fn a_second_collection_gets_nothing() {
     let w = world();
     let (cookie, id) = login(&w).await;
-    assert_eq!(wallet_posts(&w, &id).await.status, 200);
+    let answer = wallet_posts(&w, &id).await;
+    assert_eq!(answer.status, 200);
+    let code = common::bound_code(std::str::from_utf8(&answer.body).expect("answer json"));
     assert_eq!(
-        w.proxy.run(get("vp/complete", Some(&cookie))).await.status,
+        w.proxy
+            .run(get(
+                &format!("vp/complete?response_code={code}"),
+                Some(&cookie)
+            ))
+            .await
+            .status,
         200
     );
     assert_eq!(
-        w.proxy.run(get("vp/complete", Some(&cookie))).await.status,
+        w.proxy
+            .run(get(
+                &format!("vp/complete?response_code={code}"),
+                Some(&cookie)
+            ))
+            .await
+            .status,
         401
     );
 }

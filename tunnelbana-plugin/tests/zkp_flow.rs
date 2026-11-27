@@ -120,12 +120,20 @@ impl FlowStore for CorruptStore {
         now: i64,
         claim_id: &str,
         outcome: TerminalOutcome,
+        response_code: Option<&str>,
     ) -> StoreResult<FinishResult> {
-        self.inner.finish(id, now, claim_id, outcome).await
+        self.inner
+            .finish(id, now, claim_id, outcome, response_code)
+            .await
     }
 
-    async fn collect(&self, id: &str, now: i64) -> StoreResult<CollectResult> {
-        self.inner.collect(id, now).await
+    async fn collect(
+        &self,
+        id: &str,
+        now: i64,
+        response_code: Option<&str>,
+    ) -> StoreResult<CollectResult> {
+        self.inner.collect(id, now, response_code).await
     }
 }
 
@@ -554,6 +562,20 @@ async fn complete(f: &Fx, state: &State) -> Result<BackendAction, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Complete through the bound channel: the code the wallet's answer carried.
+async fn complete_bound(f: &Fx, state: &State, answer_body: &str) -> Result<BackendAction, String> {
+    let mut request = req("vp/complete", "GET");
+    let code = common::bound_code(answer_body);
+    request
+        .query
+        .insert("response_code".to_owned(), code.clone());
+    request.query_pairs.push(("response_code".to_owned(), code));
+    let mut ctx = Context::new(request, state.clone());
+    f.b.handle_endpoint(&mut ctx, "complete")
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// A refused flow completes to the failure page carrying its reason — never
 /// the legacy bare `authentication error: <code>` string. `code` rides the page.
 async fn assert_failure_page(f: &Fx, state: &State, code: &str) {
@@ -596,8 +618,9 @@ async fn a_pseudonym_login_reaches_the_frontend_as_a_pairwise_subject() {
         "only what this backend accepts is offered"
     );
     let (jwe, pseudonym) = wallet_body(&payload, T0, &f.issuer_cert, &key_of(&f.issuer_cert), None);
-    assert_eq!(post(&f, &id, &jwe).await.0, 200);
-    let BackendAction::AuthResponse(d) = complete(&f, &state).await.unwrap() else {
+    let answer = post(&f, &id, &jwe).await.1;
+    assert!(answer.contains("redirect_uri"), "the answer: {answer}");
+    let BackendAction::AuthResponse(d) = complete_bound(&f, &state, &answer).await.unwrap() else {
         panic!("expected auth response")
     };
     use base64::Engine;
@@ -710,7 +733,7 @@ async fn a_stalled_native_proof_does_not_stall_the_async_workers() {
     );
     let (status, body) = posted.await;
     assert_eq!(status, 200, "{body}");
-    let BackendAction::AuthResponse(data) = complete(&f, &state).await.unwrap() else {
+    let BackendAction::AuthResponse(data) = complete_bound(&f, &state, &body).await.unwrap() else {
         panic!("expected auth response")
     };
     assert!(data.subject_id.is_some(), "the held proof verifies");
@@ -779,7 +802,8 @@ async fn an_abandoned_native_verify_keeps_its_crypto_slot() {
         1,
         "never two native verifies at once"
     );
-    let BackendAction::AuthResponse(data) = complete(&f, &state2).await.unwrap() else {
+    let BackendAction::AuthResponse(data) = complete_bound(&f, &state2, &body2).await.unwrap()
+    else {
         panic!("expected auth response")
     };
     assert!(data.subject_id.is_some());
@@ -803,7 +827,7 @@ async fn a_pseudonym_login_over_dc_api_uses_the_dc_api_handover() {
     let (jwe, pseudonym) = wallet_body(&payload, T0, &f.issuer_cert, &key_of(&f.issuer_cert), None);
     let (status, body) = post(&f, &id, &jwe).await;
     assert_eq!(status, 200, "{body}");
-    let BackendAction::AuthResponse(data) = complete(&f, &state).await.unwrap() else {
+    let BackendAction::AuthResponse(data) = complete_bound(&f, &state, &body).await.unwrap() else {
         panic!("expected auth response")
     };
     use base64::Engine;
@@ -881,7 +905,8 @@ async fn pseudonym_and_age_profiles_are_independently_verified() {
         );
         let (status, body) = post(&f, &id, &jwe).await;
         assert_eq!(status, 200, "{body}");
-        let BackendAction::AuthResponse(data) = complete(&f, &state).await.unwrap() else {
+        let BackendAction::AuthResponse(data) = complete_bound(&f, &state, &body).await.unwrap()
+        else {
             panic!("expected auth response")
         };
         use base64::Engine;
