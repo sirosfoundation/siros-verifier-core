@@ -397,3 +397,30 @@ fn non_ascii_date_is_a_format_error_not_a_slicing_panic() {
         "tdate_format",
     );
 }
+
+// ---- the MSO-level revocation status fail-closed (issue #82) -----------------------
+
+#[test]
+fn an_mso_carrying_a_status_reference_is_refused() {
+    // The security report's second finding: an mdoc whose MSO carries
+    // a `status` reference was silently accepted — no fetch, no
+    // evaluation, nothing user-facing. The SD-JWT path fails closed
+    // when it cannot check status; the mdoc path now matches its
+    // posture: a status reference this verifier cannot verify yet is
+    // REFUSED with the reason named.
+    rejects(
+        Spec {
+            mso_status: Some((5, "https://status.example/sl".into())),
+            ..Default::default()
+        },
+        "mdoc_status_not_checked",
+    );
+}
+
+#[test]
+fn a_status_free_mso_still_verifies() {
+    // The control: the same issuance without the status member passes.
+    let f = fx();
+    let r = verify(&f, &build(&f, &Spec::default()), false);
+    assert!(r.is_ok(), "the status-free mdoc still verifies: {r:?}");
+}

@@ -1310,3 +1310,191 @@ fn plain_direct_post_round_trips_without_the_jwe_layer() {
         "a JWE answers only the encrypted modes: {error}"
     );
 }
+
+// ---- the pre-discovery response-shape validation (issue #83) ---------------------
+
+mod response_shape {
+    use super::*;
+
+    fn shape_session(q: Value) -> (World, Session) {
+        let w = world();
+        let (_jar, s) = start(&w, q);
+        (w, s)
+    }
+
+    /// A resolver that records every consultation: the shape refusals
+    // must fire BEFORE any resolver use (the discovery is what the
+    // report's amplification drove).
+    #[derive(Default)]
+    struct SpyResolver {
+        consulted: std::sync::atomic::AtomicUsize,
+    }
+    impl sdjwt::IssuerKeyResolver for SpyResolver {
+        fn resolve(
+            &self,
+            _header: &JoseHeader,
+            _iss: &str,
+        ) -> siros_verifier_core::Result<sdjwt::ResolvedKey> {
+            self.consulted
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(siros_verifier_core::Error::Policy(
+                "spy: never consulted".into(),
+            ))
+        }
+    }
+
+    fn body_with(vp_token: Value) -> Value {
+        json!({"state": "x", "vp_token": vp_token})
+        // state is replaced below with the session's real one
+    }
+
+    #[test]
+    fn an_unrequested_credential_id_refuses_at_the_open_with_no_discovery() {
+        // The security report's third finding: the junk response that
+        // names credentials the query did not ask for must be refused
+        // BEFORE any network discovery. The open validates the shape
+        // (inside open_response); the resolver is never consulted.
+        let (w, session) = shape_session(json!({
+            "credentials": [{"id": "pid", "format": "dc+sd-jwt",
+                "meta": {"vct_values": ["urn:eudi:pid:1"]},
+                "claims": [{"path": ["given_name"]}]}],
+        }));
+        let spy = SpyResolver::default();
+        let mut body = body_with(json!({
+            "pid": ["legit.presentation.jwt"],
+            "NOT_ASKED": ["junk.with.slow.kid"],
+        }));
+        body["state"] = json!(session.state.clone());
+        let jwe = raw_response(&session, body, None);
+        let err = match process_response(&session, &jwe, NOW + 5, &spy) {
+            Ok(_) => panic!("the unrequested id must refuse"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err}").contains("unrequested credential id"),
+            "the refusal names the id: {err}"
+        );
+        assert_eq!(
+            spy.consulted.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the resolver is never consulted — no discovery fired"
+        );
+        let _ = w;
+    }
+
+    #[test]
+    fn a_missing_requested_credential_refuses_at_the_open() {
+        let (_w, session) = shape_session(json!({
+            "credentials": [{"id": "pid", "format": "dc+sd-jwt",
+                "meta": {"vct_values": ["urn:eudi:pid:1"]},
+                "claims": [{"path": ["given_name"]}]}],
+        }));
+        let spy = SpyResolver::default();
+        let mut body = body_with(json!({"OTHER": ["x"]}));
+        body["state"] = json!(session.state.clone());
+        let jwe = raw_response(&session, body, None);
+        assert!(
+            process_response(&session, &jwe, NOW + 5, &spy).is_err(),
+            "the missing requested credential must refuse"
+        );
+        assert_eq!(
+            spy.consulted.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no discovery fired"
+        );
+    }
+
+    #[test]
+    fn a_wrong_presentation_count_refuses_at_the_open() {
+        let (_w, session) = shape_session(json!({
+            "credentials": [{"id": "pid", "format": "dc+sd-jwt",
+                "meta": {"vct_values": ["urn:eudi:pid:1"]},
+                "claims": [{"path": ["given_name"]}]}],
+        }));
+        // `multiple` absent (the default): exactly one presentation.
+        let spy = SpyResolver::default();
+        let mut body = body_with(json!({"pid": ["one", "two"]}));
+        body["state"] = json!(session.state.clone());
+        let jwe = raw_response(&session, body, None);
+        let err = match process_response(&session, &jwe, NOW + 5, &spy) {
+            Ok(_) => panic!("the count must refuse"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err}").contains("wrong number"),
+            "the refusal names the count: {err}"
+        );
+        assert_eq!(
+            spy.consulted.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no discovery fired"
+        );
+    }
+
+    #[test]
+    fn a_matching_response_opens() {
+        // The control: the genuine shape passes the open (the
+        // discovery/verification beyond it is not this test's subject).
+        let (_w, session) = shape_session(json!({
+            "credentials": [{"id": "pid", "format": "dc+sd-jwt",
+                "meta": {"vct_values": ["urn:eudi:pid:1"]},
+                "claims": [{"path": ["given_name"]}]}],
+        }));
+        let mut body = body_with(json!({"pid": ["legit.presentation.jwt"]}));
+        body["state"] = json!(session.state.clone());
+        let jwe = raw_response(&session, body, None);
+        // decrypt_response/open_response needs the session's enc key —
+        // raw_response encrypts TO it. Open directly:
+        let opened = open_response(&session, &jwe, NOW + 5);
+        assert!(opened.is_ok(), "the matching shape opens");
+    }
+
+    #[test]
+    fn a_multiple_query_accepts_several_presentations_at_the_open() {
+        let (_w, session) = shape_session(json!({
+            "credentials": [{"id": "pid", "format": "dc+sd-jwt", "multiple": true,
+                "meta": {"vct_values": ["urn:eudi:pid:1"]},
+                "claims": [{"path": ["given_name"]}]}],
+        }));
+        let mut body = body_with(json!({"pid": ["one", "two"]}));
+        body["state"] = json!(session.state.clone());
+        let jwe = raw_response(&session, body, None);
+        let opened = open_response(&session, &jwe, NOW + 5);
+        assert!(
+            opened.is_ok(),
+            "the multiple query accepts the list at the open"
+        );
+    }
+
+    #[test]
+    fn a_non_string_presentation_refuses_at_the_open() {
+        let (_w, session) = shape_session(json!({
+            "credentials": [{"id": "pid", "format": "dc+sd-jwt",
+                "meta": {"vct_values": ["urn:eudi:pid:1"]},
+                "claims": [{"path": ["given_name"]}]}],
+        }));
+        let mut body = body_with(json!({"pid": [42]}));
+        body["state"] = json!(session.state.clone());
+        let jwe = raw_response(&session, body, None);
+        assert!(
+            open_response(&session, &jwe, NOW + 5).is_err(),
+            "the non-string presentation must refuse"
+        );
+    }
+
+    #[test]
+    fn an_empty_presentation_list_refuses_at_the_open() {
+        let (_w, session) = shape_session(json!({
+            "credentials": [{"id": "pid", "format": "dc+sd-jwt",
+                "meta": {"vct_values": ["urn:eudi:pid:1"]},
+                "claims": [{"path": ["given_name"]}]}],
+        }));
+        let mut body = body_with(json!({"pid": []}));
+        body["state"] = json!(session.state.clone());
+        let jwe = raw_response(&session, body, None);
+        assert!(
+            open_response(&session, &jwe, NOW + 5).is_err(),
+            "the empty list must refuse"
+        );
+    }
+}

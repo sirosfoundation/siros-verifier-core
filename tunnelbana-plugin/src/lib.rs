@@ -694,13 +694,125 @@ async fn fetch_issuer_jwks(
 /// x5c-profile token, an mdoc DeviceResponse, a decoy) or that resolves its
 /// own carrier contributes nothing — the format layer re-decides per token
 /// at verification.
-fn issuer_jwks_hints(vp_token_text: &str) -> HashSet<(String, String, String)> {
+/// The cap on distinct issuer-key hints per response: the discovery
+/// fetch (an issuer-metadata + a JWKS GET per hint) is bounded by
+/// this, so a single response cannot drive an unbounded fetch
+/// fan-out (the security report's amplification). The bound is
+/// enforced BEFORE any fetch, never silently truncating an otherwise
+/// valid presentation: a response that names more distinct issuer
+/// keys than this refuses the discovery whole.
+///
+/// The budget is deliberately generous relative to the query surface:
+/// the query validator accepts any number of credentials (each
+/// possibly \`multiple: true\`), but a genuine response names at most a
+/// few distinct issuers (one per credential per presentation). The
+/// bound exists for the amplification (a junk response carrying
+/// hundreds of distinct slow issuers in a handful of credentials,
+/// each presentation a distinct kid), not for genuine cardinality —
+/// and the response's own shape check (the credential ids must be
+/// exactly the query's) has already run, so every presentation
+/// accounted for here was requested.
+const MAX_ISSUER_KEY_HINTS: usize = 64;
+
+#[cfg(test)]
+mod issuer_hints_budget_tests {
+    use super::*;
+
+    /// N real issued SD-JWTs naming N distinct (iss, kid) issuers — the
+    /// kid/JWKS profile (no x5c, kid present), the amplification's shape.
+    fn distinct_presentation(i: usize) -> String {
+        use siros_verifier_core::testutil::{ec_jwk, issue, present, IssueSpec, KbSpec};
+        let mut issuer = ec_jwk("ES256", &format!("issuer-{i}"));
+        issuer.kid = Some(format!("kid-{i}"));
+        let holder = ec_jwk("ES256", &format!("holder-{i}"));
+        let mut spec = IssueSpec::new(serde_json::json!({
+            "iss": format!("https://slow-{i}.example"),
+            "vct": "urn:eudi:pid:1",
+            "iat": 1_795_000_000i64, "exp": 1_796_000_000i64,
+            "given_name": "Ada",
+        }));
+        spec.holder_pub = Some(siros_verifier_core::testutil::public_of(&holder));
+        spec.conceal = vec![vec![siros_verifier_core::testutil::Seg::Key("given_name")]];
+        let issued = issue(&issuer, &spec).expect("the issuer issues");
+        present(
+            &issued,
+            &[0],
+            Some(KbSpec {
+                holder: &holder,
+                aud: "https://verifier.example",
+                nonce: "n",
+                iat: 1_795_000_000,
+            }),
+            siros_verifier_core::sdjwt::HashAlg::Sha256,
+        )
+        .expect("the presentation builds")
+    }
+
+    #[test]
+    fn a_junk_response_over_budget_is_refused_whole() {
+        // The production cap: MAX_ISSUER_KEY_HINTS + 1 distinct issuers
+        // refuse the discovery whole (never truncate). Reverting the
+        // budget check must fail this test.
+        let presentations: Vec<String> = (0..=MAX_ISSUER_KEY_HINTS)
+            .map(distinct_presentation)
+            .collect();
+        let text = serde_json::json!({"pid": presentations}).to_string();
+        let err = match issuer_jwks_hints_bounded(&text) {
+            Ok(_) => panic!("the over-budget response must refuse"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("issuer_key_hints_exceeded"),
+            "the refusal names the budget: {err}"
+        );
+    }
+
+    #[test]
+    fn a_genuine_response_stays_within_the_budget() {
+        // One presentation, one issuer: the budget never bites genuine
+        // responses (the review's ninth-key bug — truncation — cannot
+        // happen: under budget passes complete).
+        let presentations: Vec<String> = vec![distinct_presentation(0)];
+        let text = serde_json::json!({"pid": presentations}).to_string();
+        let hints = issuer_jwks_hints_bounded(&text).expect("the genuine response passes");
+        assert_eq!(hints.len(), 1);
+    }
+
+    #[test]
+    fn a_nine_credential_valid_response_is_not_truncated() {
+        // The review's concrete case: a 9-credential query (multiple or
+        // not) with 9 distinct issuers is VALID per the query validator —
+        // the budget (64) must not truncate it.
+        let presentations: Vec<String> = (0..9).map(distinct_presentation).collect();
+        let text = serde_json::json!({
+            "a": presentations[..3].to_vec(),
+            "b": presentations[3..6].to_vec(),
+            "c": presentations[6..].to_vec(),
+        })
+        .to_string();
+        let hints = issuer_jwks_hints_bounded(&text).expect("the valid response passes");
+        assert_eq!(
+            hints.len(),
+            9,
+            "all nine distinct issuers survive: no truncation"
+        );
+    }
+}
+
+/// The hints a response names, or the refusal if they exceed the
+/// discovery budget. Refusing (not truncating) keeps the resolver's
+/// input complete: a valid presentation that happens to name many
+/// issuers either fits the budget or is refused loudly, never
+/// silently degraded (the ninth-key bug the review caught).
+fn issuer_jwks_hints_bounded(
+    vp_token_text: &str,
+) -> std::result::Result<HashSet<(String, String, String)>, String> {
     let mut hints: HashSet<(String, String, String)> = HashSet::new();
     let Ok(vp) = serde_json::from_str::<serde_json::Value>(vp_token_text) else {
-        return hints;
+        return Ok(hints);
     };
     let Some(entries) = vp.as_object() else {
-        return hints;
+        return Ok(hints);
     };
     for value in entries.values() {
         let Some(list) = value.as_array() else {
@@ -710,11 +822,21 @@ fn issuer_jwks_hints(vp_token_text: &str) -> HashSet<(String, String, String)> {
             if let Ok(Some((iss, kid, alg))) =
                 siros_verifier_core::sdjwt::issuer_key_hint(presentation)
             {
+                if hints.len() >= MAX_ISSUER_KEY_HINTS {
+                    // Over budget: refuse the response whole. The shape
+                    // check has already run, so this many distinct
+                    // issuers in a requested presentation is either an
+                    // amplification or a deployment whose budget needs
+                    // raising — both refuse loudly.
+                    return Err(format!(
+                        "issuer_key_hints_exceeded: the response names more than {MAX_ISSUER_KEY_HINTS} distinct issuer keys — refusing the discovery whole rather than truncating it"
+                    ));
+                }
                 hints.insert((iss, kid, alg));
             }
         }
     }
-    hints
+    Ok(hints)
 }
 
 /// One issuer's key: discover `/.well-known/jwt-vc-issuer` under the token's
@@ -2075,7 +2197,12 @@ impl VpBackend {
                 // but the assertion needs the exact wire string.
                 tracing::info!(target: "vp_token", token_bytes = opened.vp_token_text().len(), "raw vp_token captured");
                 tracing::info!(target: "vp_token", "VP_TOKEN_BEGIN\n{}\nVP_TOKEN_END", opened.vp_token_text());
-                let hints = issuer_jwks_hints(&opened.vp_token_text());
+                // Only a response that passed the shape check (now inside
+                // open_response itself) reaches the discovery hints; the
+                // hints are budget-checked whole — over budget refuses the
+                // response, never truncates the resolver input.
+                let hints = issuer_jwks_hints_bounded(&opened.vp_token_text())
+                    .map_err(siros_verifier_core::Error::Policy)?;
                 Ok::<_, siros_verifier_core::Error>((opened, hints, crypto_permit))
             })
         };
