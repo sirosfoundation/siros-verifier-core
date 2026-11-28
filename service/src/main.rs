@@ -59,14 +59,80 @@ async fn main() -> std::io::Result<()> {
             std::process::exit(1);
         });
     let proxy = web::Data::new(Arc::new(proxy));
+    // The WMP surface (the [wmp] block of the backend config): built
+    // fail-fast — a malformed identity chain aborts the boot. The
+    // Arc-shared surface serves both the boot evaluation task and the
+    // POST /wmp/joins delivery endpoint. Absent — no surface, no route.
+    let wmp_state: Option<web::Data<siros_verifier_service::wmp_http::WmpEndpointState>> =
+        match wmp_config(&cfg) {
+            Some(config) => {
+                let surface = match siros_verifier_service::wmp::WmpSurface::new(
+                    config,
+                    &config_dir(&config_path),
+                ) {
+                    Ok(surface) => surface,
+                    Err(e) => {
+                        eprintln!("the WMP surface refused the boot: {e:#}");
+                        std::process::exit(1);
+                    }
+                };
+                let surface = std::sync::Arc::new(surface);
+                tracing::info!(
+                    identity = surface.identity(),
+                    invites = surface.config_invites().len(),
+                    groups = surface.config_groups_len(),
+                    "the WMP surface is configured"
+                );
+                // The config invites' and groups' decisions, evaluated
+                // in the background (fail-closed at the PDP; a stalled
+                // PDP never delays the bind).
+                let task_surface = surface.clone();
+                actix_web::rt::spawn(async move {
+                    for (invite, decision) in task_surface.evaluate_config_invites().await {
+                        tracing::info!(
+                            group = %invite.provider,
+                            sender = %invite.sender,
+                            allowed = decision == siros_verifier_service::wmp::Decision::Allow,
+                            "the config invite's join decision"
+                        );
+                    }
+                    for (group, decision) in task_surface.evaluate_config_groups().await {
+                        tracing::info!(
+                            group = %group.id,
+                            via = %group.via,
+                            allowed = decision == siros_verifier_service::wmp::Decision::Allow,
+                            "the config group's join decision"
+                        );
+                    }
+                });
+                Some(web::Data::new(
+                    siros_verifier_service::wmp_http::WmpEndpointState { surface },
+                ))
+            }
+            None => None,
+        };
     let bind = std::env::var("TUNNELBANA_BIND").unwrap_or_else(|_| "127.0.0.1:9001".to_string());
     tracing::info!(%bind, base_url = %cfg.base_url, "starting siros-verifier-service");
     HttpServer::new(move || {
-        App::new()
+        let mut app = App::new()
             .app_data(proxy.clone())
             .app_data(web::PayloadConfig::new(http::MAX_HTTP_BODY_BYTES))
-            .route("/health", web::get().to(http::health))
-            .default_service(web::to(http::handle))
+            .route("/health", web::get().to(http::health));
+        if let Some(state) = &wmp_state {
+            // The orchestrator's delivery channel — served only when
+            // the [wmp] block is present.
+            app = app
+                .app_data(state.clone())
+                .route(
+                    "/wmp/joins",
+                    web::post().to(siros_verifier_service::wmp_http::post_join),
+                )
+                .route(
+                    "/wmp/key-package",
+                    web::get().to(siros_verifier_service::wmp_http::get_key_package),
+                );
+        }
+        app.default_service(web::to(http::handle))
     })
     .bind(&bind)?
     .run()
@@ -144,40 +210,6 @@ async fn build_proxy(cfg: ProxyConfig, config_path: &str) -> anyhow::Result<Prox
     }
     let mut deployment: DeploymentConfig = serde_json::from_value(cfg.backends[0].config_json())?;
     resolve_deployment_secrets(&mut deployment, secrets.as_ref())?;
-    // The WMP surface (the [wmp] block): built fail-fast — a malformed
-    // identity chain or a refused config invite aborts the boot. The
-    // skeleton parses and validates; the join machinery is the next
-    // increment.
-    let _wmp: Option<()> = match deployment.wmp.take() {
-        Some(config) => {
-            let surface =
-                siros_verifier_service::wmp::WmpSurface::new(config, &config_dir(config_path))?;
-            tracing::info!(
-                identity = surface.identity(),
-                invites = surface.config_invites().len(),
-                "the WMP surface is configured"
-            );
-            // The config invites' join decisions evaluate OUTSIDE the
-            // pre-bind path: a stalled PDP must never delay the
-            // verifier's own endpoints (the 10s client timeout × N
-            // invites). The lifecycle task runs them in the background
-            // — local validation stays fail-fast (the chain, the invite
-            // parses already happened); the REMOTE policy calls move
-            // here, the MLS join exchange still to come.
-            actix_web::rt::spawn(async move {
-                for (invite, decision) in surface.evaluate_config_invites().await {
-                    tracing::info!(
-                        group = %invite.provider,
-                        sender = %invite.sender,
-                        allowed = decision == siros_verifier_service::wmp::Decision::Allow,
-                        "the config invite's join decision"
-                    );
-                }
-            });
-            None
-        }
-        None => None,
-    };
     let token_use_store = build_token_use_store(&deployment.storage).await?;
     let mut frontends = Vec::new();
     for p in &cfg.frontends {
@@ -638,6 +670,19 @@ async fn build_openid4vp_backend(
         .with_status_list_client(Arc::new(status_list_client));
     tracing::info!(name = %plugin.name, pdp = %deployment.pdp_endpoint, storage = %deployment.storage.backend, "loaded OpenID4VP backend");
     Ok(Box::new(backend))
+}
+
+/// The [wmp] block from the backend config, when present. The one
+/// backend's own config parse stays build_proxy's; this extracts only
+/// the surface's member.
+fn wmp_config(cfg: &ProxyConfig) -> Option<siros_verifier_service::wmp::WmpConfig> {
+    if cfg.backends.len() != 1 || cfg.backends[0].kind != "openid4vp" {
+        return None;
+    }
+    let deployment: siros_verifier_service::config::DeploymentConfig =
+        serde_json::from_value(cfg.backends[0].config_json())
+            .expect("the backend config parses (build_proxy enforces the same)");
+    deployment.wmp
 }
 
 /// The config file's directory: the base sibling paths (and relative

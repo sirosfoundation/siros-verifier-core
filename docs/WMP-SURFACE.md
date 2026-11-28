@@ -68,10 +68,21 @@ logged with the named reason; the group is never joined.
 
 ### 2. Multi-group membership
 
-`wmp-mls`'s provider holds every joined group's MLS state, persisted
-per-group in the flow store keyed by group id. The boot rehydrates
-every group; membership survives restarts. The provider's one-identity
-keystore holds the verifier's WMP key material.
+**The persistence model — corrected:** the MLS member state (the key
+store's private keys, the group epochs) is **process-lifetime** in
+wmp-mls — the OpenMLS key stores are in-memory, and the engine's own
+architecture does the same (sessions and invitations persist; key
+stores do not). Membership continuity across restarts is therefore the
+**orchestrator's reconciliation**, not state serialization: a restarted
+verifier presents a fresh KeyPackage, the orchestrator re-adds it (a
+fresh add-commit → Welcome cycle), and the join re-fires. The flow
+store persists the **membership record** — which groups the verifier is
+authorized for and joined, the epochs at join time — for audit and
+policy continuity, never the MLS state itself.
+
+The provider's one-identity keystore holds the verifier's WMP key
+material for the process lifetime; the surface tracks the joined
+groups (id → epoch) in memory, the record in the store.
 
 ### 2.1 Config-defined groups — the headless compositions
 
@@ -134,6 +145,28 @@ orchestrator-side API), or the intended set declared once per
 environment and shared by every participant. Deliberately not chosen —
 but the flag stands: if implementation or operations hits the drift,
 enumeration stops being an open item and becomes a requirement.
+
+**The join surface's endpoints** (served only when `[wmp]` is
+present): `GET /wmp/key-package` — the orchestrator fetches the
+member's fresh KeyPackage (minted per call, RFC 9420 single-use; the
+private key stays in the service's keystore) and adds the member by
+it; `POST /wmp/joins {group_id, welcome}` — the delivery. The posted
+`group_id` SELECTS a configured candidate — it is never trusted
+policy context itself: the gate evaluates the candidate's own `via`,
+and an id naming no candidate is refused before any evaluation. The
+sender's own authentication (mTLS, a delivery signature) is the open
+item — the configured candidate is today's channel's trust anchor.
+
+**Known limits, both closed by the wallet-core re-pin when [#127](https://github.com/sirosfoundation/siros-wallet-core/issues/127)
+ships:**
+- The pinned provider's `process_welcome` commits the group into its
+  in-memory map before the group id returns, so a mismatched Welcome
+  leaves the rogue group in the provider's state (refused, unlisted in
+  the registry, unusable through the surface — but present). The
+  upstream refuse-before-commit processing closes it.
+- The pinned `generate_key_package` mints a fresh signer and a
+  BasicCredential — the package advertises the basic identity, not the
+  configured X.509 one. The upstream cert-bound packages close it.
 
 The concrete mechanisms — how the group definition is expressed in
 configuration, how the orchestrator discovers the participants and
@@ -304,7 +337,7 @@ key_path = "..."
 credential_path = "..."
 
 [[backend.config.wmp.groups]]                   # config-identified groups the
-id = "wmp:group:evidence-qerds"                # verifier JOINS (the orchestrator
+id = "<the MLS GroupId, base64url>"            # verifier JOINS (the orchestrator
 via = "x509:san:dns:sirosid-gdc-wmp-mcp.fly.dev"  # creates; the gate decides)
 
 [[backend.config.wmp.invites]]                  # config-declared (optional)
@@ -332,14 +365,18 @@ fresh-key signer never minted), and the validated chain feeds the §5.6
    client; both channels; the fail-closed refusals. *(The client and
    the join decision landed in #78; the signature verification and the
    MLS join exchange land with the wallet-core 0.5.0 re-pin.)*
-3. **PDP-delegated persistent groups** — the verifier joins the
-   groups it is allowed to join (§2.1): the `[[wmp.groups]]` config
-   names the candidates, the go-spocp PDP decides each ("may this
-   entity join the group named X?"), and the MLS join exchange
-   completes the membership. **The join machinery — the invite channel
-   and the persistent-group channel — is the next implementation
-   increment.** The orchestration side (how the orchestrator creates
-   and assembles) is out of scope here.
+3. **PDP-delegated persistent groups — the join machinery**
+   *(partially landed)*: the `[[wmp.groups]]` candidates evaluate at
+   boot ("may this entity join the group named X?"); the join fires
+   when the orchestrator delivers the Welcome — `join_by_welcome`
+   gates, verifies the declared id against the Welcome's own MLS
+   GroupId, and processes it into the registry; the fresh-KeyPackage
+   surface (`fresh_key_package`) is the orchestrator's add-flow input
+   (the restart reconciliation). The invite-channel signature
+   verification (wmp-core's `InvitationVerifier`, the sender's key
+   via `wmp.resolve`) remains; the delivery endpoint
+   (POST /wmp/joins) is the orchestrator's channel, landing with the
+   actix wiring.
 4. **The responder** — the request shape, the PDP evaluation, the §5.6
    assertion generation.
 5. **The relay leg** — the verified-outcome hook, the per-target PDP
